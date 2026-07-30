@@ -213,14 +213,14 @@ test('per-row frame counts are the measured ones, with a full-row fallback', () 
 });
 
 test('mode -> row map follows contracts.md', () => {
-  assert.deepEqual(MODE_ROW, { idle: 0, busy: 7, waiting: 6, failed: 5 });
+  assert.deepEqual(MODE_ROW, { idle: 0, busy: 8, waiting: 6, failed: 5 });
   assert.deepEqual(WALK_ROW, { right: 1, left: 2 });
   assert.deepEqual(CELEBRATE_PULSE, [4, 3]);
 });
 
 test('baseRowFor maps every mode and falls back to idle', () => {
   assert.equal(baseRowFor({ mode: 'idle' }), ROW.IDLE);
-  assert.equal(baseRowFor({ mode: 'busy' }), ROW.BUSY);
+  assert.equal(baseRowFor({ mode: 'busy' }), ROW.REVIEW);
   assert.equal(baseRowFor({ mode: 'waiting' }), ROW.WAITING);
   assert.equal(baseRowFor({ mode: 'failed' }), ROW.FAILED);
   assert.equal(baseRowFor({ mode: 'nonsense' }), ROW.IDLE);
@@ -231,14 +231,25 @@ test('baseRowFor maps every mode and falls back to idle', () => {
 test('walk direction wins over mode', () => {
   assert.equal(baseRowFor({ mode: 'idle', walk: { dir: 'right' } }), ROW.RUN_RIGHT);
   assert.equal(baseRowFor({ mode: 'idle', walk: { dir: 'left' } }), ROW.RUN_LEFT);
-  assert.equal(baseRowFor({ mode: 'busy', walk: { dir: 'sideways' } }), ROW.BUSY);
-  assert.equal(baseRowFor({ mode: 'busy', walk: null }), ROW.BUSY);
+  assert.equal(baseRowFor({ mode: 'busy', walk: { dir: 'left' } }), ROW.RUN_LEFT);
+  assert.equal(baseRowFor({ mode: 'busy', walk: { dir: 'sideways' } }), ROW.REVIEW);
+  assert.equal(baseRowFor({ mode: 'busy', walk: null }), ROW.REVIEW);
+});
+
+test('stationary busy uses the standing review row, not the run-in-place one', () => {
+  assert.equal(baseRowFor({ mode: 'busy' }), ROW.REVIEW);
+  assert.equal(baseRowFor({ mode: 'busy', walk: { dir: 'left' } }), ROW.RUN_LEFT, 'walk still wins');
+  assert.equal(
+    Object.values(MODE_ROW).includes(ROW.BUSY),
+    false,
+    'row 7 runs on the spot, so no mode may reach it',
+  );
 });
 
 test('walk rows animate at 6 fps, everything else at 8', () => {
   assert.equal(fpsForRow(ROW.RUN_LEFT), WALK_FPS);
   assert.equal(fpsForRow(ROW.RUN_RIGHT), WALK_FPS);
-  for (const row of [ROW.IDLE, ROW.WAVE, ROW.JUMP, ROW.FAILED, ROW.WAITING, ROW.BUSY]) {
+  for (const row of [ROW.IDLE, ROW.WAVE, ROW.JUMP, ROW.FAILED, ROW.WAITING, ROW.BUSY, ROW.REVIEW]) {
     assert.equal(fpsForRow(row), DEFAULT_FPS);
   }
 });
@@ -251,8 +262,8 @@ test("animator loops a row's real frames at the row fps", () => {
   let t = 0;
   const a = createAnimator({ now: () => t });
   a.setState({ mode: 'busy' }, 0);
-  assert.equal(a.row, ROW.BUSY);
-  const frames = framesForRow(ROW.BUSY); // 6, not the full 8
+  assert.equal(a.row, ROW.REVIEW);
+  const frames = framesForRow(ROW.REVIEW); // 6, not the full 8
   const step = 1000 / DEFAULT_FPS;
   for (let i = 1; i < frames; i += 1) {
     t = i * step;
@@ -260,7 +271,30 @@ test("animator loops a row's real frames at the row fps", () => {
   }
   t = frames * step;
   assert.equal(a.tick(t).frame, 0, 'wraps to 0');
-  assert.equal(a.row, ROW.BUSY, 'stays on the same row');
+  assert.equal(a.row, ROW.REVIEW, 'stays on the same row');
+});
+
+test('a whole busy loop never lands on the run-in-place row', () => {
+  assert.equal(ROW_FRAMES[ROW.REVIEW], 6, 'row 8 has 6 real frames');
+  let t = 0;
+  const a = createAnimator({ now: () => t });
+  const step = 1000 / DEFAULT_FPS;
+  const seen = [a.setState({ mode: 'busy' }, 0)];
+  for (let i = 1; i <= 12; i += 1) {
+    t = i * step;
+    seen.push(a.tick(t));
+  }
+  for (const { row } of seen) assert.notEqual(row, ROW.BUSY, 'row 7 must be unreachable');
+  assert.equal(
+    seen.every((s) => s.row === ROW.REVIEW),
+    true,
+    'stays on the standing pose',
+  );
+  assert.deepEqual(
+    seen.map((s) => s.frame),
+    [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0],
+    'two clean loops of 6',
+  );
 });
 
 test('idle never draws the two empty trailing cells', () => {
@@ -383,9 +417,9 @@ test('mid-pulse mode changes are deferred until the pulse finishes', () => {
   a.setState({ mode: 'idle', celebrate: true }, 0);
   a.setState({ mode: 'busy', celebrate: true }, 0);
   assert.equal(a.row, ROW.JUMP, 'pulse is not interrupted');
-  assert.equal(a.baseRow, ROW.BUSY);
+  assert.equal(a.baseRow, ROW.REVIEW);
   t = (framesForRow(ROW.JUMP) + framesForRow(ROW.WAVE)) * step;
-  assert.equal(a.tick(t).row, ROW.BUSY, 'lands on the newest base row');
+  assert.equal(a.tick(t).row, ROW.REVIEW, 'lands on the newest base row');
   assert.equal(a.frame, 0, 'the new row starts at frame 0, never mid-row');
 });
 
@@ -394,8 +428,8 @@ test('a long stall resyncs instead of replaying every skipped frame', () => {
   const a = createAnimator({ now: () => t });
   a.setState({ mode: 'busy' }, 0);
   const before = a.tick(60 * 60 * 1000); // one hour of skipped frames
-  assert.equal(before.row, ROW.BUSY);
-  assert.ok(before.frame >= 0 && before.frame < framesForRow(ROW.BUSY));
+  assert.equal(before.row, ROW.REVIEW);
+  assert.ok(before.frame >= 0 && before.frame < framesForRow(ROW.REVIEW));
 });
 
 // ---------------------------------------------------------------------------
@@ -611,7 +645,7 @@ test('boot subscribes to state before awaiting flags, so the first push is not l
   const app = await h.booting;
 
   assert.ok(app, 'boot resolved');
-  assert.equal(app.animator.row, ROW.BUSY, 'early state survived the await');
+  assert.equal(app.animator.row, ROW.REVIEW, 'early state survived the await');
   assert.equal(app.renderer !== null, true, 'sprite loaded from flags.spritePath');
   app.dispose();
 });

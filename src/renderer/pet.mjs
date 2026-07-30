@@ -36,7 +36,9 @@ export const ROW = {
 /** Aggregate mode -> row. Unknown modes fall back to idle. */
 export const MODE_ROW = {
   idle: ROW.IDLE,
-  busy: ROW.BUSY,
+  // Row 7 (BUSY) is a run-in-place sprite and must never play while stationary —
+  // REVIEW is the standing working pose, so busy maps there instead.
+  busy: ROW.REVIEW,
   waiting: ROW.WAITING,
   failed: ROW.FAILED,
 };
@@ -64,7 +66,7 @@ export function framesForRow(row) {
 /**
  * The row a state resolves to ignoring the celebrate pulse: a walk direction
  * wins over the mode, otherwise mode -> row. The precedence matters now that
- * the pet also strolls while busy — walking legs beat the run-in-place row.
+ * the pet also strolls while busy — walking legs beat the standing busy pose.
  */
 export function baseRowFor(state) {
   const dir = state && state.walk && state.walk.dir;

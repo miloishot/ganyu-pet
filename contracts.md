@@ -97,7 +97,7 @@ Canvas-based sprite engine. Spritesheet grid — 8 columns × 9 rows, frame 192�
 
 | Row | Animation |
 |---|---|
-| 0 idle · 1 run-right · 2 run-left · 3 waving · 4 jumping · 5 failed · 6 waiting · 7 busy (non-directional) · 8 review |
+| 0 idle · 1 run-right · 2 run-left · 3 waving · 4 jumping · 5 failed · 6 waiting · 7 busy run-in-place (**unmapped**) · 8 review (standing working pose) |
 
 **Frames per row are not uniform.** The grid is 8 wide but only rows 1, 2 and 5 fill it; the rest end early and their trailing cells are fully transparent. Measured opaque-pixel counts (`ROW_FRAMES` in `pet.mjs`):
 
@@ -105,7 +105,9 @@ Canvas-based sprite engine. Spritesheet grid — 8 columns × 9 rows, frame 192�
 |---|---|---|---|---|---|---|---|---|---|
 | Frames | 6 | 8 | 8 | 4 | 5 | 8 | 6 | 6 | 6 |
 
-Mode → row: `idle→0`, `busy→7`, `waiting→6`, `failed→5`, `celebrate` pulse → 4 (jump) then 3 (wave) once, `walk.dir right→1 / left→2`. 8 fps default, 6 fps for walk rows. Loop each row's real frame count, never the full 8 — drawing a blank trailing cell blinks the pet out (idle at 8 fps lost 250ms of every second). Chromium decodes `.webp` natively — draw via offscreen `<img>` → `drawImage` crops.
+Mode → row: `idle→0`, `busy→8`, `waiting→6`, `failed→5`, `celebrate` pulse → 4 (jump) then 3 (wave) once, `walk.dir right→1 / left→2`. 8 fps default, 6 fps for walk rows.
+
+**Row 7 is intentionally unmapped.** It is a run-in-place animation, so playing it while the pet is stationary reads as running on the spot without moving. Stationary `busy` therefore draws row 8 (review), a standing thinking pose; real locomotion already draws rows 1/2 via `walk.dir`, which outranks the mode. The row stays in `ROW`/`ROW_FRAMES` because it still exists on the sheet — it is simply unreachable from any mode. Loop each row's real frame count, never the full 8 — drawing a blank trailing cell blinks the pet out (idle at 8 fps lost 250ms of every second). Chromium decodes `.webp` natively — draw via offscreen `<img>` → `drawImage` crops.
 
 Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteractive(true)`; `mouseleave` → `false`. Right-click on sprite → minimal in-window menu (Mute/Unmute · Pin/Unpin · **Home** · Quit) → `ganyu.menuAction(...)`. `home` is wired end to end in main (§Window) but **module C has not added the menu entry yet**, so the recall action is reachable over IPC and unlabelled in the UI until it does. Speech bubble: styled div above the sprite, fades after 8s, newest replaces current.
 
@@ -131,7 +133,7 @@ Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteract
 - Arms **20s** after entering a calm mode from a non-calm one. Then every **45–120s** (deterministic from injected `random`): pick target x in work area, walk at ~60 px/s (move window every 50ms tick), face travel direction (`onWalkState({dir})`), occasional mid-walk pause (idle 3–8s).
 - A transition **between** two calm modes (idle↔busy, which the hook stream does constantly as sessions start and stop) neither interrupts a stroll in progress nor restarts the countdown. Only a **non-calm** mode (`waiting`, `failed`, or any unrecognized mode) → instant cancel, `onWalkState(null)`. Repeated identical modes are ignored. Pinned → never arms.
 - **Edge bounce.** Targets are always picked inside the work area, but a wall can move under her mid-stroll (the work area shrinks, a monitor is undocked). When the next step would cross `minX`/`maxX` she stops at the wall, picks a fresh target back the other way, and flips the direction reported through `onWalkState` — she turns around rather than stopping dead against the edge. Arrival still wins over the wall check, so a target sitting exactly on an edge ends the stroll normally.
-- Renderer precedence follows from this: `walk.dir` outranks the mode row, so a stroll under `busy` draws the directional run rows (1/2), not the run-in-place row 7.
+- Renderer precedence follows from this: `walk.dir` outranks the mode row, so a stroll under `busy` draws the directional run rows (1/2), not the stationary busy row 8.
 
 **Containment — `containNow()`.** Re-clamps the window into the current work area from wherever it is, then hands off to gravity if it is above the floor. Callable at any time from any state: **no mode check, no pinned check, no stroll required**, and a no-op (not one `moveWindow` call) when she is already fully inside. Returns true if it moved her. This is the fix for the owner losing the pet off-screen: `syncPosition()` alone only re-clamped at the *start* of a stroll, so a work-area change or a drag left her outside with nothing to pull her back — and with the aggregate mode stuck non-calm (`waiting`/`failed`) wander is cancelled and no stroll ever comes, so she stayed lost indefinitely. **Pinned does not exempt containment**: a pinned pet stranded off-screen was exactly the trap. Module A's call sites are in §Window.
 
