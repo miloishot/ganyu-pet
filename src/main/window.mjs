@@ -21,6 +21,70 @@ export const SPRITE_SIZE = Object.freeze({ width: 192, height: 208 });
 /** Cursor poll interval for the hover watch below. */
 export const HOVER_POLL_MS = 120;
 
+/**
+ * How far the reported window size may sit from WINDOW_SIZE before the size guard
+ * treats it as drift and resets it. Legitimate jitter is +/-1 DIP (the reported
+ * outer rect rounds differently at odd coordinates on a fractional scale factor);
+ * real drift runs into the hundreds.
+ */
+export const SIZE_DRIFT_TOLERANCE = 8;
+
+/**
+ * Move the window, re-pinning its canonical DIP size on every call.
+ *
+ * NEVER use a bare `win.setPosition` for the pet. On Windows at a fractional
+ * scale factor (this machine: 1.5) every `setPosition` re-rounds the window rect
+ * and grows it slightly, and the growth compounds — measured on Electron 43.2.0 /
+ * Windows 11 22000 with a 256x320 window:
+ *
+ *   setPosition x300 : 259x323 -> 344x389 -> 430x456 -> 516x522   (content grows too)
+ *   setBounds   x300 : 259x323 -> 256x320 -> 256x320 -> 256x320   (pinned, stable)
+ *
+ * At 20 moves/sec during a stroll that reached 2643x4257 *physical* px within
+ * minutes of walking. The sprite is drawn bottom-centre of the window, so an
+ * inflated window pushes the pet below the bottom of the screen — invisible — and
+ * the constant resizing is the flicker the owner saw. Passing width/height on
+ * every move is what stops it compounding, so do not "simplify" this back to
+ * `setPosition`. One `setBounds` also fully recovers an already-inflated window.
+ */
+export function moveWindowPinned(win, x, y, size = WINDOW_SIZE) {
+  if (!win) return null;
+  const bounds = { x: Math.round(x), y: Math.round(y), width: size.width, height: size.height };
+  win.setBounds(bounds);
+  return bounds;
+}
+
+/**
+ * Is this reading close enough to the canonical size to be the same window?
+ *
+ * The reported outer rect is not exact: at a fractional scale factor it comes back
+ * +/-1 DIP depending on the parity of the window's position (measured: 256x320 at
+ * even coordinates, 257x321 at odd ones, for the same pinned window). Within the
+ * tolerance the canonical size is therefore the *more* accurate value, because it
+ * is the one `moveWindowPinned` actually sets. Outside it, the reading is either
+ * drift or a genuinely different window, and the caller should act on it.
+ */
+export function sizeWithinTolerance(measured, size = WINDOW_SIZE, tolerance = SIZE_DRIFT_TOLERANCE) {
+  if (!measured || !Number.isFinite(measured.width) || !Number.isFinite(measured.height)) return false;
+  return Math.abs(measured.width - size.width) <= tolerance && Math.abs(measured.height - size.height) <= tolerance;
+}
+
+/**
+ * Belt and braces for the drift above: if the window's reported size has wandered
+ * further than `tolerance` from canonical, reset it to canonical at its current
+ * position. Returns the drifted size it corrected (so the caller can log it), or
+ * null when there was nothing to do — `moveWindowPinned` should mean this never
+ * fires, and it firing is worth knowing about.
+ */
+export function enforceWindowSize(win, { size = WINDOW_SIZE, tolerance = SIZE_DRIFT_TOLERANCE } = {}) {
+  if (!win) return null;
+  const b = win.getBounds();
+  if (!b || !Number.isFinite(b.width) || !Number.isFinite(b.height)) return null;
+  if (sizeWithinTolerance(b, size, tolerance)) return null;
+  win.setBounds({ x: b.x, y: b.y, width: size.width, height: size.height });
+  return { width: b.width, height: b.height };
+}
+
 /** Codex pet id — see contracts.md "Machine facts". */
 export const PET_ID = 'ganyu--chenxin-dlut';
 
@@ -33,11 +97,20 @@ export const CHANNELS = Object.freeze({
   getFlags: 'ganyu:get-flags',
 });
 
-export const MENU_ACTIONS = Object.freeze(['toggle-mute', 'toggle-pin', 'quit']);
+/**
+ * `home` is the recall action: it snaps the pet back to `computeInitialBounds`.
+ * It exists because a pet stranded off-screen — by a resolution change, an
+ * undocked monitor, or a drag — was unrecoverable, and the right-click menu is
+ * the only user control there is.
+ */
+export const MENU_ACTIONS = Object.freeze(['toggle-mute', 'toggle-pin', 'home', 'quit']);
 
 /**
  * Bottom-right of the primary display work area. Y sits flush on the bottom
- * edge because the wander scheduler only ever changes X.
+ * edge — the wander scheduler moves Y only while she is falling, and settles her
+ * back on this line. Pass the *measured* window size when one is available:
+ * Electron adds invisible frame padding on Windows, so WINDOW_SIZE lands the
+ * bottom edge a few pixels below the work area.
  */
 export function computeInitialBounds(workArea, size = WINDOW_SIZE) {
   const wa = { x: 0, y: 0, width: 1920, height: 1080, ...(workArea || {}) };

@@ -12,7 +12,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 4. `echo <sample JSON> | cmd /c hooks\ganyu-hook.cmd codex 47899` delivers the payload to a listening server (test with a throwaway node listener).
 5. `node hooks/install-hooks.mjs` (dry-run, default) against **fixture copies** of `hooks.json` / `settings.json` produces valid JSON that preserves every pre-existing hook entry and adds ours exactly once (idempotent on re-run). It must never touch real config without `--apply`.
 6. Speech unit tests: prompt template correct, 45s global cooldown enforced (15s floor for `waiting`/`failed` interrupts), canned fallback used when the CLI call fails. Live Haiku call is exercised once by the integrator (`claude -p --model haiku`); if offline, flag it — don't fail the build.
-7. Wander scheduler unit tests with an injected clock: engages 20s after the aggregate mode becomes calm (`idle` **or** `busy`), picks targets inside the primary display work area, keeps walking across idle↔busy transitions, and cancels immediately on a non-calm mode (`waiting`/`failed`).
+7. Wander scheduler unit tests with an injected clock: engages 20s after the aggregate mode becomes calm (`idle` **or** `busy`), picks targets inside the primary display work area, keeps walking across idle↔busy transitions, and cancels immediately on a non-calm mode (`waiting`/`failed`). Containment and physics are covered by the same suite: `bounds()` derives from the **injected measured** window size, `containNow()` recovers her from every edge (and no-ops inside, and works while pinned and while the mode is non-calm), gravity settles her exactly on the floor after at most a few decreasing bounces without exceeding terminal velocity or teleporting on a late tick, and a stroll aimed past a wall turns around instead of stopping dead.
 8. Server binds `127.0.0.1` only. No secrets, no telemetry, nothing written outside the repo (except the installer with explicit `--apply`).
 
 ## Machine facts (Windows 11)
@@ -71,7 +71,7 @@ Preload exposes exactly:
 - `ganyu.onState(cb)` — cb receives `{mode, sessionCount, celebrate, walk: {dir: 'left'|'right'} | null}`.
 - `ganyu.onSpeak(cb)` — cb receives `{text}`.
 - `ganyu.setInteractive(bool)` — toggles `setIgnoreMouseEvents(!bool, {forward: true})`.
-- `ganyu.menuAction(action)` — `'toggle-mute' | 'toggle-pin' | 'quit'`.
+- `ganyu.menuAction(action)` — `'toggle-mute' | 'toggle-pin' | 'home' | 'quit'`. `home` is the recall action (see §Window); main filters against `MENU_ACTIONS`, so anything else is dropped.
 - `ganyu.getFlags()` → Promise of `{muted, pinned, spritePath}` (spritePath as `file://` URL for the `<img>`/canvas source).
 
 Channels (main side): `ganyu:state`, `ganyu:speak`, `ganyu:set-interactive`, `ganyu:menu`, `ganyu:get-flags`. Nothing else.
@@ -79,6 +79,17 @@ Channels (main side): `ganyu:state`, `ganyu:speak`, `ganyu:set-interactive`, `ga
 ### Window (module A)
 
 Frameless, transparent, `alwaysOnTop: 'screen-saver'`, `skipTaskbar`, not resizable, ~256×320 (192×208 sprite + bubble headroom), initial position bottom-right of primary display `workArea`, `webPreferences: {contextIsolation: true, preload: preload.cjs}`. Default click-through ON via `setIgnoreMouseEvents(true, {forward: true})`; renderer flips interactivity on sprite hover (see C). `GANYU_SMOKE=1` → after ~5s print `SMOKE_OK ` + JSON `{transparent, alwaysOnTop, frame:false}` to stdout and `app.quit()`. Single-instance lock. Wires modules together: server → state → (renderer push, speech, wander).
+
+**Measured size, not `WINDOW_SIZE` — and measured exactly once.** Two facts about this machine (Electron 43.2.0 / Windows 11 22000, primary display `workArea` 1707×1019, `scaleFactor` 1.5), both measured live:
+
+1. Windows adds invisible frame padding even to a frameless transparent window: a 256×320 request measures **259×323**. Clamping the pet against `WINDOW_SIZE` therefore left her right and bottom edges ~3px outside the work area.
+2. **`win.getBounds()` is not a stable size.** Every `setPosition` inflates the reported width and height by ~1px — 259×323 at create, 458×523 after 200 moves — and `setSize(256, 320)` does not reset it. It is a DIP↔physical round-tripping artifact of the 1.5 scale factor.
+
+So module A captures the size **once, before anything calls `setPosition`**, caches it, and hands that to everything that needs geometry: wander's `getWindowSize`, `computeInitialBounds` for the recall target, and the hover watch's bounds (live position + stable size — the inflating size slid the sprite's hover box off the sprite the longer she walked, until the right-click menu could not be opened). Re-reading the size live walks the pet up the screen ~1px per tick; do not "fix" it back into a live read. Production values: **maxX 1448, floor 696**.
+
+**Containment.** Module A calls `wander.containNow()` (a) once on startup, right after the window exists — the initial `computeInitialBounds` placement is derived from `WINDOW_SIZE` and is already ~3px outside; (b) from the existing 1s state poll, which is cheap because module E no-ops when she is already inside; and (c) on the `screen` events `display-metrics-changed`, `display-added` and `display-removed`. Listeners are removed in `cleanup()`.
+
+**Recall.** `MENU_ACTIONS` is `['toggle-mute', 'toggle-pin', 'home', 'quit']`. `home` cancels any stroll (or its next tick drags her straight back out), snaps the window to `computeInitialBounds(workArea, measuredSize)`, and calls `containNow()` to resync module E's tracked position. It is the last resort for a pet the owner cannot reach, and works while pinned and while the aggregate mode is stuck non-calm.
 
 ### Renderer (module C)
 
@@ -90,7 +101,7 @@ Canvas-based sprite engine. Spritesheet grid — 8 columns × 9 rows, frame 192�
 
 Mode → row: `idle→0`, `busy→7`, `waiting→6`, `failed→5`, `celebrate` pulse → 4 (jump) then 3 (wave) once, `walk.dir right→1 / left→2`. 8 fps default, 6 fps for walk rows. Loop all 8 frames per row. Chromium decodes `.webp` natively — draw via offscreen `<img>` → `drawImage` crops.
 
-Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteractive(true)`; `mouseleave` → `false`. Right-click on sprite → minimal in-window menu (Mute/Unmute · Pin/Unpin · Quit) → `ganyu.menuAction(...)`. Speech bubble: styled div above the sprite, fades after 8s, newest replaces current.
+Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteractive(true)`; `mouseleave` → `false`. Right-click on sprite → minimal in-window menu (Mute/Unmute · Pin/Unpin · **Home** · Quit) → `ganyu.menuAction(...)`. `home` is wired end to end in main (§Window) but **module C has not added the menu entry yet**, so the recall action is reachable over IPC and unlabelled in the UI until it does. Speech bubble: styled div above the sprite, fades after 8s, newest replaces current.
 
 ### Speech (module D)
 
@@ -105,12 +116,25 @@ Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteract
 
 ### Wander (module E)
 
-`createWander({clock, schedule, moveWindow, getWorkArea, onWalkState, isPinned})` — all side effects injected; `schedule(fn, ms)` returns a cancel handle (production: setTimeout).
+`createWander({clock, schedule, moveWindow, getWorkArea, getWindowSize, getPosition, onWalkState, isPinned})` — all side effects injected; `schedule(fn, ms)` returns a cancel handle (production: setTimeout).
+
+- `getWindowSize()` → `{width, height}`: the **measured** outer size of the window, read on every `bounds()` call. Falls back to the `windowWidth`/`windowHeight` defaults (256×320) when absent or when it returns garbage, so unit tests need not inject it. See §Window for why module A measures once and caches rather than reading `getBounds()` live.
+- `getPosition()` → `{x, y}`: where the window really is, drags included. This is what makes containment possible at all — without it the module only knows the position it last set. Ignored while she is strolling or falling, because mid-motion the module owns the position and re-reading a rounded value each tick would fight the float integration.
 
 - **Calm modes** (`WANDER_DEFAULTS`-adjacent export `CALM_MODES = ['idle', 'busy']`, plus an `isCalm(mode)` helper): she strolls while the aggregate mode is `idle` **or** `busy`. `busy` counts as calm because the owner always has codex/Claude Code sessions open, so the lifecycle-hook stream pins the aggregate at `busy` indefinitely and `idle` effectively never arrives — gating on `idle` alone meant she never walked at all, just looped the non-directional busy run on the spot.
 - Arms **20s** after entering a calm mode from a non-calm one. Then every **45–120s** (deterministic from injected `random`): pick target x in work area, walk at ~60 px/s (move window every 50ms tick), face travel direction (`onWalkState({dir})`), occasional mid-walk pause (idle 3–8s).
-- A transition **between** two calm modes (idle↔busy, which the hook stream does constantly as sessions start and stop) neither interrupts a stroll in progress nor restarts the countdown. Only a **non-calm** mode (`waiting`, `failed`, or any unrecognized mode) → instant cancel, `onWalkState(null)`. Repeated identical modes are ignored. Pinned → never arms. Y stays fixed at bottom edge.
+- A transition **between** two calm modes (idle↔busy, which the hook stream does constantly as sessions start and stop) neither interrupts a stroll in progress nor restarts the countdown. Only a **non-calm** mode (`waiting`, `failed`, or any unrecognized mode) → instant cancel, `onWalkState(null)`. Repeated identical modes are ignored. Pinned → never arms.
+- **Edge bounce.** Targets are always picked inside the work area, but a wall can move under her mid-stroll (the work area shrinks, a monitor is undocked). When the next step would cross `minX`/`maxX` she stops at the wall, picks a fresh target back the other way, and flips the direction reported through `onWalkState` — she turns around rather than stopping dead against the edge. Arrival still wins over the wall check, so a target sitting exactly on an edge ends the stroll normally.
 - Renderer precedence follows from this: `walk.dir` outranks the mode row, so a stroll under `busy` draws the directional run rows (1/2), not the run-in-place row 7.
+
+**Containment — `containNow()`.** Re-clamps the window into the current work area from wherever it is, then hands off to gravity if it is above the floor. Callable at any time from any state: **no mode check, no pinned check, no stroll required**, and a no-op (not one `moveWindow` call) when she is already fully inside. Returns true if it moved her. This is the fix for the owner losing the pet off-screen: `syncPosition()` alone only re-clamped at the *start* of a stroll, so a work-area change or a drag left her outside with nothing to pull her back — and with the aggregate mode stuck non-calm (`waiting`/`failed`) wander is cancelled and no stroll ever comes, so she stayed lost indefinitely. **Pinned does not exempt containment**: a pinned pet stranded off-screen was exactly the trap. Module A's call sites are in §Window.
+
+**Physics.** `WANDER_DEFAULTS` adds `gravityPxPerSec2: 1400`, `maxFallPxPerSec: 900`, `restitution: 0.25`, `minBounceVelocity: 120`.
+
+- **Floor** = work area bottom minus the **measured** window height. Y is no longer a constant: it changes while she falls, and `moveWindow` receives the updated y. The renderer is unaffected — it draws in-window.
+- Whenever she is above the floor — dragged up, or left high by a display change — she **falls**: `vy += gravity·dt`, `y += vy·dt`, capped at `maxFallPxPerSec`, on the existing `tickMs` cadence with the same `maxTickDtMs` clamp so a suspended timer cannot teleport her. On reaching the floor she bounces with `restitution`, and once the rebound is below `minBounceVelocity` she settles **exactly** on the floor. With these constants that is one or two bounces.
+- **Falling outranks strolling**: it cancels a stroll in progress (`onWalkState(null)`), then normal scheduling resumes on landing. It also outranks the mode and the pinned flag — gravity is containment, not behaviour, so it runs while pinned and while the mode is non-calm. Only `stop()` (teardown) cancels a fall; `cancel()` and a non-calm `setMode` deliberately leave it running rather than leaving her hanging in mid-air.
+- Diagnostics: `isFalling()` alongside `isWandering()` / `isArmed()`. Falling is deliberately *not* "armed" and *not* "wandering".
 
 ### Hook delivery (module F)
 

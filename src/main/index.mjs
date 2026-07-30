@@ -9,10 +9,15 @@ import { fileURLToPath } from 'node:url';
 import {
   CHANNELS,
   HOVER_POLL_MS,
+  WINDOW_SIZE,
+  computeInitialBounds,
   createHoverWatch,
   createPetWindow,
+  enforceWindowSize,
+  moveWindowPinned,
   registerIpc,
   resolveSpritePath,
+  sizeWithinTolerance,
   smokeFlags,
   spriteFileUrl,
   toSpeechDetail,
@@ -27,6 +32,9 @@ const SMOKE = process.env.GANYU_SMOKE === '1';
 const SMOKE_DELAY_MS = 5000;
 const DEFAULT_PORT = 47821;
 const STATE_POLL_MS = 1000;
+
+/** `screen` events that can invalidate the pet's position. */
+const DISPLAY_EVENTS = ['display-metrics-changed', 'display-added', 'display-removed'];
 
 // Transparent always-on-top windows are GPU-composited; on some Windows GPU
 // stacks that shows up as a black box behind the sprite. Escape hatch only.
@@ -70,7 +78,62 @@ function schedule(fn, ms) {
   return cancel;
 }
 
-/** Wander's `moveWindow`. Accepts (x, y), (x) or ({x, y}). */
+/**
+ * The window's measured outer size, captured once after the size has been pinned
+ * (see `moveWindowPinned` in window.mjs for the drift this defends against, with
+ * the numbers).
+ *
+ * Cached rather than re-read live, and snapped to canonical within the tolerance,
+ * for one reason each:
+ *  - live re-reads make the floor follow the drift, which walks the pet up the
+ *    screen a pixel per tick;
+ *  - the reported rect comes back +/-1 DIP depending on the parity of the window's
+ *    position, so an unsnapped reading would put the floor at 698 or 699 according
+ *    to where she happened to be standing when we measured.
+ * A size genuinely outside the tolerance is still honoured — that is what the
+ * measurement is for.
+ */
+let stableSize = null;
+
+function captureWindowSize() {
+  if (!win || win.isDestroyed()) return;
+  try {
+    const b = win.getBounds();
+    if (!b || !Number.isFinite(b.width) || b.width <= 0 || !Number.isFinite(b.height) || b.height <= 0) return;
+    stableSize = sizeWithinTolerance(b)
+      ? { width: WINDOW_SIZE.width, height: WINDOW_SIZE.height }
+      : { width: b.width, height: b.height };
+    if (process.env.GANYU_DEBUG === '1') {
+      console.log(`[ganyu][window] requested ${WINDOW_SIZE.width}x${WINDOW_SIZE.height}, reported ${b.width}x${b.height}, using ${stableSize.width}x${stableSize.height}`);
+    }
+  } catch {
+    /* fall back to the constant */
+  }
+}
+
+function measuredWindowSize() {
+  if (!stableSize) captureWindowSize();
+  return stableSize ?? { width: WINDOW_SIZE.width, height: WINDOW_SIZE.height };
+}
+
+/** Wander's `getPosition`: where the window really is, drags included. */
+function windowPosition() {
+  if (!win || win.isDestroyed()) return null;
+  try {
+    const [x, y] = win.getPosition();
+    return { x, y };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wander's `moveWindow`. Accepts (x, y), (x) or ({x, y}). Delegates to
+ * `moveWindowPinned`, which re-pins the canonical DIP size on every move — a bare
+ * `setPosition` inflates the window a little each call and compounds into
+ * thousands of pixels. That mechanism, and why it must not be simplified away, is
+ * documented at `moveWindowPinned` in window.mjs.
+ */
 function moveWindow(a, b) {
   if (!win || win.isDestroyed()) return;
   let x = a;
@@ -80,10 +143,29 @@ function moveWindow(a, b) {
     y = a.y;
   }
   const [curX, curY] = win.getPosition();
-  win.setPosition(
-    Math.round(Number.isFinite(x) ? x : curX),
-    Math.round(Number.isFinite(y) ? y : curY),
+  moveWindowPinned(
+    win,
+    Number.isFinite(x) ? x : curX,
+    Number.isFinite(y) ? y : curY,
   );
+}
+
+/**
+ * The size guard. `moveWindowPinned` should mean this never fires; it is here to
+ * catch any other resize path (a DPI change, or a move that did not go through
+ * moveWindow) before the inflated window pushes the sprite off the bottom of the
+ * screen. Runs alongside the 1s containment check, which re-clamps afterwards.
+ */
+function guardWindowSize() {
+  if (!win || win.isDestroyed()) return;
+  try {
+    const drifted = enforceWindowSize(win);
+    if (drifted) {
+      console.warn(`[ganyu] window size drifted to ${drifted.width}x${drifted.height} — reset`);
+    }
+  } catch (err) {
+    console.warn('[ganyu] window size guard failed:', err?.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,8 +243,44 @@ function requireMethod(label, target, names) {
 let speechSink = null;
 let wanderSink = null;
 let wanderStop = null;
+let wanderContain = null;
 let wanderIsActive = null;
 let speechTapped = false;
+
+/**
+ * Pull the pet back inside the work area. Cheap enough for the 1s poll because
+ * module E no-ops when she is already inside. Called on startup, from the state
+ * poll, and on every `screen` display event — the owner lost her off the right
+ * edge of a 1707px work area and, with the aggregate mode stuck non-calm, no
+ * stroll ever came to re-clamp her.
+ */
+function containPet() {
+  if (!wanderContain) return;
+  try {
+    wanderContain.call();
+  } catch (err) {
+    console.warn('[ganyu] contain failed:', err?.message);
+  }
+}
+
+/**
+ * A display change can rescale the window as well as move the work area, so
+ * re-pin the canonical size and re-measure before re-clamping. Pins
+ * unconditionally (tolerance 0) rather than via guardWindowSize, so a routine
+ * DPI change is not reported as drift.
+ */
+function onDisplayChange() {
+  if (win && !win.isDestroyed()) {
+    try {
+      enforceWindowSize(win, { tolerance: 0 });
+    } catch (err) {
+      console.warn('[ganyu] window resize on display change failed:', err?.message);
+    }
+  }
+  stableSize = null;
+  captureWindowSize();
+  containPet();
+}
 
 /** Only for the fallback tap, where no normalized event is available. */
 function payloadHints(payload) {
@@ -281,6 +399,9 @@ async function composeRuntime() {
       schedule,
       moveWindow,
       getWorkArea: () => screen.getPrimaryDisplay().workArea,
+      // Measured, not assumed — see measuredWindowSize.
+      getWindowSize: measuredWindowSize,
+      getPosition: windowPosition,
       onWalkState: (next) => {
         walk = next;
         // Pass the walk object, not a boolean: state.setWandering(true) coerces to
@@ -293,6 +414,7 @@ async function composeRuntime() {
     });
     wanderSink = requireMethod('wander', wander, ['onState', 'update', 'setState', 'notify', 'setMode', 'onMode']);
     wanderStop = pickMethod(wander, ['cancel', 'stop', 'disarm', 'reset']);
+    wanderContain = requireMethod('wander contain', wander, ['containNow', 'contain']);
     // `walk` is null during a mid-stroll breather, so it under-reports wandering
     // on GET /state; the module's own isWandering() spans the whole stroll.
     wanderIsActive = typeof wander.isWandering === 'function' ? () => wander.isWandering() : null;
@@ -346,6 +468,28 @@ function getFlags() {
   return { muted: flags.muted, pinned: flags.pinned, spritePath: spriteUrl };
 }
 
+/**
+ * Recall: snap her back to the initial bottom-right corner. The last resort when
+ * the pet is somewhere the owner cannot reach — reachable even while pinned, and
+ * even while the mode is stuck non-calm. Uses the measured size so the corner it
+ * lands on is genuinely inside the work area.
+ */
+function goHome() {
+  if (!win || win.isDestroyed()) return;
+  const home = computeInitialBounds(screen.getPrimaryDisplay().workArea, measuredWindowSize());
+  // Drop any stroll first, or its next tick drags her straight back out.
+  if (wanderStop) {
+    try {
+      wanderStop.call();
+    } catch (err) {
+      console.warn('[ganyu] wander stop failed:', err?.message);
+    }
+  }
+  moveWindowPinned(win, home.x, home.y); // never a bare setPosition — see window.mjs
+  containPet(); // resyncs module E's tracked position to where she now is
+  pushState();
+}
+
 function handleMenuAction(action) {
   if (action === 'toggle-mute') {
     flags.muted = !flags.muted;
@@ -367,6 +511,10 @@ function handleMenuAction(action) {
     }
     return;
   }
+  if (action === 'home') {
+    goHome();
+    return;
+  }
   if (action === 'quit') app.quit();
 }
 
@@ -383,6 +531,12 @@ async function main() {
     workArea: screen.getPrimaryDisplay().workArea,
     preloadPath: PRELOAD,
   });
+  // The BrowserWindow constructor rounds a 256x320 request up to a 259x323 outer
+  // rect on this machine, which hangs 3px past the work area. One pinned move
+  // normalizes it to exactly 256x320 (measured), so do that before measuring —
+  // otherwise every geometry consumer inherits the constructor's rounding.
+  enforceWindowSize(win, { tolerance: 0 });
+  captureWindowSize();
   win.on('closed', () => {
     win = null;
   });
@@ -394,9 +548,16 @@ async function main() {
   // Hover interactivity: forwarded mouse-move does not reach this window on
   // Electron 43 / Win11, so main polls the real cursor (see createHoverWatch).
   // Without it the pet never becomes interactive and the right-click
-  // Mute/Pin/Quit menu — the only user controls — is unreachable.
+  // Mute/Pin/Home/Quit menu — the only user controls — is unreachable.
   hoverWatch = createHoverWatch({
-    getBounds: () => (win && !win.isDestroyed() ? win.getBounds() : null),
+    // Live position, but the *stable* size: getBounds' width/height inflate ~1px
+    // per move (see measuredWindowSize), which slid the sprite's hover box further
+    // off the sprite the longer she walked, until the right-click menu — the only
+    // user control, and the only way to reach 'home' — could not be opened at all.
+    getBounds: () => {
+      const at = windowPosition();
+      return at ? { ...at, ...measuredWindowSize() } : null;
+    },
     getCursorPoint: () => {
       try {
         return screen.getCursorScreenPoint();
@@ -424,7 +585,20 @@ async function main() {
     console.error('[ganyu] composition failed:', err?.stack ?? err?.message);
   }
 
-  statePoll = setInterval(() => pushState(), STATE_POLL_MS);
+  // Contain once now that module E exists and the geometry is settled.
+  containPet();
+
+  // A resolution or scaling change, or a monitor being docked or undocked, can
+  // strand her outside the new work area — nothing in the stroll scheduler would
+  // notice until the next stroll, and a non-calm mode means there is no next
+  // stroll. `screen` is only valid after app.whenReady(), which main() is inside.
+  for (const event of DISPLAY_EVENTS) screen.on(event, onDisplayChange);
+
+  statePoll = setInterval(() => {
+    guardWindowSize(); // reset any residual drift first, then re-clamp
+    containPet();
+    pushState();
+  }, STATE_POLL_MS);
 
   if (SMOKE) {
     setTimeout(() => {
@@ -439,6 +613,13 @@ function cleanup() {
   statePoll = null;
   if (hoverPoll) clearInterval(hoverPoll);
   hoverPoll = null;
+  for (const event of DISPLAY_EVENTS) {
+    try {
+      screen.removeListener(event, onDisplayChange);
+    } catch {
+      /* shutting down */
+    }
+  }
   if (disposeIpc) disposeIpc();
   disposeIpc = null;
   if (wanderStop) {
