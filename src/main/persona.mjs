@@ -204,6 +204,46 @@ export const BRAIN_INSTRUCTIONS = [
   ].join('\n'),
 ].join('\n\n');
 
+// ---------------------------------------------------------------------------
+// Chat prompt — the same person, spoken to instead of reported to
+// ---------------------------------------------------------------------------
+
+/**
+ * Chat replies get roughly twice the ambient line's room. A status bubble is a
+ * remark; an answer to a question is an answer, and one clipped at 110
+ * characters stops before it has said anything. brain.mjs clamps at
+ * MAX_CHAT_LINE_CHARS as the backstop, the same way 140 backs the 110 above.
+ */
+export const CHAT_LINE_TARGET_CHARS = 200;
+
+/**
+ * BRAIN_INSTRUCTIONS **verbatim**, plus the two rules that change when he is
+ * talking to her rather than being reported on. Built by concatenation rather
+ * than by writing a second prompt, because the whole point is that she sounds
+ * like the same person in both — VOICE_EXAMPLES is what carries the register,
+ * and a chat prompt that did not contain it would drift straight back into the
+ * corporate assistant the examples exist to prevent.
+ *
+ * The two overrides are named as overrides. The ambient prompt says "exactly one
+ * short line, under 110 characters" and "your agent's activity reaches you as a
+ * briefing", and simply appending a longer limit after that leaves the model
+ * holding two contradictory rules — so this says which two are being replaced,
+ * and that nothing else is.
+ */
+export const CHAT_INSTRUCTIONS = [
+  BRAIN_INSTRUCTIONS,
+  [
+    `Now the situation has changed: ${OWNER_NAME} has turned away from his screen and spoken to you directly, and is waiting for an answer.`,
+    'Exactly two of the rules above change, and only these two.',
+    'One: answer what he actually said. A question gets its answer.',
+    "Do not read his machine's status back at him, and do not narrate what his agents are doing, unless that is what he asked about.",
+    `Two: instead of exactly one line, reply with one or two short sentences, under ${CHAT_LINE_TARGET_CHARS} characters in total.`,
+    'Everything else holds unchanged — the same voice, the same register, the same banned corporate words,',
+    'the same ban on inventing any detail you were not given, the same rule about his name.',
+    'What his agents are doing is given below as background, in case he asks about it. It is not something to recite.',
+  ].join(' '),
+].join('\n\n');
+
 /** Below this, "he has been working for a while" is noise rather than a fact. */
 const MIN_REPORTED_ACTIVE_MS = 30 * 60 * 1000;
 const MAX_LISTED_TOOLS = 3;
@@ -452,6 +492,58 @@ export function buildBrainInput(ev = {}, summary = null) {
     lastSaidLine(recentLines),
   ];
   return lines.filter(Boolean).join('\n');
+}
+
+/** How each side of the conversation is labelled when it is rendered for her. */
+export const CHAT_SPEAKERS = Object.freeze({ owner: OWNER_NAME, ganyu: 'You' });
+
+/** One `Name: text` line, or null for an entry with nothing in it. */
+function chatTurnLine(entry) {
+  const text = String(entry?.text ?? '').replace(/\s+/g, ' ').trim();
+  if (text === '') return null;
+  return `${entry?.role === 'ganyu' ? CHAT_SPEAKERS.ganyu : CHAT_SPEAKERS.owner}: ${text}`;
+}
+
+/**
+ * The `input` / user text for a chat reply: what is going on around him, what
+ * has already been said, and then his message.
+ *
+ * `{text, history, context}` — `history` is the conversation *before* this
+ * message (`{role:'owner'|'ganyu', text, at}`, oldest first, from chat.mjs) and
+ * `context` is the same buildContext object the ambient path uses.
+ *
+ * The context lines are the ambient briefing's, minus the two that have no
+ * meaning here: there is no event to describe, and `You last said:` is
+ * redundant when the whole conversation is right there. They are also **not**
+ * rate-limited through `decideMentions`, which the ambient path needs and this
+ * one must not have: she is answering a question, and "how long have I been at
+ * this" cannot be answered from a briefing that suppressed the clock. He asked,
+ * so the fact is wanted rather than volunteered.
+ *
+ * Privacy is unchanged and comes from the same place — `context` has already
+ * been through context.mjs's tool-input allowlist, and nothing here reaches for
+ * anything else. The only new text is what he typed himself.
+ */
+export function buildChatInput({ text = '', history = [], context = null } = {}) {
+  const message = String(text ?? '').replace(/\s+/g, ' ').trim();
+  const ctx = context && typeof context === 'object' ? context : null;
+
+  const facts = ctx
+    ? [
+      sessionsLine(ctx.sessions),
+      recentLine(ctx.recent),
+      alsoActiveLine(ctx, null),
+      timeLine(ctx),
+    ].filter(Boolean)
+    : [];
+
+  const turns = (Array.isArray(history) ? history : []).map(chatTurnLine).filter(Boolean);
+
+  const blocks = [];
+  if (facts.length) blocks.push(['Around him right now:', ...facts].join('\n'));
+  if (turns.length) blocks.push(['Earlier in this conversation:', ...turns].join('\n'));
+  blocks.push(`${CHAT_SPEAKERS.owner} says to you: ${message}`);
+  return blocks.join('\n\n');
 }
 
 const SLOTS = ['tool', 'project'];

@@ -125,6 +125,14 @@ export function toolClass(name) {
   return s.toLowerCase();
 }
 
+/**
+ * Something actually finished, and it worked. Only a completion counts: a
+ * `PreToolUse` is "about to run it again", which during a retry loop is the most
+ * common event of all and says nothing about whether the trouble has cleared.
+ */
+const succeeded = (ev) =>
+  !ev.errorish && (ev.event === 'PostToolUse' || IDLE_EVENTS.has(ev.event));
+
 /** Same event→mode table as module B; used only when the caller does not supply `mode`. */
 export function modeForEvent(event, errorish = false) {
   if (errorish) return 'failed';
@@ -293,11 +301,14 @@ export function createSpeech({
     }
     if (ev.event === 'SessionStart') return 'greeting';
     if (IDLE_EVENTS.has(ev.event)) return 'celebrate';
-    // The first step that works after something broke. No tool-class change is
-    // required: that it ran at all is the news. Module B's event carries its own
-    // mode (`busy`), not the session's sticky `failed`, so this fires on the very
-    // next successful event rather than 30 seconds later.
-    if (prevMode === 'failed' && ev.mode === 'busy' && !ev.errorish) return 'recovered';
+    // The first thing that *finishes* successfully after something broke. It has
+    // to be a completion, not a PreToolUse: "about to run it again" says nothing
+    // about whether it works, and treating a retry as a recovery would clear the
+    // failure streak on every attempt. No tool-class change is required — that it
+    // came back at all is the news. Module B's event carries its own mode
+    // (`busy`), not the session's sticky `failed`, so this fires on the next
+    // successful step rather than 30 seconds later.
+    if (prevMode === 'failed' && succeeded(ev)) return 'recovered';
     if (ev.mode === 'busy' && cls !== 'none' && prevClass !== null && cls !== prevClass) {
       return 'busy';
     }
@@ -413,9 +424,10 @@ export function createSpeech({
     const t = now();
     const kind = decideTrigger(ev);
     // The streak is the event's, not the line's: a failure she stays quiet about
-    // still counts towards the third and fifth, which she does not.
+    // still counts towards the third and fifth, which she does not. Only a
+    // successful *completion* clears it — see `succeeded`.
     if (kind === 'failed') failStreak += 1;
-    else if (ev.mode && ev.mode !== 'failed' && !ev.errorish) failStreak = 0;
+    else if (succeeded(ev)) failStreak = 0;
     const patterns = trackPatterns(ev, t);
 
     if (!kind) return { spoken: false, reason: 'no-trigger', kind: null };

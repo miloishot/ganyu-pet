@@ -322,6 +322,26 @@ test('the same file five times over is worth one remark, and only one', () => {
   assert.equal(spoken, 1, 'twelve passes over one file is one remark, not eight');
 });
 
+test('a retry loop is not a recovery, and does not reset the streak', () => {
+  const h = harness();
+  const failed = { source: 'claude', event: 'PostToolUse', sessionId: 's2', toolName: 'Bash', mode: 'failed' };
+  const retry = { source: 'claude', event: 'PreToolUse', sessionId: 's2', toolName: 'Bash', mode: 'busy' };
+
+  const spoken = [];
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    h.advance(30_000);
+    // "About to run it again" says nothing about whether it works. If this
+    // counted as a recovery she would sympathise afresh on every attempt.
+    assert.equal(h.speech.notify(retry).reason, 'no-trigger', `attempt ${attempt}`);
+    h.advance(30_000);
+    const res = h.speech.notify(failed);
+    assert.equal(res.kind, 'failed');
+    assert.equal(h.speech.stats().failStreak, attempt);
+    if (res.spoken) spoken.push(attempt);
+  }
+  assert.deepEqual(spoken, [1, 3, 5], 'the first, the third and the fifth — not all five');
+});
+
 test('a recovery after a failure is always worth a line', () => {
   const h = harness();
   assert.equal(h.speech.notify(failure).kind, 'failed');
@@ -524,9 +544,9 @@ test('every salient trigger fires through the real B -> A -> D seam', () => {
     tool_response: { is_error: true },
   });
 
-  // The next step that works is the recovery.
+  // The next step that finishes and works is the recovery.
   h.advance(QUIET_THROTTLE_MS);
-  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PreToolUse', tool_name: 'Read' });
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PostToolUse', tool_name: 'Read' });
 
   h.advance(QUIET_THROTTLE_MS);
   state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'Stop' });

@@ -15,6 +15,7 @@ import path from 'node:path';
 import {
   DEFAULT_REASONING_EFFORT,
   MAX_BRAIN_LINE_CHARS,
+  MAX_CHAT_LINE_CHARS,
   REQUIRED_KEYS,
   ROUTES,
   createBrain,
@@ -22,7 +23,17 @@ import {
   parseEnvFile,
   postProcess,
 } from '../src/main/brain.mjs';
-import { BRAIN_INSTRUCTIONS, buildBrainInput } from '../src/main/persona.mjs';
+import { buildContext } from '../src/main/context.mjs';
+import {
+  BRAIN_INSTRUCTIONS,
+  BRAIN_LINE_TARGET_CHARS,
+  CHAT_INSTRUCTIONS,
+  CHAT_LINE_TARGET_CHARS,
+  OWNER_NAME,
+  VOICE_EXAMPLES,
+  buildBrainInput,
+  buildChatInput,
+} from '../src/main/persona.mjs';
 
 const CONFIG = Object.freeze({
   enabled: true,
@@ -391,4 +402,391 @@ test('the chat-completions body carries the same prompt as system + user', async
   ]);
   assert.equal(body.model, CONFIG.model);
   assert.equal(body.store, undefined, 'store is a Responses-API field');
+});
+
+// ============================================================ chat replies
+//
+// `requestChat({text, history})` is the seam chat.mjs calls. The transport is
+// the ambient path's, unchanged and shared; what differs is the prompt, the
+// length she is allowed, and the latch.
+
+const HISTORY = Object.freeze([
+  { role: 'owner', text: 'what are you working on?', at: 1000 },
+  { role: 'ganyu', text: 'Watching the edits go past.', at: 1000 },
+]);
+
+// ---------------------------------------------------------------- the prompt
+
+test('the chat prompt is the ambient prompt verbatim, examples and all', () => {
+  // The whole reason CHAT_INSTRUCTIONS is a concatenation rather than a second
+  // prompt: VOICE_EXAMPLES is what holds the register, and a chat prompt without
+  // it drifts straight back to the corporate assistant they exist to prevent.
+  assert.ok(CHAT_INSTRUCTIONS.startsWith(BRAIN_INSTRUCTIONS), 'not a paraphrase — the same text');
+  for (const [situation, line] of VOICE_EXAMPLES) {
+    assert.ok(CHAT_INSTRUCTIONS.includes(line), `voice example missing (${situation}): ${line}`);
+  }
+  assert.ok(CHAT_INSTRUCTIONS.includes(OWNER_NAME));
+  assert.ok(!/mr/i.test(CHAT_INSTRUCTIONS), 'no "Mr" anywhere, not even in a prohibition');
+  assert.ok(!/\b(sir|madam|master|mister)\b/i.test(CHAT_INSTRUCTIONS));
+});
+
+test('the chat prompt names the two rules it overrides, and only those two', () => {
+  const added = CHAT_INSTRUCTIONS.slice(BRAIN_INSTRUCTIONS.length);
+  assert.match(added, /spoken to you directly/);
+  assert.match(added, /answer what he actually said/i);
+  assert.match(added, /two of the rules above change/i, 'says it is an override, not a second opinion');
+
+  // The ambient prompt's "exactly one short line, under 110" has to be replaced
+  // by name, or the model is left holding two contradictory length rules.
+  assert.ok(BRAIN_INSTRUCTIONS.includes(String(BRAIN_LINE_TARGET_CHARS)));
+  assert.ok(added.includes(String(CHAT_LINE_TARGET_CHARS)));
+  assert.match(added, /instead of exactly one line/i);
+  assert.ok(CHAT_LINE_TARGET_CHARS > BRAIN_LINE_TARGET_CHARS, 'a chat reply gets more room');
+});
+
+// ---------------------------------------------------------------- the input
+
+test('buildChatInput renders the conversation oldest first, then his message', () => {
+  assert.deepEqual(buildChatInput({ text: 'and now?', history: HISTORY }).split('\n'), [
+    'Earlier in this conversation:',
+    'Kahweng: what are you working on?',
+    'You: Watching the edits go past.',
+    '',
+    'Kahweng says to you: and now?',
+  ]);
+
+  // A first message has no conversation and, with no context, nothing else.
+  assert.equal(buildChatInput({ text: 'hello' }), 'Kahweng says to you: hello');
+  assert.equal(buildChatInput({}), 'Kahweng says to you: ');
+});
+
+test('buildChatInput collapses newlines and drops entries with nothing in them', () => {
+  const input = buildChatInput({
+    text: '  what\n\nbroke?  ',
+    history: [
+      { role: 'owner', text: '  hello\nthere ', at: 1 },
+      { role: 'ganyu', text: '   ', at: 2 },
+      { role: 'ganyu', text: null, at: 3 },
+      'not an entry',
+    ],
+  });
+  assert.deepEqual(input.split('\n'), [
+    'Earlier in this conversation:',
+    'Kahweng: hello there',
+    '',
+    'Kahweng says to you: what broke?',
+  ]);
+  assert.equal(buildChatInput({ text: 'hi', history: 'not an array' }), 'Kahweng says to you: hi');
+});
+
+test('the chat briefing carries the activity, so "what broke" has facts to answer from', async () => {
+  const context = {
+    time: { hhmm: '22:15', daypart: 'late night', lateNight: true },
+    recent: null,
+    sessions: { count: 4, projects: ['ganyu-pet'], activeSince: null, activeForMs: null },
+  };
+  const fetchImpl = scriptedFetch(responsesOk('Bash stumbled, but it cleared.'));
+  const brain = createBrain({ config: CONFIG, fetchImpl, getContext: () => context });
+
+  assert.equal(await brain.requestChat({ text: 'what broke?' }), 'Bash stumbled, but it cleared.');
+  const input = fetchImpl.calls[0].body.input;
+  assert.equal(input, buildChatInput({ text: 'what broke?', history: [], context }));
+  assert.match(input, /^Around him right now:$/m);
+  assert.match(input, /^Right now: 4 coding sessions are running at once\.$/m);
+  assert.match(input, /^Local time: 22:15, late night\.$/m);
+  assert.match(input, /^Kahweng says to you: what broke\?$/m);
+});
+
+test('the clock is not rate-limited out of a chat briefing — he asked', async () => {
+  // decideMentions exists because a fact in *every* ambient prompt reads as the
+  // point of the prompt. A question is the opposite case: "how long have I been
+  // at this" cannot be answered from a briefing that suppressed the clock.
+  const context = {
+    time: { hhmm: '01:40', daypart: 'late night', lateNight: true },
+    recent: null,
+    sessions: { count: 5, projects: [], activeSince: null, activeForMs: 5 * 60 * 60 * 1000 },
+  };
+  const fetchImpl = scriptedFetch(responsesOk('Nearly two, and still going.'));
+  const brain = createBrain({ config: CONFIG, fetchImpl, getContext: () => context });
+
+  await brain.requestChat({ text: 'what time is it?' });
+  await brain.requestChat({ text: 'and how long have I been at this?' });
+
+  assert.equal(fetchImpl.calls.length, 2);
+  for (const call of fetchImpl.calls) {
+    assert.match(call.body.input, /^Local time: 01:40, late night\. He has been working for about 5 hours\.$/m);
+    assert.match(call.body.input, /^Right now: 5 coding sessions are running at once\.$/m);
+  }
+});
+
+// ---------------------------------------------------------------- length
+
+test('a chat reply is not clamped to the ambient line limit', async () => {
+  assert.equal(MAX_BRAIN_LINE_CHARS, 140);
+  assert.equal(MAX_CHAT_LINE_CHARS, 240);
+
+  // Two sentences of the length the chat prompt asks for: must survive whole.
+  const answer = 'The tests are green again. '.repeat(7).trim();
+  assert.ok(answer.length > MAX_BRAIN_LINE_CHARS, `${answer.length} chars — the ambient clamp would cut it`);
+  assert.ok(answer.length <= CHAT_LINE_TARGET_CHARS, 'and it is within what the chat prompt asks for');
+
+  const chatFetch = scriptedFetch(responsesOk(answer));
+  assert.equal(
+    await createBrain({ config: CONFIG, fetchImpl: chatFetch }).requestChat({ text: 'how did it go?' }),
+    answer,
+    'nothing cut',
+  );
+
+  // The same text on the ambient path is still cut, so the two limits are real
+  // and separate rather than one limit that quietly got looser for everyone.
+  const ambientFetch = scriptedFetch(responsesOk(answer));
+  const line = await createBrain({ config: CONFIG, fetchImpl: ambientFetch }).requestLine({ detail: DETAIL });
+  assert.ok(line.length <= MAX_BRAIN_LINE_CHARS, `ambient length ${line.length}`);
+  assert.ok(line.endsWith('…'));
+});
+
+test('the chat backstop still cuts a runaway reply, at a word boundary', async () => {
+  const runaway = 'word '.repeat(120).trim(); // 599 chars
+  const fetchImpl = scriptedFetch(responsesOk(runaway));
+  const replyText = await createBrain({ config: CONFIG, fetchImpl }).requestChat({ text: 'tell me everything' });
+
+  assert.ok(replyText.length <= MAX_CHAT_LINE_CHARS, `length ${replyText.length}`);
+  assert.ok(replyText.length > MAX_BRAIN_LINE_CHARS, 'and it used the chat allowance, not the ambient one');
+  assert.ok(replyText.endsWith('…'));
+  assert.ok(replyText.slice(0, -1).endsWith('word'), `cut mid-word: ${replyText}`);
+  assert.equal(postProcess('', MAX_CHAT_LINE_CHARS), null);
+});
+
+// ---------------------------------------------------------------- transport
+
+test('the chat path follows the same transport rules as the ambient one', async () => {
+  const fetchImpl = scriptedFetch(reply(404, {}), chatOk('Of course.'));
+  const brain = createBrain({ config: CONFIG, fetchImpl });
+
+  assert.equal(await brain.requestChat({ text: 'busy?' }), 'Of course.');
+  assert.deepEqual(fetchImpl.urls(), [
+    `${CONFIG.baseUrl}${ROUTES.responses}`,
+    `${CONFIG.baseUrl}${ROUTES.chat}`,
+  ], 'responses first, chat completions as the fallback');
+  assert.equal(brain.stats().route, 'chat', 'and the working route is remembered');
+
+  const responsesBody = fetchImpl.calls[0].body;
+  assert.equal(responsesBody.store, false, 'the owner disabled response storage');
+  assert.equal(responsesBody.model, CONFIG.model);
+  assert.equal(responsesBody.instructions, CHAT_INSTRUCTIONS);
+  assert.deepEqual(responsesBody.reasoning, { effort: DEFAULT_REASONING_EFFORT });
+  assert.ok(Number.isInteger(responsesBody.max_output_tokens));
+  assert.equal(fetchImpl.calls[0].init.headers.authorization, `Bearer ${CONFIG.apiKey}`);
+
+  assert.deepEqual(fetchImpl.calls[1].body.messages, [
+    { role: 'system', content: CHAT_INSTRUCTIONS },
+    { role: 'user', content: buildChatInput({ text: 'busy?' }) },
+  ]);
+  assert.equal(fetchImpl.calls[1].body.reasoning, undefined, 'never on the chat-completions route');
+});
+
+test('every chat failure resolves null and releases the latch', async () => {
+  for (const [label, step] of Object.entries({
+    'a 500': reply(500, {}),
+    'an unparseable body': { status: 200, json: async () => { throw new Error('not json'); } },
+    'a blank reply': responsesOk('   \n '),
+  })) {
+    const brain = createBrain({ config: CONFIG, fetchImpl: scriptedFetch(step) });
+    assert.equal(await brain.requestChat({ text: 'hello?' }), null, label);
+    assert.deepEqual(brain.stats().pending, { ambient: false, chat: false }, label);
+  }
+
+  const offline = createBrain({
+    config: CONFIG,
+    fetchImpl: async () => { throw new Error('getaddrinfo ENOTFOUND endpoint.invalid'); },
+  });
+  assert.equal(await offline.requestChat({ text: 'hello?' }), null);
+  assert.equal(offline.stats().pending.chat, false);
+});
+
+test('a chat request that never answers is aborted and resolves null', async () => {
+  let aborted = false;
+  const fetchImpl = (url, init) =>
+    new Promise((_, reject) => {
+      init.signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }));
+      });
+    });
+
+  const brain = createBrain({ config: CONFIG, fetchImpl, timeoutMs: 20 });
+  assert.equal(await brain.requestChat({ text: 'anyone home?' }), null);
+  assert.equal(aborted, true, 'the same 10s-style AbortController timeout applies');
+  assert.equal(brain.stats().pending.chat, false, 'and the latch is not wedged');
+});
+
+test('401 on a chat request disables the brain for the ambient path too', async () => {
+  const fetchImpl = scriptedFetch(reply(401, {}));
+  const log = recorder();
+  const brain = createBrain({ config: CONFIG, fetchImpl, log });
+
+  assert.equal(await brain.requestChat({ text: 'hello' }), null);
+  assert.equal(brain.isEnabled(), false);
+  assert.equal(await brain.requestChat({ text: 'still there?' }), null);
+  assert.equal(await brain.requestLine({ detail: DETAIL }), null);
+  assert.equal(fetchImpl.calls.length, 1, 'nothing after the rejection reaches the network');
+
+  const rejected = log.lines.filter((l) => l.includes('endpoint rejected the key'));
+  assert.equal(rejected.length, 1, 'one log line, from whichever path hit it first');
+  for (const entry of log.lines) assert.ok(!entry.includes(CONFIG.apiKey), entry);
+});
+
+test('a disabled brain and an empty message both answer null without fetching', async () => {
+  const off = scriptedFetch(responsesOk('hello'));
+  assert.equal(
+    await createBrain({ config: { enabled: false, reason: 'no .env.local' }, fetchImpl: off })
+      .requestChat({ text: 'hello?' }),
+    null,
+  );
+  assert.equal(off.calls.length, 0);
+
+  // chat.mjs already refuses blank input; this is the same promise kept here, so
+  // an empty message can never spend a request.
+  const blank = scriptedFetch(responsesOk('hello'));
+  const brain = createBrain({ config: CONFIG, fetchImpl: blank });
+  for (const text of ['', '   ', '\n\t ', null, undefined]) {
+    assert.equal(await brain.requestChat({ text }), null, JSON.stringify(text));
+  }
+  assert.equal(await brain.requestChat(), null, 'no argument at all');
+  assert.equal(blank.calls.length, 0);
+});
+
+// ------------------------------------------------- chat vs ambient single-flight
+
+test('a chat message is not dropped because an ambient request is in flight', async () => {
+  // The defect this guards: a hook event landing a few milliseconds before he
+  // presses Enter used to swallow his message on the shared latch, and he would
+  // watch the pending bubble resolve to nothing for no reason he could see.
+  let releaseAmbient = null;
+  const held = new Promise((resolve) => { releaseAmbient = resolve; });
+  const fetchImpl = scriptedFetch(async (_url, init) => {
+    if (JSON.parse(init.body).instructions === CHAT_INSTRUCTIONS) return responsesOk('Still here.');
+    await held;
+    return responsesOk('Running the tests…');
+  });
+  const brain = createBrain({ config: CONFIG, fetchImpl });
+
+  const ambient = brain.requestLine({ detail: DETAIL, summary: SUMMARY });
+  assert.deepEqual(brain.stats().pending, { ambient: true, chat: false });
+
+  assert.equal(await brain.requestChat({ text: 'what broke?' }), 'Still here.');
+  assert.equal(fetchImpl.calls.length, 2, 'his message reached the endpoint anyway');
+
+  releaseAmbient();
+  assert.equal(await ambient, 'Running the tests…', 'and the ambient line still lands');
+  assert.deepEqual(brain.stats().pending, { ambient: false, chat: false });
+  assert.equal(brain.stats().inFlight, false);
+});
+
+test('an ambient line is not dropped because he is mid-conversation', async () => {
+  let releaseChat = null;
+  const held = new Promise((resolve) => { releaseChat = resolve; });
+  const fetchImpl = scriptedFetch(async (_url, init) => {
+    if (JSON.parse(init.body).instructions === CHAT_INSTRUCTIONS) {
+      await held;
+      return responsesOk('One moment.');
+    }
+    return responsesOk('That step failed.');
+  });
+  const brain = createBrain({ config: CONFIG, fetchImpl });
+
+  const chatting = brain.requestChat({ text: 'how are the tests?' });
+  assert.deepEqual(brain.stats().pending, { ambient: false, chat: true });
+  assert.equal(brain.stats().inFlight, true, 'the boolean still means "anything in flight"');
+
+  assert.equal(await brain.requestLine({ detail: DETAIL, summary: SUMMARY }), 'That step failed.');
+
+  releaseChat();
+  assert.equal(await chatting, 'One moment.');
+});
+
+test('within a kind the single-flight guard still holds', async () => {
+  const gates = { chat: null, ambient: null };
+  const fetchImpl = scriptedFetch((_url, init) => (
+    JSON.parse(init.body).instructions === CHAT_INSTRUCTIONS
+      ? new Promise((resolve) => { gates.chat = () => resolve(responsesOk('Here.')); })
+      : new Promise((resolve) => { gates.ambient = () => resolve(responsesOk('Working.')); })
+  ));
+  const brain = createBrain({ config: CONFIG, fetchImpl });
+
+  const firstChat = brain.requestChat({ text: 'one' });
+  assert.equal(await brain.requestChat({ text: 'two' }), null, 'a second chat gives up at once');
+
+  const firstAmbient = brain.requestLine({ detail: DETAIL });
+  assert.equal(await brain.requestLine({ detail: DETAIL }), null, 'and a second ambient event too');
+  assert.equal(fetchImpl.calls.length, 2, 'one request per kind, not four');
+
+  gates.chat();
+  gates.ambient();
+  assert.equal(await firstChat, 'Here.');
+  assert.equal(await firstAmbient, 'Working.');
+  assert.deepEqual(brain.stats().pending, { ambient: false, chat: false }, 'neither latch is sticky');
+});
+
+// ---------------------------------------------------------------- privacy
+
+const SECRETS = Object.freeze({
+  file_path: 'C:\\repo\\src\\auth.ts',
+  old_string: 'const OLD_PASSWORD = "hunter2";',
+  new_string: 'const NEW_PASSWORD = "correct-horse-battery";',
+  content: 'the entire contents of the file he is writing',
+  prompt: 'what the owner actually typed into his agent',
+  command: 'npm test',
+});
+
+const LEAKS = ['hunter2', 'correct-horse', 'OLD_PASSWORD', 'NEW_PASSWORD',
+  'entire contents', 'actually typed'];
+
+test('a chat request can carry no more of his machine than an ambient one', async () => {
+  const at = Date.now();
+  const ring = Array.from({ length: 4 }, (_, i) => ({
+    at: at - (5 - i) * 60_000,
+    source: 'claude',
+    sessionId: 's1',
+    event: 'PreToolUse',
+    mode: 'busy',
+    raw: {
+      session_id: 's1',
+      cwd: 'C:\\repo',
+      hook_event_name: 'PreToolUse',
+      tool_name: 'Edit',
+      tool_input: SECRETS,
+    },
+  }));
+
+  const fetchImpl = scriptedFetch(responsesOk('It was the auth file.'));
+  await createBrain({
+    config: CONFIG,
+    fetchImpl,
+    getContext: () => buildContext({ ring, state: null, now: at }),
+  }).requestChat({
+    text: 'what broke?',
+    history: [{ role: 'owner', text: 'anything wrong?', at }],
+  });
+
+  // The whole serialized request, not just the input — a leak anywhere in it counts.
+  const sent = fetchImpl.calls[0].init.body;
+  for (const secret of LEAKS) {
+    assert.ok(!sent.includes(secret), `the chat request leaked ${secret}`);
+  }
+  assert.ok(sent.includes('auth.ts'), 'the file *name* is still sayable — that is what the allowlist is for');
+
+  // And there is no channel for it either: requestChat reads `text` and
+  // `history` and nothing else, so a caller cannot hand it a payload to render.
+  const smuggled = scriptedFetch(responsesOk('ok'));
+  await createBrain({ config: CONFIG, fetchImpl: smuggled }).requestChat({
+    text: 'hello',
+    history: [],
+    detail: { toolInput: SECRETS },
+    context: SECRETS,
+    summary: SECRETS.content,
+  });
+  for (const secret of LEAKS) {
+    assert.ok(!smuggled.calls[0].init.body.includes(secret), `an extra argument reached the prompt: ${secret}`);
+  }
 });

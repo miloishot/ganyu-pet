@@ -9,6 +9,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+// The only project import here, and a safe one: chat.mjs is pure — no Electron,
+// no timers of its own — so window.test.mjs still runs on plain node. The two
+// channel names are defined there rather than duplicated into CHANNELS below,
+// because two frozen tables of the same strings is exactly how they drift.
+import { CHAT_CHANNELS } from './chat.mjs';
+
 /** Sprite frame is 192x208; the extra headroom is for the speech bubble. */
 export const WINDOW_SIZE = Object.freeze({ width: 256, height: 320 });
 
@@ -88,7 +94,10 @@ export function enforceWindowSize(win, { size = WINDOW_SIZE, tolerance = SIZE_DR
 /** Codex pet id — see contracts.md "Machine facts". */
 export const PET_ID = 'ganyu--chenxin-dlut';
 
-/** Channels this module owns. Nothing outside this list is registered. */
+/**
+ * Channels this module owns. Nothing outside this list — and CHAT_CHANNELS,
+ * which `registerIpc` also registers — is registered.
+ */
 export const CHANNELS = Object.freeze({
   state: 'ganyu:state',
   speak: 'ganyu:speak',
@@ -348,8 +357,22 @@ export function smokeFlags(win) {
  *
  * `onInteractive` (optional) hands the renderer's request to the hover watch
  * instead of applying it straight to the window, so polling and DOM hover agree.
+ *
+ * `getChat` (optional) is read per message rather than captured, because the
+ * chat module is composed asynchronously in `composeRuntime` while this runs at
+ * window creation. Registering the channel early is the point: `invoke` on an
+ * unregistered channel *rejects*, and the renderer raises its pending bubble the
+ * instant it calls, so a message sent during startup has to resolve to a plain
+ * null it already knows how to display.
  */
-export function registerIpc({ ipcMain, getWindow, getFlags, onMenuAction, onInteractive = null }) {
+export function registerIpc({
+  ipcMain,
+  getWindow,
+  getFlags,
+  onMenuAction,
+  onInteractive = null,
+  getChat = null,
+}) {
   const handleSetInteractive = (_event, interactive) => {
     if (onInteractive) {
       onInteractive(Boolean(interactive));
@@ -364,14 +387,64 @@ export function registerIpc({ ipcMain, getWindow, getFlags, onMenuAction, onInte
   };
   const handleGetFlags = () => getFlags();
 
+  /** Owner -> Ganyu. Always a string or null; never a rejection, never a hang. */
+  const handleChat = async (_event, text) => {
+    let chat = null;
+    try {
+      chat = getChat ? getChat() : null;
+    } catch {
+      return null;
+    }
+    if (!chat || typeof chat.send !== 'function') return null;
+    try {
+      const reply = await chat.send(String(text ?? ''));
+      return typeof reply === 'string' && reply.trim() !== '' ? reply : null;
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * Lift and restore focusability for the chat input.
+   *
+   * `createPetWindow` builds the window `focusable: false` so an always-on-top
+   * overlay can never steal the caret from the editor — which also means its own
+   * text input cannot receive a keystroke until main lifts that. The renderer
+   * asks on open and gives it back on close; restoring the flag *and* blurring is
+   * what hands focus back to whatever he was typing in, since dropping
+   * focusability alone leaves the window holding the focus it already had.
+   */
+  const handleSetFocus = (_event, focused) => {
+    const win = getWindow();
+    if (!win || win.isDestroyed()) return;
+    try {
+      if (focused) {
+        win.setFocusable(true);
+        win.focus();
+      } else {
+        win.setFocusable(false);
+        win.blur();
+      }
+    } catch {
+      // A window that cannot be focused is a chat strip he must click twice —
+      // annoying, and never a reason to take the pet down.
+    }
+  };
+
   ipcMain.on(CHANNELS.setInteractive, handleSetInteractive);
   ipcMain.on(CHANNELS.menu, handleMenu);
   ipcMain.handle(CHANNELS.getFlags, handleGetFlags);
+  ipcMain.on(CHAT_CHANNELS.setFocus, handleSetFocus);
+  ipcMain.handle(CHAT_CHANNELS.chat, handleChat);
 
   return () => {
     ipcMain.removeListener(CHANNELS.setInteractive, handleSetInteractive);
     ipcMain.removeListener(CHANNELS.menu, handleMenu);
-    if (typeof ipcMain.removeHandler === 'function') ipcMain.removeHandler(CHANNELS.getFlags);
+    ipcMain.removeListener(CHAT_CHANNELS.setFocus, handleSetFocus);
+    if (typeof ipcMain.removeHandler === 'function') {
+      ipcMain.removeHandler(CHANNELS.getFlags);
+      ipcMain.removeHandler(CHAT_CHANNELS.chat);
+    }
   };
 }
 

@@ -115,7 +115,9 @@ Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteract
 
 `createSpeech({exec, clock, onLine, isMuted})` — `exec` injected (production: `child_process.execFile` of `C:\Users\kw11l\.local\bin\claude` with args `['-p', prompt, '--model', 'haiku']`, 60s timeout, kill on expiry — measured CLI latency on this machine is 23–57s, so 15s starved every live call).
 
-- **Triggers**: `SessionStart` (greeting), `Stop`/`SessionEnd` (celebrate), `waiting` (nudge), `failed` (sympathy), the first successful step after a failure (**recovered**), and a tool-class change during `busy` (busy). Queue depth 1 — a newer trigger replaces a pending one.
+- **Triggers**: `SessionStart` (greeting), `Stop`/`SessionEnd` (celebrate), `waiting` (nudge), `failed` (sympathy), the first successful **completion** after a failure (**recovered**), and a tool-class change during `busy` (busy). Queue depth 1 — a newer trigger replaces a pending one.
+
+  **A recovery is a completion, never a `PreToolUse`.** During a retry loop "about to run it again" is the commonest event of all and says nothing about whether the trouble cleared; counting it as a recovery would reset the failure streak on every attempt and hand her a fresh sympathetic line each time — the exact defect the streak rule exists to prevent. Only `PostToolUse`/`Stop`/`SessionEnd` without an error marker (`succeeded(ev)`) clears the streak or fires `recovered`.
 
 - **Salience — the gate that decides whether a trigger is worth a line at all.** `salienceOf({kind, failStreak, quietForMs, sinceNotableMs, patterns})` (exported from `speech.mjs`, pure) returns `{level, reason}` with `level` ∈ `urgent | always | notable | null`. It lives in speech rather than context because it is a decision about *speaking*, and `context.mjs` is deliberately stateless with no notion of what the pet has said.
 
@@ -133,7 +135,7 @@ Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteract
 - Persona prompt: `BRAIN_INSTRUCTIONS` in `persona.mjs` — see §Brain.
   `OWNER_NAME` is **Kahweng** (owner's preferred name — no honorific, never "Mr.").
   `{summary}` = compact human phrase built from the normalized event (`"codex finished a task in ganyu-pet"`, `"Claude Code is waiting for permission to run Bash"`).
-- On exec error/timeout/empty output → canned fallback per mode (≥6 lines per mode table in `persona.mjs`), same cooldown rules. Muted → no exec calls at all.
+- On exec error/timeout/empty output → canned fallback from the `MESSAGES` table in `persona.mjs`, same cooldown rules. Muted → no exec calls at all. Six kinds — `greeting`, `busy`, `waiting`, `failed`, `recovered`, `celebrate` — 3–5 variants each, ≤ `MAX_LINE_CHARS` (70), at most one emoji, no honorific, and at least one slot-free variant per kind so an event with no tool or project still renders. `recovered` is its own kind rather than a `busy` line because "Running Bash…" is the wrong thing to say at the moment the trouble clears, and because the brain writes a better line when it is told which of the two moments this is.
 
 ### Brain (optional LLM speech — module D)
 
@@ -165,7 +167,7 @@ Pure functions over module B's debug ring and aggregate — no I/O, no clock, no
 - `localTimePhrase(now)` — `{hhmm, daypart, lateNight}`. `lateNight` spans 22:00–05:00 and is what lets her suggest he stop.
 - `buildContext({ring, state, now, activeSinceMs})` — all of the above, assembled once per brain request; returns **null** rather than throwing, and a null context is simply the old thin input.
 
-`persona.buildBrainInput` renders it. **Every line is optional and an unknown fact deletes its line** — she is never handed `project: unknown` to read out — and with neither context nor recent lines the output is byte-for-byte the original one-line form:
+`persona.buildBrainInput` renders it. **Every line is optional and an unknown fact deletes its line** — she is never handed `project: unknown` to read out — and with neither context nor recent lines the output is byte-for-byte the original one-line form. Two of the lines are additionally **rate-limited** rather than merely optional (see below):
 
 ```
 Right now: 5 coding sessions are running at once.
@@ -176,11 +178,18 @@ Local time: 22:15, late night. He has been working for about 4 hours.
 You last said: "Running npm test…" — do not repeat yourself.
 ```
 
+**The two rate-limited lines — `Local time:` and `Right now:`.** Both used to be emitted on every request (the time whenever `context.time` existed, the count whenever it was ≥ 2), and a fact repeated in every prompt is read as the point of the prompt — so she announced the clock and the session count endlessly. `persona.decideMentions(context, memory, {now, firstLine})` now gates them, mutating `memory` when it decides a line is worth including, because "worth saying" is entirely a question of when it was last said:
+
+- **Time** — her first line ever · a **4h** then **6h** working-stretch mark passed for the first time (`LONG_SESSION_STEPS_MS`, cooldown ignored, one remark each) · or it is genuinely late (**≥ 23:00 or < 05:00**, narrower than context's 22:00 `lateNight` daypart label) or she is speaking after a long silence, **and** she has not mentioned the hour for `TIME_MENTION_COOLDOWN_MS` (**45 min**). Otherwise the line is omitted entirely — and `BRAIN_INSTRUCTIONS` forbids mentioning time when it is absent, which is what makes the omission bite.
+- **Sessions** — the count first reaches `SESSIONS_NOTABLE_COUNT` (**3**; two at once is this owner's ordinary day) · then only on a jump of `SESSIONS_NOTABLE_JUMP` (**2**) or more · or any change once `SESSIONS_MENTION_COOLDOWN_MS` (**30 min**) has passed. Dropping back under 3 clears the mark, so the next crowd is news again.
+
+**Where the state lives.** `createMentionMemory()` is created and owned by `createSpeech` alongside the lines she remembers — no module-level store, so two pets in one process never share it — and injectable via `createSpeech({mentionMemory})` for tests. It reaches this function as `ev.narration = {memory, now, firstLine}` on the brain detail, snapshotted **before** the urgent canned line is shown (otherwise every urgent line looks like a continuation of itself and `firstLine` is never true). It has to travel that way round because only speech knows when she last spoke, and only `buildBrainInput` sees the context the decision reads. A null memory means there is nothing to rate-limit against and yields the old unconditional shape.
+
 **Privacy — the hard line.** File *paths*, command *strings*, tool names, project names and counts may be sent. File contents, diffs, prompt text, transcripts and environment values may not, ever. This is enforced by an **allowlist** of `tool_input` keys (`ALLOWED_TOOL_INPUT_KEYS`: `file_path`, `notebook_path`, `path`, `command`, `pattern`, `url`, `subagent_type`) and never a denylist, so a tool that invents a new key is silent by default rather than leaky by default. Three corollaries, each load-bearing and each easy to undo by accident:
 
 1. Only **string** values are taken, so an object smuggled under an allowed key is dropped rather than serialized.
 2. A truncated ring capture (`{truncated, bytes, preview}`) counts as **no payload at all** — `preview` is a raw prefix of the event JSON and can contain a diff, so it is never read. Such an entry yields less detail; it never throws.
-3. Commands are run through `redactSecrets` before being quoted: `sk-`/`ghp_`/`xox`-prefixed tokens, long hex, and long mixed-case base64 become `<redacted>`. Over-redaction is the safe direction.
+3. Commands are run through `redactSecrets` before being quoted: `sk-`/`ghp_`/`xox`-prefixed tokens, 32+ hex runs, `Bearer <token>`, a bare mixed-case base64 blob, and the value of anything *named* like a credential (`TOKEN=`, `--api-key`, `password:` …, where the name is kept and only the value goes). **Over-redaction is not free, and it was over-redacting.** `/` used to be in the base64 character class, so the ordinary path run `Users/kw11l/AppData/Local/Temp/claude/C` — long, mixed case, a digit in `kw11l` — matched, and she read out `LOG="C:/<redacted>--Users-kw11l-…`. A path she cannot say is a fact lost on every line that mentions one. Neither `/` nor `-` is in the class now: a real blob is one solid run, while a path is short runs joined by separators. `test/context.test.mjs` pins both directions — a real-looking key *is* redacted, a long dashed Windows path is *not*.
 
 `speech.normalizeEvent` applies the same allowlist at the edge, so the forbidden keys do not travel past the event that carried them. `test/context.test.mjs` proves it from both ends: the unfiltered payload handed straight to the input builder, and the real `state → speech → brain` seam.
 

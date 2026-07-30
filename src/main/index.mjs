@@ -6,6 +6,7 @@ import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { createChat } from './chat.mjs';
 import { buildContext, trackActiveSince } from './context.mjs';
 import {
   CHANNELS,
@@ -50,6 +51,7 @@ let spriteUrl = null;
 
 let state = null;
 let server = null;
+let chat = null;
 let walk = null;
 let statePoll = null;
 let hoverPoll = null;
@@ -421,6 +423,19 @@ async function composeRuntime() {
     }
   }
 
+  // The owner's half of the conversation. Built unconditionally, with whatever
+  // the brain turned out to be: `createChat({brain: null})` is not a broken chat,
+  // it is one whose every `send` resolves null — which is precisely the contract
+  // `ganyu:chat` promises and what the renderer already draws its in-character
+  // fallback from. Guarding the construction instead would only move the null
+  // one layer out and add a way for the channel to hang.
+  chat = createChat({ brain });
+  console.log(
+    brain
+      ? '[ganyu] chat: enabled'
+      : '[ganyu] chat: disabled (no brain) — she cannot answer, the bubble says so',
+  );
+
   const speechMod = await tryImport('./speech.mjs');
   if (speechMod?.createSpeech) {
     const speech = speechMod.createSpeech({
@@ -618,6 +633,9 @@ async function main() {
     getFlags,
     onMenuAction: handleMenuAction,
     onInteractive: (interactive) => hoverWatch.setRendererWants(interactive),
+    // Read per message, not captured: composeRuntime builds `chat` below, after
+    // this runs. Anything he types before then answers null instead of rejecting.
+    getChat: () => chat,
   });
 
   try {

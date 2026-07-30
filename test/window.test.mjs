@@ -6,6 +6,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { CHAT_CHANNELS, createChat } from '../src/main/chat.mjs';
 import {
   CHANNELS,
   HOVER_POLL_MS,
@@ -116,6 +117,10 @@ class FakeWindow {
     this.options = options;
     this.alwaysOnTop = Boolean(options.alwaysOnTop);
     this.listeners = new Map();
+    // The overlay is built focusable:false so it never steals the caret.
+    this.focusable = options.focusable !== false;
+    this.focused = false;
+    this.focusLog = [];
     // A framed window's outer bounds exceed its content bounds.
     const chrome = options.frame === true ? { w: 16, h: 39 } : { w: 0, h: 0 };
     this.bounds = { x: options.x, y: options.y, width: options.width + chrome.w, height: options.height + chrome.h };
@@ -130,6 +135,10 @@ class FakeWindow {
   getContentBounds() { return { ...this.content }; }
   once(event, cb) { this.listeners.set(event, cb); }
   showInactive() {}
+
+  setFocusable(v) { this.focusable = Boolean(v); this.focusLog.push(`focusable:${Boolean(v)}`); }
+  focus() { this.focused = true; this.focusLog.push('focus'); }
+  blur() { this.focused = false; this.focusLog.push('blur'); }
 
   /**
    * Reproduces the measured Windows behaviour: a bare setPosition re-rounds the
@@ -294,6 +303,130 @@ test('registerIpc dispatches every MENU_ACTIONS entry and nothing else', () => {
 
   dispose();
   assert.equal(handlers.size, 0, 'dispose removes every listener it added');
+});
+
+// ---------------------------------------------------------------- chat channels
+//
+// registerIpc owns the chat pair too. `ganyu:set-focus` is purely a window
+// operation, and `ganyu:chat` is registered here — at window creation — rather
+// than later, when composeRuntime builds the chat module: `invoke` on an
+// unregistered channel *rejects*, and the renderer raises its pending bubble the
+// instant it calls, so a message typed during startup has to come back as a
+// plain null it already knows how to draw.
+
+function ipcHarness({ getChat = null, getWindow = () => null } = {}) {
+  const handlers = new Map();
+  const ipcMain = {
+    on: (channel, fn) => handlers.set(channel, fn),
+    handle: (channel, fn) => handlers.set(channel, fn),
+    removeListener: (channel) => handlers.delete(channel),
+    removeHandler: (channel) => handlers.delete(channel),
+  };
+  const dispose = registerIpc({
+    ipcMain,
+    getWindow,
+    getFlags: () => ({ muted: false, pinned: false, spritePath: null }),
+    onMenuAction: () => {},
+    getChat,
+  });
+  return { handlers, dispose, call: (channel, ...args) => handlers.get(channel)(null, ...args) };
+}
+
+test('registerIpc registers the chat pair alongside the original three, and disposes both', () => {
+  const h = ipcHarness();
+  assert.ok(h.handlers.has(CHAT_CHANNELS.chat), 'ganyu:chat');
+  assert.ok(h.handlers.has(CHAT_CHANNELS.setFocus), 'ganyu:set-focus');
+  assert.equal(h.handlers.size, 5, 'the three renderer->main channels plus the chat pair');
+
+  // chat.mjs is the single home of these two strings; CHANNELS must not grow a
+  // second copy of either, which is the only way the two tables could drift.
+  for (const channel of Object.values(CHAT_CHANNELS)) {
+    assert.ok(!Object.values(CHANNELS).includes(channel), `${channel} is defined in both tables`);
+  }
+
+  h.dispose();
+  assert.equal(h.handlers.size, 0, 'dispose removes every listener it added');
+});
+
+test('ganyu:chat answers null before the chat module exists, then relays the reply', async () => {
+  let chat = null;
+  const h = ipcHarness({ getChat: () => chat });
+  const send = (text) => h.call(CHAT_CHANNELS.chat, text);
+
+  assert.equal(await send('hello?'), null, 'composeRuntime has not run yet');
+
+  chat = createChat({ brain: { requestChat: ({ text }) => Promise.resolve(`re: ${text}`) } });
+  assert.equal(await send('are you there?'), 're: are you there?');
+
+  // No brain is not a broken chat — it is one whose every send resolves null,
+  // which is exactly what the renderer's in-character fallback is for.
+  chat = createChat({ brain: null });
+  assert.equal(await send('and now?'), null);
+});
+
+test('ganyu:chat never rejects and never hands back a blank line', async () => {
+  const cases = {
+    'a chat that throws': { send: () => { throw new Error('boom'); } },
+    'a chat that rejects': { send: () => Promise.reject(new Error('boom')) },
+    'a blank reply': { send: () => Promise.resolve('   ') },
+    'a non-string reply': { send: () => Promise.resolve({ text: 'nope' }) },
+    'not a chat at all': {},
+  };
+  for (const [label, chat] of Object.entries(cases)) {
+    assert.equal(await ipcHarness({ getChat: () => chat }).call(CHAT_CHANNELS.chat, 'hi'), null, label);
+  }
+
+  const broken = ipcHarness({ getChat: () => { throw new Error('composition failed'); } });
+  assert.equal(await broken.call(CHAT_CHANNELS.chat, 'hi'), null, 'a getter that throws is survivable too');
+});
+
+test('ganyu:chat coerces whatever the renderer sent into a string', async () => {
+  const seen = [];
+  const h = ipcHarness({ getChat: () => ({ send: (text) => { seen.push(text); return Promise.resolve(null); } }) });
+  for (const raw of ['hi', null, undefined, 42]) await h.call(CHAT_CHANNELS.chat, raw);
+  assert.deepEqual(seen, ['hi', '', '', '42'], 'chat.mjs then does the trimming and the cap');
+});
+
+test('the window really is built unfocusable, which is what set-focus exists to lift', () => {
+  const win = makeWindow();
+  assert.equal(win.options.focusable, false, 'an overlay must never steal focus from the editor');
+  assert.equal(win.focusable, false, 'so its own text input cannot take a keystroke until main lifts it');
+});
+
+test('ganyu:set-focus lifts focusability on open and restores it on close', () => {
+  const win = makeWindow();
+  const h = ipcHarness({ getWindow: () => win });
+
+  h.call(CHAT_CHANNELS.setFocus, true);
+  assert.equal(win.focusable, true);
+  assert.equal(win.focused, true);
+  assert.deepEqual(win.focusLog, ['focusable:true', 'focus'], 'the flag first — focusing an unfocusable window is a no-op');
+
+  h.call(CHAT_CHANNELS.setFocus, false);
+  assert.equal(win.focusable, false);
+  assert.equal(win.focused, false);
+  assert.deepEqual(
+    win.focusLog.slice(2),
+    ['focusable:false', 'blur'],
+    'blurring is what hands the caret back — dropping the flag alone leaves the window holding it',
+  );
+});
+
+test('ganyu:set-focus coerces its argument and never takes the pet down', () => {
+  const win = makeWindow();
+  const h = ipcHarness({ getWindow: () => win });
+  h.call(CHAT_CHANNELS.setFocus, 'open');
+  assert.equal(win.focusable, true);
+  h.call(CHAT_CHANNELS.setFocus, 0);
+  assert.equal(win.focusable, false);
+
+  for (const getWindow of [
+    () => null,
+    () => ({ isDestroyed: () => true }),
+    () => ({ isDestroyed: () => false, setFocusable() { throw new Error('no such window'); } }),
+  ]) {
+    assert.doesNotThrow(() => ipcHarness({ getWindow }).call(CHAT_CHANNELS.setFocus, true));
+  }
 });
 
 test('computeInitialBounds is the recall target, and honours a measured size', () => {
