@@ -16,7 +16,9 @@ import {
 
 export const COOLDOWN_MS = 45_000;
 export const INTERRUPT_FLOOR_MS = 15_000;
-export const EXEC_TIMEOUT_MS = 15_000;
+// Measured claude-CLI latency on this machine is 23–57s; 15s starved every
+// live call, so every line came out canned (verify round 1, 2026-07-30).
+export const EXEC_TIMEOUT_MS = 60_000;
 export const INTERRUPT_KINDS = new Set(['waiting', 'failed']);
 
 /** argv for the CLI, per contracts.md §Speech. */

@@ -202,6 +202,7 @@ function requireMethod(label, target, names) {
 let speechSink = null;
 let wanderSink = null;
 let wanderStop = null;
+let wanderIsActive = null;
 let speechTapped = false;
 
 /** Only for the fallback tap, where no normalized event is available. */
@@ -309,7 +310,7 @@ async function composeRuntime() {
       exec: makeExec(),
       clock,
       onLine: sendSpeak,
-      // Smoke has a 20s budget and the claude CLI a 15s timeout — never let a
+      // Smoke has a 20s budget and the claude CLI a 60s timeout — never let a
       // stray line spawn a subprocess during the check.
       isMuted: () => flags.muted || SMOKE,
     });
@@ -335,6 +336,9 @@ async function composeRuntime() {
     });
     wanderSink = requireMethod('wander', wander, ['onState', 'update', 'setState', 'notify', 'setMode', 'onMode']);
     wanderStop = pickMethod(wander, ['cancel', 'stop', 'disarm', 'reset']);
+    // `walk` is null during a mid-stroll breather, so it under-reports wandering
+    // on GET /state; the module's own isWandering() spans the whole stroll.
+    wanderIsActive = typeof wander.isWandering === 'function' ? () => wander.isWandering() : null;
   }
 
   if (typeof state.onChange === 'function') {
@@ -361,7 +365,7 @@ async function composeRuntime() {
         log: console,
         ingest: (source, payload) => state.ingest(source, payload),
         onEvent: (source, payload) => state.ingest(source, payload),
-        getWandering: () => walk !== null,
+        getWandering: () => (wanderIsActive ? wanderIsActive() : walk !== null),
       });
       // A factory that already listened needs no start(); an http.Server would
       // otherwise be re-listened on a random port.
@@ -502,6 +506,7 @@ function cleanup() {
 const gotLock = SMOKE ? true : app.requestSingleInstanceLock();
 
 if (!gotLock) {
+  console.log('[ganyu] another instance is already running — exiting');
   app.quit();
 } else {
   app.on('second-instance', () => {

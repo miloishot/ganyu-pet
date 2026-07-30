@@ -6,7 +6,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 
 ## Goal / success criteria (the verifier's checklist)
 
-1. `npm test` (runs `node --test test/`) — all unit tests pass.
+1. `npm test` (runs `node --test test/*.test.mjs`) — all unit tests pass.
 2. `npm run smoke` — Electron launches, creates a frameless transparent always-on-top window, prints `SMOKE_OK {json flags}` and exits 0 within 20s (env `GANYU_SMOKE=1` makes the app self-quit after ~5s).
 3. Server + state standalone (`node src/main/server.mjs --standalone --port 47899`): POST a codex-shaped `PreToolUse` payload → `GET /state` reports `busy`; `PermissionRequest` → `waiting`; `Stop` → `idle` with a transient `celebrate` flag; a payload containing an error marker → `failed`.
 4. `echo <sample JSON> | cmd /c hooks\ganyu-hook.cmd codex 47899` delivers the payload to a listening server (test with a throwaway node listener).
@@ -61,7 +61,7 @@ Payloads differ between codex and Claude Code — normalize defensively:
 Per-session mode from last event:
 `PreToolUse|PostToolUse|UserPromptSubmit|SubagentStart|SubagentStop|SessionStart` → `busy` · `PermissionRequest` (codex) / `Notification` (Claude, permission-flavored) → `waiting` · `Stop|SessionEnd` → `idle` (Stop also sets `celebrate` for 10s) · payload with `error|failed` markers (case-insensitive scan of tool_response/last message) → `failed` (sticky 30s, then falls back to the underlying mode).
 
-Aggregate mode = highest priority across live sessions: `failed > waiting > busy > idle`. Sessions expire after 10 min without events (sweep every 30s). `celebrate` is a transient flag alongside the mode, not a mode.
+Aggregate mode = highest priority across live sessions: `failed > waiting > busy > idle`. Sessions expire after 10 min without events (sweep interval implementation-defined — currently 1s; TTLs unchanged). `celebrate` is a transient flag alongside the mode, not a mode.
 
 State module exposes `createState({clock})` returning `{ingest(source, payload), aggregate(), onChange(cb)}` — injectable clock (`clock.now()`) for tests; production passes `() => Date.now()`.
 
@@ -94,11 +94,12 @@ Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteract
 
 ### Speech (module D)
 
-`createSpeech({exec, clock, onLine, isMuted})` — `exec` injected (production: `child_process.execFile` of `C:\Users\kw11l\.local\bin\claude` with args `['-p', prompt, '--model', 'haiku']`, 15s timeout, kill on expiry).
+`createSpeech({exec, clock, onLine, isMuted})` — `exec` injected (production: `child_process.execFile` of `C:\Users\kw11l\.local\bin\claude` with args `['-p', prompt, '--model', 'haiku']`, 60s timeout, kill on expiry — measured CLI latency on this machine is 23–57s, so 15s starved every live call).
 
 - **Chatty mode** (the only mode in v1): speaks on `SessionStart` (greeting), tool-class change during `busy` (e.g. first Bash after edits), `Stop` (completion), `waiting` (nudge), `failed` (sympathy). Global cooldown **45s**; `waiting`/`failed` may interrupt at ≥15s. Queue depth 1 — a newer trigger replaces a pending one.
 - Persona prompt template (in `persona.mjs`):
-  `You are Ganyu from Genshin Impact, working as {user}'s diligent secretary. React to this coding-agent event in ONE short line (max 90 chars), gentle and dutiful, in English, at most one emoji, occasionally hinting you could use a nap. Event: {summary}. Reply with ONLY the line.`
+  `You are Ganyu from Genshin Impact, working as {user}'s diligent secretary. React to this coding-agent event in ONE short line (max 90 chars), gentle and dutiful, in English, at most one emoji, occasionally hinting you could use a nap. Address them by name only, never with an honorific (no Mr., Miss, or Sir). Event: {summary}. Reply with ONLY the line.`
+  Default `{user}` is **Kahweng** (owner's preferred name — no honorific, never "Mr."; `GANYU_USER` env overrides).
   `{summary}` = compact human phrase built from the normalized event (`"codex finished a task in ganyu-pet"`, `"Claude Code is waiting for permission to run Bash"`).
 - On exec error/timeout/empty output → canned fallback per mode (≥6 lines per mode table in `persona.mjs`), same cooldown rules. Muted → no exec calls at all.
 

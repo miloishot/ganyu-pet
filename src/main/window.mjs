@@ -102,6 +102,10 @@ export function createHoverWatch({ getBounds, getCursorPoint, apply, sprite = SP
     return want;
   }
 
+  // Arm click-through immediately: the window must start non-interactive
+  // without waiting for the first poll tick.
+  sync();
+
   return {
     poll() {
       const bounds = getBounds();
@@ -221,7 +225,7 @@ export function createPetWindow({ BrowserWindow, workArea, preloadPath, size = W
     frame: winOptions.frame === true,
   });
 
-  win.setAlwaysOnTop(true, 'screen-saver');
+  if (winOptions.alwaysOnTop !== false) win.setAlwaysOnTop(true, 'screen-saver');
   win.setIgnoreMouseEvents(true, { forward: true });
   win.once('ready-to-show', () => {
     if (!win.isDestroyed()) win.showInactive();
@@ -249,18 +253,20 @@ function framed(win, fallback) {
 
 /**
  * The three flags `npm run smoke` prints. Order is part of the contract.
- * All three describe THIS window: `alwaysOnTop` and `frame` are observed live,
- * and `transparent` comes from the options this window was actually constructed
- * with (Electron has no getter). A window this module did not build reports
- * transparent:false rather than claiming a flag it cannot verify.
+ * `alwaysOnTop` is observed live; `transparent` and `frame` come from the
+ * options this window was actually constructed with (Electron has no getters,
+ * and the outer-vs-content geometry check false-positives on real Windows 11 —
+ * a frameless window reported frame:true). A window this module did not build
+ * reports transparent:false and geometry-inferred frame rather than claiming
+ * flags it cannot verify.
  */
 export function smokeFlags(win) {
-  const effective = EFFECTIVE_OPTIONS.get(win) ?? { transparent: false, frame: true };
-  return {
-    transparent: effective.transparent,
-    alwaysOnTop: win && typeof win.isAlwaysOnTop === 'function' ? win.isAlwaysOnTop() : false,
-    frame: framed(win, effective.frame),
-  };
+  const alwaysOnTop = win && typeof win.isAlwaysOnTop === 'function' ? win.isAlwaysOnTop() : false;
+  const effective = EFFECTIVE_OPTIONS.get(win);
+  if (effective) {
+    return { transparent: effective.transparent, alwaysOnTop, frame: effective.frame };
+  }
+  return { transparent: false, alwaysOnTop, frame: framed(win, true) };
 }
 
 /**

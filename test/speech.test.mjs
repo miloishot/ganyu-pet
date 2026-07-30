@@ -109,7 +109,8 @@ test('PROMPT_TEMPLATE matches the contract text with both slots', () => {
     PROMPT_TEMPLATE,
     "You are Ganyu from Genshin Impact, working as {user}'s diligent secretary. React to this " +
       'coding-agent event in ONE short line (max 90 chars), gentle and dutiful, in English, at ' +
-      'most one emoji, occasionally hinting you could use a nap. Event: {summary}. Reply with ' +
+      'most one emoji, occasionally hinting you could use a nap. Address them by name only, never ' +
+      'with an honorific (no Mr., Miss, or Sir). Event: {summary}. Reply with ' +
       'ONLY the line.',
   );
 });
@@ -120,7 +121,8 @@ test('buildPrompt substitutes user and summary and leaves no slots behind', () =
     prompt,
     "You are Ganyu from Genshin Impact, working as Isaac's diligent secretary. React to this " +
       'coding-agent event in ONE short line (max 90 chars), gentle and dutiful, in English, at ' +
-      'most one emoji, occasionally hinting you could use a nap. Event: codex finished a task in ' +
+      'most one emoji, occasionally hinting you could use a nap. Address them by name only, never ' +
+      'with an honorific (no Mr., Miss, or Sir). Event: codex finished a task in ' +
       'ganyu-pet. Reply with ONLY the line.',
   );
   assert.ok(!prompt.includes('{user}'));
@@ -144,7 +146,7 @@ test('buildSummary reproduces both contract examples verbatim', () => {
   assert.equal(sourceLabel('claude'), 'Claude Code');
 });
 
-test('exec is called with the claude CLI argv, 15s timeout and the built prompt', () => {
+test('exec is called with the claude CLI argv, 60s timeout and the built prompt', () => {
   const h = harness();
   const res = h.speech.notify(sessionStart);
   assert.equal(res.dispatched, true);
@@ -159,7 +161,7 @@ test('exec is called with the claude CLI argv, 15s timeout and the built prompt'
   assert.equal(args[3], 'haiku');
   assert.equal(args[1], buildPrompt({ user: 'Isaac', summary: 'codex started a session in ganyu-pet' }));
   assert.deepEqual(args, claudeArgs(args[1]));
-  assert.equal(options.timeout, 15_000);
+  assert.equal(options.timeout, 60_000);
   assert.equal(options.windowsHide, true);
   // Without these the CLI spends 25-57s replaying this machine's whole config
   // (hooks, CLAUDE.md, plugin sync) plus extended thinking, so every line would
