@@ -11,7 +11,8 @@
 // throttle gate them identically.
 // No Electron import; every side effect is injectable.
 
-import { RECENT_WINDOW_MS, basename, pickToolInput, projectFromCwd } from './context.mjs';
+import { RECENT_WINDOW_MS, basename, describeAction, pickToolInput, projectFromCwd } from './context.mjs';
+import { LEDGER_KINDS } from './ledger.mjs';
 import { buildSummary, createMentionMemory, messageFor } from './persona.mjs';
 
 /**
@@ -175,6 +176,8 @@ export const projectName = projectFromCwd;
  * mentionMemory — the suppression state for the rate-limited briefing lines
  *            (persona.createMentionMemory). Injectable so a test can start her
  *            mid-evening, having already mentioned the hour.
+ * ledger   — optional {record(entry)} (ledger.createLedger). Absent is the
+ *            original behaviour: she reacts and forgets.
  */
 export function createSpeech({
   clock = { now: () => Date.now() },
@@ -183,11 +186,13 @@ export function createSpeech({
   random = Math.random,
   brain = null,
   mentionMemory = createMentionMemory(),
+  ledger = null,
 } = {}) {
   const now = () => (typeof clock === 'function' ? clock() : clock.now());
   const muted = () => (typeof isMuted === 'function' ? Boolean(isMuted()) : Boolean(isMuted));
 
   const askBrain = typeof brain?.requestLine === 'function' ? brain : null;
+  const diary = typeof ledger?.record === 'function' ? ledger : null;
 
   let lastSpokeAt = null;
   let lastKind = null;
@@ -393,6 +398,54 @@ export function createSpeech({
   }
 
   /**
+   * Write one salient moment into the ledger, so that "I've noted it" is a true
+   * sentence rather than the register talking. Nothing here re-derives salience:
+   * the caller has already decided, and this only translates the decision.
+   *
+   *   level 'notable'  -> kind `notable`, detail = the pattern remarked on
+   *                       ('repeat-file'), which ledger.digest phrases.
+   *   kind in LEDGER_KINDS -> itself, detail = what the tool was doing
+   *                       ('running `npm test`'), from the allowlisted toolInput.
+   *   anything else    -> nothing. In practice that is `busy`: a tool-class
+   *                       change during ordinary work is exactly the traffic the
+   *                       ledger exists to keep out, even on the evening a long
+   *                       silence promotes one to `always`.
+   *
+   * Called before the throttle rather than after: a bubble she had no room for
+   * is a line not shown, not a thing that did not happen, and the digest is the
+   * one place a suppressed failure can still reach him. It is called after the
+   * mute gate, though, which is where `notify` returns — muted is a quiet
+   * evening in the record as well as on screen.
+   *
+   * Metadata only, and only ENTRY_KEYS of it. `sanitizeEntry` defends the disk
+   * independently; nothing here relies on that.
+   */
+  function remember(ev, kind, level, reason, t) {
+    if (!diary) return;
+    const ledgerKind = level === 'notable' ? 'notable' : (LEDGER_KINDS.includes(kind) ? kind : null);
+    if (!ledgerKind) return;
+    const detail = ledgerKind === 'notable'
+      ? reason
+      : describeAction({
+        tool_name: ev.toolName,
+        tool_input: ev.toolInput,
+        agent_type: ev.agentType,
+      });
+    try {
+      diary.record({
+        at: t,
+        kind: ledgerKind,
+        project: ev.project,
+        tool: ev.toolName,
+        detail,
+        sessionId: ev.sessionId,
+      });
+    } catch {
+      /* record() promises not to throw; a pet who cannot write her diary still talks */
+    }
+  }
+
+  /**
    * Ask the brain, then show its line — or, for a non-urgent kind that got
    * nothing back, the canned line it was standing in for. `seq` is the emitted-
    * line count at the moment the request was fired: if it has moved, another
@@ -444,6 +497,8 @@ export function createSpeech({
       return { spoken: false, reason: 'not-salient', kind, salience: salience.reason };
     }
     const level = salience.level;
+
+    remember(ev, kind, level, salience.reason, t);
 
     const wait = waitFor(level, kind, t);
     if (wait > 0) return { spoken: false, reason: 'throttled', kind, retryInMs: wait };

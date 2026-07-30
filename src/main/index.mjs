@@ -3,11 +3,13 @@
 // production dependencies injected.
 
 import { app, BrowserWindow, ipcMain, screen } from 'electron';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { createChat } from './chat.mjs';
-import { buildContext, trackActiveSince } from './context.mjs';
+import { buildContext, payloadOf, trackActiveSince } from './context.mjs';
 import {
   CHANNELS,
   HOVER_POLL_MS,
@@ -31,6 +33,23 @@ const PRELOAD = path.join(HERE, 'preload.cjs');
 const RENDERER = path.join(HERE, '..', 'renderer', 'index.html');
 /** Optional, git-ignored, and read only here: the brain's endpoint + key. */
 const ENV_FILE = path.join(HERE, '..', '..', '.env.local');
+
+/**
+ * Her ledger. Under Electron's `userData` (resolved at runtime, in
+ * `composeRuntime` — it is only reliable after the app is ready), deliberately
+ * **not** in the repo: a file the app appends to all evening would show up in
+ * every `git status` and be committed by accident within the week.
+ */
+const LEDGER_FILE = 'ledger.jsonl';
+
+/**
+ * The owner's Obsidian vault and the repo→project map his shell hooks read.
+ * Both **read-only**, and only ever a note's title, date and `Left open`
+ * bullets — see the privacy note in vault.mjs. Absent on any other machine,
+ * which is simply a pet who does not mention his notes.
+ */
+const VAULT_PROJECTS = path.join(os.homedir(), 'second-brain', '03 Projects');
+const PROJECT_MAP = path.join(os.homedir(), '.claude', 'hooks', 'projects.tsv');
 
 const SMOKE = process.env.GANYU_SMOKE === '1';
 const SMOKE_DELAY_MS = 5000;
@@ -199,6 +218,26 @@ function currentAggregate() {
     console.warn('[ganyu] aggregate() failed:', err?.message);
     return null;
   }
+}
+
+/** Module B's debug ring, oldest first, or an empty one. */
+function debugRing() {
+  return typeof server?.debugEvents === 'function' ? server.debugEvents() : [];
+}
+
+/**
+ * The directory his agents are working in — the newest hook event carrying one.
+ * This is what decides which vault project's notes the pet can see, and it is
+ * emphatically **not** `process.cwd()`: that is always this repo, which has no
+ * vault folder, so resolving from it would make the whole feature inert.
+ */
+function agentCwd() {
+  const ring = debugRing();
+  for (let i = ring.length - 1; i >= 0; i -= 1) {
+    const cwd = payloadOf(ring[i])?.cwd;
+    if (typeof cwd === 'string' && cwd.trim() !== '') return cwd;
+  }
+  return process.cwd();
 }
 
 /**
@@ -397,6 +436,38 @@ async function composeRuntime() {
     }
   }
 
+  // Her memory, both halves. The ledger is what she saw and wrote down; the
+  // vault is what he wrote down. Both are optional, both fail to null, and both
+  // are constructed unconditionally — `createLedger({filePath: null})` and a
+  // vault with no directory to read are objects that answer every call with
+  // nothing, which is exactly what the rest of the wiring wants.
+  let ledger = null;
+  const ledgerMod = await tryImport('./ledger.mjs');
+  if (ledgerMod?.createLedger) {
+    // Resolved here rather than at module scope: `getPath` is only dependable
+    // once the app is ready, and composeRuntime runs inside whenReady().
+    ledger = ledgerMod.createLedger({ filePath: path.join(app.getPath('userData'), LEDGER_FILE), fs });
+    console.log(`[ganyu] ledger: ${ledger.enabled ? ledger.path : 'disabled'}`);
+  }
+
+  let vault = null;
+  const vaultMod = await tryImport('./vault.mjs');
+  if (vaultMod?.createVault) {
+    vault = vaultMod.createVault({
+      fs,
+      projectsDir: VAULT_PROJECTS,
+      mapPath: PROJECT_MAP,
+      // A getter, not a value: the project changes as he moves between repos.
+      cwd: agentCwd,
+    });
+  }
+
+  /** The two digests, read per chat message. Never a reason a reply fails. */
+  const readMemory = () => ({
+    ledger: ledger?.digest?.() ?? null,
+    vault: vault?.digest?.() ?? null,
+  });
+
   // The brain is optional in every sense: no .env.local, no key, or an endpoint
   // that turns us away all mean the same thing — the canned MESSAGES table does
   // the talking, exactly as it did before. Nothing here logs a config value.
@@ -411,11 +482,13 @@ async function composeRuntime() {
         // Read fresh per request, and lazily: the server that owns the ring is
         // created further down this same function.
         getContext: () => buildContext({
-          ring: typeof server?.debugEvents === 'function' ? server.debugEvents() : [],
+          ring: debugRing(),
           state,
           now: Date.now(),
           activeSinceMs: activity?.since ?? null,
         }),
+        // Chat only — brain.mjs reads this on `requestChat` and nowhere else.
+        getMemory: readMemory,
       });
       console.log(`[ganyu] brain: enabled (model ${brainConfig.model})`);
     } else {
@@ -444,6 +517,7 @@ async function composeRuntime() {
       // Smoke is a startup check: keep stray bubbles out of the stdout it parses.
       isMuted: () => flags.muted || SMOKE,
       brain,
+      ledger,
     });
     speechSink = requireMethod('speech', speech, ['onEvent', 'handleEvent', 'notify', 'trigger', 'onState', 'ingest', 'speak']);
   }

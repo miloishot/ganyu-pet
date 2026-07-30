@@ -36,6 +36,24 @@ import {
   sourceLabel,
 } from '../src/main/persona.mjs';
 
+/**
+ * A ledger, shrunk to the one method speech calls. `entries` is what reached
+ * the disk in production — the assertions below read it directly rather than
+ * going through a real file, which ledger.test.mjs already covers.
+ */
+function fakeLedger({ throws = false } = {}) {
+  const entries = [];
+  return {
+    entries,
+    kinds: () => entries.map((e) => e.kind),
+    record(entry) {
+      if (throws) throw new Error('disk is on fire');
+      entries.push(entry);
+      return entry;
+    },
+  };
+}
+
 /** Test harness: manual clock, captured lines, deterministic variant choice. */
 function harness(opts = {}) {
   const lines = [];
@@ -47,11 +65,13 @@ function harness(opts = {}) {
     isMuted: () => Boolean(opts.muted && opts.muted()),
     random: opts.random ?? (() => 0),
     brain: opts.brain ?? null,
+    ledger: opts.ledger ?? null,
   });
 
   return {
     speech,
     lines,
+    ledger: opts.ledger ?? null,
     now: () => t,
     advance(ms) {
       t += ms;
@@ -413,7 +433,9 @@ test('an event with no tool and no project still gets a natural line', () => {
   h.advance(QUIET_THROTTLE_MS);
   const idle = h.speech.notify({ source: 'codex', event: 'SessionEnd', sessionId: 's1' });
   assert.equal(idle.kind, 'celebrate');
-  assert.equal(idle.text, 'Task complete. I\'ll file the report.');
+  // "I'll file the report" until the ledger landed: she files nothing, and a
+  // canned line promising it is the same false claim the persona rule now bans.
+  assert.equal(idle.text, 'Task complete. I\'ll note it down.');
 
   const waiting = h.speech.notify({ source: 'codex', event: 'PermissionRequest', sessionId: 's1' });
   assert.equal(waiting.text, 'Paused — a permission request needs you.');
@@ -591,6 +613,57 @@ test('the voice examples cover the moments she reaches, and obey her own rules',
     assert.ok(!/please \w+ carefully/i.test(line), `preachy: ${line}`);
     assert.ok((line.match(/\p{Extended_Pictographic}/gu) ?? []).length <= 1, `emoji: ${line}`);
   }
+});
+
+/**
+ * Claims she cannot back. Each entry is a claim to have *acted on his work*, or
+ * a promise to — not a list of forbidden English.
+ *
+ * This exists because of one line she actually said: "I've set that page aside
+ * for you." Nothing in the app could set anything aside; she generalised the
+ * claim out of a register full of secretarial competence, and the examples are
+ * where the model reads that register from. So the examples are where it is
+ * enforced. Note what is *not* here: "noted", "written down", "remember",
+ * "corrected the record" — the ledger makes those true, which is the whole
+ * reason it was built.
+ */
+const FORBIDDEN_CLAIMS = [
+  [/\bset\b[^.?!]{0,24}\baside\b/i, 'setting his work aside'],
+  [/\b(fixed|repaired|patched|resolved)\b/i, 'fixing it'],
+  [/\bhandled\b/i, 'handling it'],
+  [/\b(postponed|deferred|rescheduled)\b/i, 'postponing it'],
+  [/\btook care of\b/i, 'taking care of it'],
+  [/\bsorted (it|that|them) out\b/i, 'sorting it out'],
+  [/\b(filed|archived|submitted)\b/i, 'filing a real thing'],
+  [/\bcleaned (it|that|them) up\b/i, 'cleaning up'],
+  [/\bI'?(ve| have) (run|ran|edited|deleted|removed|changed|updated)\b/i, 'touching his files'],
+  [/\bI'?ll (fix|handle|sort|file|run|edit|take care|deal with|look after)\b/i, 'promising to'],
+  [/\bleave it (with|to) me\b/i, 'promising to'],
+  [/\bshall I (bring|fetch|make|get)\b/i, 'offering to fetch something'],
+];
+
+test('no line of hers claims an action she cannot take', () => {
+  // Both halves of her voice: the examples the brain copies its register from,
+  // and the canned table the bubble draws verbatim. "Task complete. I'll file
+  // the report." lived in the second one until the ledger landed.
+  const everything = [
+    ...VOICE_EXAMPLES.map(([situation, line]) => [`example (${situation})`, line]),
+    ...Object.entries(MESSAGES).flatMap(([kind, table]) => table.map((line) => [`${kind} variant`, line])),
+  ];
+  for (const [where, line] of everything) {
+    for (const [pattern, claim] of FORBIDDEN_CLAIMS) {
+      assert.ok(!pattern.test(line), `${where} claims ${claim}: ${line}`);
+    }
+  }
+});
+
+test('the standing rule names what she may claim and what she may not', () => {
+  // She keeps a real ledger now, so exactly one class of claim is true.
+  assert.match(BRAIN_INSTRUCTIONS, /you may say you have noted something, written it down/i);
+  assert.match(BRAIN_INSTRUCTIONS, /You cannot edit a file, run a command, fix anything, set a page aside/i);
+  assert.match(BRAIN_INSTRUCTIONS, /never say or imply that you have done so or are about to/i);
+  assert.match(BRAIN_INSTRUCTIONS, /say so plainly and kindly/i);
+  assert.match(BRAIN_INSTRUCTIONS, /do not pretend, and do not promise it for later/i);
 });
 
 test('the instructions carry who she is, the hard rules, and every example', () => {
@@ -829,4 +902,159 @@ test('free-text "error" in a tool response no longer makes her kneel (regression
   assert.equal(state.aggregate().mode, 'busy', 'the aggregate never enters failed');
   assert.deepEqual(h.lines.map((l) => l.kind), ['busy'], 'read -> shell is a class change, not a failure');
   assert.equal(h.speech.stats().lastMode, 'busy');
+});
+
+// ------------------------------------------------- what she writes down (the ledger)
+//
+// Speech is the only writer, and the question here is only ever *what gets in*.
+// Salience has already decided what was worth interrupting him for; recording
+// is a translation of that decision, never a second opinion on it — a ledger
+// that re-derived its own idea of "notable" would drift from the lines she
+// actually said, and the digest would describe an evening he did not have.
+//
+// The file itself, the pruning and the digest are ledger.test.mjs's; the fake
+// here records what speech *offered*, which is the seam this section owns.
+
+test('a salient moment is written down, with what the tool was doing', () => {
+  const ledger = fakeLedger();
+  const h = harness({ ledger });
+  h.speech.notify({
+    source: 'claude',
+    event: 'PostToolUse',
+    sessionId: 's2',
+    toolName: 'Bash',
+    mode: 'failed',
+    cwd: 'C:\\Users\\kw11l\\Desktop\\GolfCRM',
+    toolInput: { command: 'npm test' },
+  });
+  assert.deepEqual(ledger.entries, [{
+    at: h.now(),
+    kind: 'failed',
+    project: 'GolfCRM',
+    tool: 'Bash',
+    detail: 'running `npm test`',
+    sessionId: 's2',
+  }]);
+});
+
+test('only the six kinds worth remembering reach it — never busy', () => {
+  const ledger = fakeLedger();
+  const h = harness({ ledger });
+
+  h.speech.notify(sessionStart);                       // greeting
+  h.advance(QUIET_THROTTLE_MS);
+  h.speech.notify(permission);                         // waiting
+  h.advance(QUIET_THROTTLE_MS);
+  h.speech.notify(failure);                            // failed
+  h.advance(QUIET_THROTTLE_MS);
+  h.speech.notify({ ...failure, event: 'PostToolUse', mode: 'busy' }); // recovered
+  h.advance(QUIET_THROTTLE_MS);
+  h.speech.notify(stop);                               // celebrate
+
+  assert.deepEqual(ledger.kinds(), ['greeting', 'waiting', 'failed', 'recovered', 'celebrate']);
+});
+
+test('routine tool traffic is not remembered, even when it is worth a line', () => {
+  const ledger = fakeLedger();
+  const h = harness({ ledger });
+
+  h.speech.notify(sessionStart);
+  assert.deepEqual(ledger.kinds(), ['greeting']);
+
+  // A class change she is quiet about: ordinary work, and nothing to recall.
+  h.advance(1000);
+  h.speech.notify(editPre);
+  const quiet = h.speech.notify(bashPre);
+  assert.equal(quiet.reason, 'throttled');
+
+  // And a class change she *does* speak, because ten minutes of silence
+  // promotes it. This is the interesting one: the line is worth showing, the
+  // event is still a Bash call in the middle of an ordinary afternoon, and a
+  // ledger holding those spends its whole file in an evening.
+  h.advance(QUIET_STRETCH_MS);
+  const spoken = h.speech.notify(editPre);
+  assert.equal(spoken.kind, 'busy');
+  assert.equal(spoken.spoken, true);
+
+  assert.deepEqual(ledger.kinds(), ['greeting'], 'busy has no ledger kind, at any salience');
+});
+
+test('a pattern she remarks on is remembered as the pattern', () => {
+  const ledger = fakeLedger();
+  const h = harness({ ledger });
+  const read = {
+    source: 'claude',
+    event: 'PostToolUse',
+    sessionId: 's1',
+    toolName: 'Read',
+    mode: 'busy',
+    cwd: 'C:\\dev\\ganyu-pet',
+    toolInput: { file_path: 'C:\\dev\\ganyu-pet\\src\\main\\persona.mjs' },
+  };
+  // A first line, so the long-quiet promotion is not what fires below.
+  h.speech.notify(sessionStart);
+  h.advance(QUIET_THROTTLE_MS);
+  for (let i = 0; i < 6; i += 1) {
+    h.advance(1000);
+    h.speech.notify({ ...read, toolName: i % 2 === 0 ? 'Read' : 'Grep' });
+  }
+
+  const notable = ledger.entries.filter((e) => e.kind === 'notable');
+  assert.equal(notable.length, 1, 'one remark per ten minutes, and one entry to match');
+  assert.equal(notable[0].detail, 'repeat-file', 'the pattern, which ledger.digest phrases');
+  assert.equal(notable[0].project, 'ganyu-pet');
+});
+
+test('a repeated failure she stays quiet about is not written down either', () => {
+  const ledger = fakeLedger();
+  const h = harness({ ledger });
+  const failed = { source: 'claude', event: 'PostToolUse', sessionId: 's2', toolName: 'Bash', mode: 'failed' };
+  const retry = { source: 'claude', event: 'PreToolUse', sessionId: 's2', toolName: 'Bash', mode: 'busy' };
+
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    h.advance(30_000);
+    h.speech.notify(retry);
+    h.advance(30_000);
+    h.speech.notify(failed);
+  }
+  // The same 1/3/5 the bubble shows: the streak rule is the salience gate, and
+  // the ledger inherits it rather than counting again.
+  assert.equal(ledger.entries.length, 3);
+  assert.ok(ledger.entries.every((e) => e.kind === 'failed'));
+});
+
+test('a line she had no room for is still remembered', () => {
+  const ledger = fakeLedger();
+  const h = harness({ ledger });
+  // Two sessions hit the same wall two seconds apart. One bubble — the 6s
+  // same-kind floor — but two failures happened, and the digest is the only
+  // place the second one can still reach him.
+  const first = h.speech.notify({ ...failure, sessionId: 'a' });
+  h.advance(2000);
+  const second = h.speech.notify({ ...failure, sessionId: 'b', errorish: true });
+
+  assert.equal(first.spoken, true);
+  assert.equal(second.reason, 'throttled', 'the bubble refused it');
+  assert.deepEqual(ledger.kinds(), ['failed', 'failed'], 'the record did not');
+});
+
+test('muted is a quiet evening in the record as well as on screen', () => {
+  const ledger = fakeLedger();
+  const h = harness({ ledger, muted: () => true });
+  assert.equal(h.speech.notify(sessionStart).reason, 'muted');
+  assert.equal(h.speech.notify(failure).reason, 'muted');
+  assert.deepEqual(ledger.entries, []);
+});
+
+test('a ledger that cannot write is not a pet that cannot talk', () => {
+  const h = harness({ ledger: fakeLedger({ throws: true }) });
+  const res = h.speech.notify(sessionStart);
+  assert.equal(res.spoken, true);
+  assert.equal(h.lines.length, 1);
+});
+
+test('with no ledger she behaves exactly as she did before', () => {
+  const h = harness();
+  assert.equal(h.speech.notify(sessionStart).spoken, true);
+  assert.equal(h.lines.length, 1);
 });

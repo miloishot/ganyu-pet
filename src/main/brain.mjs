@@ -10,7 +10,10 @@
 //
 // Privacy: only event metadata leaves the machine (event kind, tool name,
 // project name — see persona.buildBrainInput), plus, on the chat path, the
-// message the owner typed himself and her own past replies. No file contents,
+// message the owner typed himself, her own past replies, and the two memory
+// digests (`getMemory`) — the ledger's, itself built only from the metadata
+// above, and the vault's, which is a note title, a date and the owner's own
+// `Left open` bullets and nothing else. No file contents,
 // no diffs, no agent prompt text, no transcript — the chat briefing is built
 // from the same allowlisted context object as the ambient one, and reaches for
 // nothing the ambient path could not already send. `store: false` asks the
@@ -180,6 +183,12 @@ export function postProcess(text, max = MAX_BRAIN_LINE_CHARS) {
  * about to run Edit" into a briefing she can actually say something about. It is
  * called once per request, so the facts are current; a getter that throws is
  * treated as no context at all.
+ *
+ * `getMemory` is the same shape and the same failure semantics, for recall
+ * rather than for the present moment: `{ledger, vault}`, two short digests of
+ * what she wrote down and what he left open in his own notes. **It is read on
+ * the chat path only** — see persona.buildChatInput for why an ambient remark
+ * is worse for having it.
  */
 export function createBrain({
   config,
@@ -188,6 +197,7 @@ export function createBrain({
   log = null,
   timeoutMs = REQUEST_TIMEOUT_MS,
   getContext = null,
+  getMemory = null,
 } = {}) {
   const baseUrl = String(config?.baseUrl ?? '').replace(/\/+$/, '');
   const model = String(config?.model ?? '');
@@ -300,6 +310,18 @@ export function createBrain({
     }
   }
 
+  /** What she remembers, or nothing. Same contract: an answer, never an exception. */
+  function readMemory() {
+    if (typeof getMemory !== 'function') return null;
+    try {
+      const memory = getMemory();
+      return memory && typeof memory === 'object' ? memory : null;
+    } catch (err) {
+      say('warn', `brain: memory unavailable (${err?.name ?? 'error'})`);
+      return null;
+    }
+  }
+
   /**
    * Walk the routes for one prompt and return the text, or null. Shared by both
    * request kinds so the transport rules — route order, the remembered route, a
@@ -354,7 +376,9 @@ export function createBrain({
    * first, from chat.mjs. The context read is the same one the ambient path
    * uses, so "what am I doing" and "what broke" have facts to draw on — and the
    * same allowlist, so they are still only facts context.mjs was willing to
-   * share. An empty message never becomes a request.
+   * share. Memory is read here and only here, so "what broke *earlier*" and
+   * "what was I in the middle of" have something older than the last twenty
+   * minutes behind them. An empty message never becomes a request.
    */
   async function requestChat({ text = '', history = [] } = {}) {
     const message = String(text ?? '').replace(/\s+/g, ' ').trim();
@@ -363,7 +387,7 @@ export function createBrain({
     const started = now();
     try {
       const context = readContext();
-      const input = buildChatInput({ text: message, history, context });
+      const input = buildChatInput({ text: message, history, context, memory: readMemory() });
       return await exchange(CHAT_INSTRUCTIONS, input, CHAT_LIMITS);
     } catch {
       return null; // same promise as requestLine: a reply or null, never a rejection

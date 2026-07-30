@@ -113,7 +113,7 @@ export const MESSAGES = Object.freeze({
   celebrate: Object.freeze([
     'Finished in {project}.',
     'All done in {project}. ✨',
-    "Task complete. I'll file the report.",
+    "Task complete. I'll note it down.",
     'Finished. Nothing else is pending.',
   ]),
 });
@@ -144,6 +144,14 @@ export const BRAIN_LINE_TARGET_CHARS = 110;
  * a line, and none of their details may be borrowed as a fact — both are said
  * again in the rules below, because this list is the most tempting thing in the
  * prompt to copy from.
+ *
+ * **And none of them may claim an action she cannot take.** This list is where
+ * the "I've set that page aside for you" bug came from: the model does not copy
+ * an example, it generalises from it, and a secretary who files things and
+ * fetches tea generalises into one who handles his work. The record-keeping
+ * lines survive because the ledger (ledger.mjs) makes them true — she really
+ * does write down what she saw. Everything past writing it down is gone, and
+ * the denylist in test/speech.test.mjs keeps it gone.
  */
 export const VOICE_EXAMPLES = Object.freeze([
   ['a session starts', `Good evening, ${OWNER_NAME}. I have the ledger open.`],
@@ -151,8 +159,8 @@ export const VOICE_EXAMPLES = Object.freeze([
   ['it failed again', 'The same error a third time. Perhaps set it down and come back to it?'],
   ['it works again', "It's running again. I've corrected the record."],
   ['waiting on permission', "This one won't move until you say so."],
-  ['a task finished', "That's done, and filed. Nothing else is waiting."],
-  ['the same file, many times', 'The fifth pass over that one file… shall I bring you tea?'],
+  ['a task finished', "That's done, and written down. Nothing else is waiting."],
+  ['the same file, many times', 'The fifth pass over that one file… perhaps it is time for tea.'],
   ['the same command over and over', "Three runs of it now. I don't think it has changed its mind."],
   ['a long night', `It's past one, ${OWNER_NAME}. I'm no better at stopping than you are, but one of us should.`],
   ['a very long stretch of work', 'Six hours. Even the Qixing send me home eventually.'],
@@ -199,6 +207,14 @@ export const BRAIN_INSTRUCTIONS = [
     'Vary how you open. Do not begin every line the same way, and never repeat a line you were just told you said.',
   ].join(' '),
   [
+    'What you can actually do, and what you cannot. You watch, you remember, and you say what you think.',
+    'You keep a real written ledger of what you have seen, so you may say you have noted something, written it down,',
+    'or that you remember it — that one is true, and it is the only thing of its kind that is.',
+    'You cannot edit a file, run a command, fix anything, set a page aside, postpone a task, file a report,',
+    'or handle any part of his work for him, and you must never say or imply that you have done so or are about to.',
+    'If he asks you for something you cannot do, say so plainly and kindly: do not pretend, and do not promise it for later.',
+  ].join(' '),
+  [
     'Examples of the voice. They show the register only — never reuse one as your line, and never borrow a detail from one as if it were a fact:',
     ...VOICE_EXAMPLES.map(([situation, line]) => `- (${situation}) ${line}`),
   ].join('\n'),
@@ -239,8 +255,12 @@ export const CHAT_INSTRUCTIONS = [
     "Do not read his machine's status back at him, and do not narrate what his agents are doing, unless that is what he asked about.",
     `Two: instead of exactly one line, reply with one or two short sentences, under ${CHAT_LINE_TARGET_CHARS} characters in total.`,
     'Everything else holds unchanged — the same voice, the same register, the same banned corporate words,',
-    'the same ban on inventing any detail you were not given, the same rule about his name.',
+    'the same ban on inventing any detail you were not given, the same rule about his name,',
+    'and the same hard limit on what you can do — here most of all, because here he can ask you for things.',
+    'You may say you have noted or remembered something; that is real. Anything else he asks of you, you cannot do,',
+    'and you tell him so gently instead of agreeing to it.',
     'What his agents are doing is given below as background, in case he asks about it. It is not something to recite.',
+    'So is what you have written down, and whatever he left open in his own notes — draw on them when he asks what happened, do not read them out.',
   ].join(' '),
 ].join('\n\n');
 
@@ -504,13 +524,21 @@ function chatTurnLine(entry) {
   return `${entry?.role === 'ganyu' ? CHAT_SPEAKERS.ganyu : CHAT_SPEAKERS.owner}: ${text}`;
 }
 
+/** One trimmed prompt block, or null — an empty digest deletes its own block. */
+function memoryBlock(value) {
+  const text = String(value ?? '').trim();
+  return text === '' ? null : text;
+}
+
 /**
  * The `input` / user text for a chat reply: what is going on around him, what
- * has already been said, and then his message.
+ * she remembers, what has already been said, and then his message.
  *
- * `{text, history, context}` — `history` is the conversation *before* this
- * message (`{role:'owner'|'ganyu', text, at}`, oldest first, from chat.mjs) and
- * `context` is the same buildContext object the ambient path uses.
+ * `{text, history, context, memory}` — `history` is the conversation *before*
+ * this message (`{role:'owner'|'ganyu', text, at}`, oldest first, from
+ * chat.mjs), `context` is the same buildContext object the ambient path uses,
+ * and `memory` is `{ledger, vault}`: two short digests, each already written as
+ * a sentence in her own voice, each optional.
  *
  * The context lines are the ambient briefing's, minus the two that have no
  * meaning here: there is no event to describe, and `You last said:` is
@@ -520,13 +548,24 @@ function chatTurnLine(entry) {
  * this" cannot be answered from a briefing that suppressed the clock. He asked,
  * so the fact is wanted rather than volunteered.
  *
- * Privacy is unchanged and comes from the same place — `context` has already
- * been through context.mjs's tool-input allowlist, and nothing here reaches for
- * anything else. The only new text is what he typed himself.
+ * **Memory is on this path only.** The context object is live facts about the
+ * last twenty minutes; the two digests are recall, which is what a question
+ * needs and an ambient remark does not — "React to the specific thing in the
+ * briefing" and a paragraph about this morning's failures pull in opposite
+ * directions, and the ambient line has 110 characters to resolve them in.
+ *
+ * Privacy is unchanged and comes from the same places — `context` has been
+ * through context.mjs's tool-input allowlist, `ledger` through
+ * ledger.sanitizeEntry, `vault` through vault.mjs's title/date/Left-open
+ * extraction, and nothing here reaches for anything else. The only new text is
+ * what he typed himself.
  */
-export function buildChatInput({ text = '', history = [], context = null } = {}) {
+export function buildChatInput({
+  text = '', history = [], context = null, memory = null,
+} = {}) {
   const message = String(text ?? '').replace(/\s+/g, ' ').trim();
   const ctx = context && typeof context === 'object' ? context : null;
+  const recall = memory && typeof memory === 'object' ? memory : {};
 
   const facts = ctx
     ? [
@@ -541,6 +580,13 @@ export function buildChatInput({ text = '', history = [], context = null } = {})
 
   const blocks = [];
   if (facts.length) blocks.push(['Around him right now:', ...facts].join('\n'));
+  // Unlabelled on purpose: both digests are already addressed to her ("You
+  // remember…", "Your notes for…"), and a heading over them reads as a list to
+  // be recited rather than as something she knows.
+  const ledger = memoryBlock(recall.ledger);
+  if (ledger) blocks.push(ledger);
+  const vault = memoryBlock(recall.vault);
+  if (vault) blocks.push(vault);
   if (turns.length) blocks.push(['Earlier in this conversation:', ...turns].join('\n'));
   blocks.push(`${CHAT_SPEAKERS.owner} says to you: ${message}`);
   return blocks.join('\n\n');

@@ -14,6 +14,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 6. Speech unit tests: the salience gate silences routine tool traffic and lets the always-worth-it moments through, the 90s non-urgent throttle is enforced (`waiting`/`failed` interrupt immediately, subject only to a 6s floor against a repeat of the same kind), the time and session-count lines are rate-limited out of the briefing, and the canned fallback is used when the generated line does not arrive. Live Haiku call is exercised once by the integrator (`claude -p --model haiku`); if offline, flag it — don't fail the build.
 7. Wander scheduler unit tests with an injected clock: engages 20s after the aggregate mode becomes calm (`idle` **or** `busy`), picks targets inside the primary display work area, keeps walking across idle↔busy transitions, and cancels immediately on a non-calm mode (`waiting`/`failed`). Containment and physics are covered by the same suite: `bounds()` derives from the **injected measured** window size, `containNow()` recovers her from every edge (and no-ops inside, and works while pinned and while the mode is non-calm), gravity settles her exactly on the floor after at most a few decreasing bounces without exceeding terminal velocity or teleporting on a late tick, and a stroll aimed past a wall turns around instead of stopping dead.
 8. Server binds `127.0.0.1` only. No secrets, no telemetry, nothing written outside the repo (except the installer with explicit `--apply`).
+9. Chat unit tests: `send()` always resolves (line or null) across every brain failure, the rolling window drops whole exchanges, and the input cap holds. On the brain side, `requestChat` renders the conversation into the request, carries the persona and its voice examples, allows a reply the ambient 140-char clamp would have cut, keeps the allowlist (no file contents or diffs reachable), resolves null on timeout/failure, is disabled by a 401 along with the ambient path, and holds a latch **independent** of the ambient one in both directions. On the wiring side, `ganyu:chat` answers null before the chat module exists and relays the reply after, and `ganyu:set-focus` lifts then restores focusability in the right order.
 
 ## Machine facts (Windows 11)
 
@@ -33,6 +34,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 | C renderer | builder-C | `src/renderer/index.html`, `src/renderer/pet.mjs`, `src/renderer/bubbles.mjs`, `src/renderer/styles.css` |
 | D speech | builder-D | `src/main/speech.mjs`, `src/main/persona.mjs`, `src/main/brain.mjs`, `src/main/context.mjs`, `test/speech.test.mjs`, `test/brain.test.mjs`, `test/context.test.mjs` |
 | E wander | builder-E | `src/main/wander.mjs`, `test/wander.test.mjs` |
+| G chat | builder-G | `src/main/chat.mjs`, `test/chat.test.mjs` |
 | F hooks | builder-F | `hooks/ganyu-hook.cmd`, `hooks/install-hooks.mjs`, `test/install-hooks.test.mjs`, `hooks/fixtures/*` |
 | integrator | integrator | `package.json`, `scripts/smoke.mjs`, plus minimal cross-module wiring fixes |
 
