@@ -11,10 +11,14 @@
 // throttle gate them identically.
 // No Electron import; every side effect is injectable.
 
+import { pickToolInput, projectFromCwd } from './context.mjs';
 import { buildSummary, messageFor } from './persona.mjs';
 
 /** Minimum gap between lines. `waiting` / `failed` ignore it — they are the point. */
 export const THROTTLE_MS = 6_000;
+
+/** How many of her own lines she remembers, and is reminded of, at a time. */
+export const RECENT_LINES = 3;
 export const INTERRUPT_KINDS = new Set(['waiting', 'failed']);
 
 const BUSY_EVENTS = new Set([
@@ -65,12 +69,13 @@ export function toolNameOf(value) {
   return s === '' ? null : s;
 }
 
-/** Last path segment, tolerant of both Windows and POSIX separators. */
-export function projectName(p) {
-  if (!p) return null;
-  const parts = String(p).split(/[\\/]+/).filter(Boolean);
-  return parts.length ? parts[parts.length - 1] : null;
-}
+/**
+ * Last path segment, tolerant of both Windows and POSIX separators — with one
+ * exception, which is why it lives in context.mjs rather than here: an Orca
+ * worktree keeps `<repo>/<worktree>`, since "bay-daily-codes" alone does not say
+ * which repo it belongs to.
+ */
+export const projectName = projectFromCwd;
 
 /**
  * createSpeech({clock, onLine, isMuted, random, brain})
@@ -99,7 +104,19 @@ export function createSpeech({
   let lastMode = null;
   let shownCount = 0; // bumped on every emitted line; a brain reply for an older one is stale
   const toolClasses = new Map(); // sessionId -> last tool class
-  const lastLines = new Map(); // kind -> last line used, so variants alternate
+  // The last few lines she actually said, newest first. One store serving two
+  // readers: `avoid` keeps the canned table off the variant it just used, and the
+  // brain is told the same lines so it does not paraphrase itself all evening.
+  const recentLines = [];
+
+  function rememberLine(kind, text, fromTable) {
+    recentLines.unshift({ kind, text, fromTable });
+    if (recentLines.length > RECENT_LINES) recentLines.length = RECENT_LINES;
+  }
+
+  /** Only table lines: a generated line is never a variant, so it would disable `avoid`. */
+  const avoidFor = (kind) => recentLines.find((l) => l.fromTable && l.kind === kind)?.text ?? null;
+  const spokenLines = () => recentLines.map((l) => l.text);
 
   function rememberClass(sessionId, cls) {
     toolClasses.delete(sessionId);
@@ -127,7 +144,13 @@ export function createSpeech({
     // An errorish event is `failed` whatever its event name says: a PostToolUse
     // carrying an error arrives with mode 'busy', which would otherwise shadow it.
     const mode = errorish ? 'failed' : (input.mode ?? modeForEvent(event, errorish));
-    return { source, event, sessionId, toolName, project, errorish, mode };
+    // What the tool was actually asked to do — the difference between "running a
+    // tool" and "editing persona.mjs". Reduced to the allowlisted keys here, at
+    // the edge, so the keys carrying his code (old_string, content, prompt) do
+    // not travel any further into the app than the event that carried them.
+    const toolInput = pickToolInput(input.toolInput ?? input.tool_input ?? p.tool_input);
+    const agentType = input.agentType ?? p.agent_type ?? null;
+    return { source, event, sessionId, toolName, project, errorish, mode, toolInput, agentType };
   }
 
   /** Trigger rules. Also updates mode / tool-class tracking. */
@@ -182,9 +205,7 @@ export function createSpeech({
       return { spoken: false, reason: 'throttled', kind, retryInMs: wait, summary };
     }
 
-    // Only table lines feed the anti-repeat memory — a generated line is never
-    // one of the variants, so remembering it would just disable `avoid`.
-    if (fromTable) lastLines.set(kind, text);
+    rememberLine(kind, text, fromTable);
     lastSpokeAt = t;
     shownCount += 1;
     emit({ text, kind, mode: ev.mode ?? null, source: ev.source, summary });
@@ -200,6 +221,9 @@ export function createSpeech({
       project: ev.project,
       mode: ev.mode ?? null,
       source: ev.source,
+      toolInput: ev.toolInput ?? {},
+      agentType: ev.agentType ?? null,
+      recentLines: spokenLines(),
     };
   }
 
@@ -244,7 +268,7 @@ export function createSpeech({
       tool: ev.toolName,
       project: ev.project,
       random,
-      avoid: lastLines.get(kind) ?? null,
+      avoid: avoidFor(kind),
     });
 
     if (!askBrain) return show(kind, canned, ev, summary);
@@ -279,7 +303,7 @@ export function createSpeech({
     },
     dispose() {
       toolClasses.clear();
-      lastLines.clear();
+      recentLines.length = 0;
     },
   };
 }

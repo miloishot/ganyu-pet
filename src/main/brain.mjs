@@ -42,7 +42,9 @@ const ROUTE_ORDER = ['responses', 'chat'];
 /**
  * Generous because on the Responses API reasoning tokens are charged against
  * this budget too — a cap tight enough for a 140-char line can be spent
- * entirely on reasoning and return empty output.
+ * entirely on reasoning and return empty output. The line itself measured at
+ * most 62 tokens live, so this is headroom for the thinking, not for the line;
+ * it is a ceiling, not a spend, and lowering it only buys empty replies.
  */
 const MAX_OUTPUT_TOKENS = 300;
 
@@ -52,6 +54,16 @@ export const REQUIRED_KEYS = Object.freeze([
   'GANYU_OPENAI_MODEL',
   'GANYU_OPENAI_API_KEY',
 ]);
+
+/**
+ * Reasoning effort for the Responses API. Measured on the owner's endpoint:
+ * `low` answered in 3.0s against 5.5s for the model's default, and wrote better
+ * lines — a status bubble is not a puzzle, and a stale line is a wrong line.
+ * Optional `GANYU_OPENAI_REASONING_EFFORT` in `.env.local` overrides it;
+ * `none` omits the field entirely, for a model that rejects it.
+ */
+export const DEFAULT_REASONING_EFFORT = 'low';
+const NO_REASONING = new Set(['none', 'off', 'default', '']);
 
 /** Minimal KEY=VALUE parser: blank lines and `#` comments skipped, values trimmed. */
 export function parseEnvFile(text) {
@@ -92,6 +104,7 @@ export function loadBrainConfig({ envPath } = {}) {
     baseUrl: env.GANYU_OPENAI_BASE_URL.replace(/\/+$/, ''),
     model: env.GANYU_OPENAI_MODEL,
     apiKey: env.GANYU_OPENAI_API_KEY,
+    reasoningEffort: env.GANYU_OPENAI_REASONING_EFFORT || DEFAULT_REASONING_EFFORT,
   };
 }
 
@@ -119,9 +132,15 @@ export function postProcess(text) {
 }
 
 /**
- * createBrain({config, fetchImpl, now, log, timeoutMs}) -> {requestLine, ...}
+ * createBrain({config, fetchImpl, now, log, timeoutMs, getContext}) -> {requestLine, ...}
  *
  * `requestLine({detail, summary})` resolves to a line or to null. Never rejects.
+ *
+ * `getContext` is optional: module A injects a reader over module B's debug ring
+ * and aggregate (see context.mjs), and its result is what turns "Claude Code is
+ * about to run Edit" into a briefing she can actually say something about. It is
+ * called once per request, so the facts are current; a getter that throws is
+ * treated as no context at all.
  */
 export function createBrain({
   config,
@@ -129,10 +148,12 @@ export function createBrain({
   now = Date.now,
   log = null,
   timeoutMs = REQUEST_TIMEOUT_MS,
+  getContext = null,
 } = {}) {
   const baseUrl = String(config?.baseUrl ?? '').replace(/\/+$/, '');
   const model = String(config?.model ?? '');
   const apiKey = String(config?.apiKey ?? '');
+  const effort = String(config?.reasoningEffort ?? DEFAULT_REASONING_EFFORT).trim().toLowerCase();
 
   // A brain with nothing to call is born disabled rather than special-cased at
   // every call site: speech treats "returns null forever" identically to absent.
@@ -159,6 +180,8 @@ export function createBrain({
         input,
         max_output_tokens: MAX_OUTPUT_TOKENS,
         store: false,
+        // Chat completions has no such parameter, so this stays on this branch.
+        ...(NO_REASONING.has(effort) ? {} : { reasoning: { effort } }),
       };
     }
     return {
@@ -209,6 +232,18 @@ export function createBrain({
     }
   }
 
+  /** The world around the event, or nothing. Never the reason a line fails to appear. */
+  function readContext() {
+    if (typeof getContext !== 'function') return null;
+    try {
+      const context = getContext();
+      return context && typeof context === 'object' ? context : null;
+    } catch (err) {
+      say('warn', `brain: context unavailable (${err?.name ?? 'error'})`);
+      return null;
+    }
+  }
+
   /**
    * At most one request in flight. A second event during a call gets its canned
    * line and nothing else — queueing would only ever deliver a line describing
@@ -220,7 +255,8 @@ export function createBrain({
     const started = now();
     try {
       const instructions = BRAIN_INSTRUCTIONS;
-      const input = buildBrainInput(detail, summary);
+      const context = readContext();
+      const input = buildBrainInput(context ? { ...detail, context } : detail, summary);
       const order = route ? [route, ...ROUTE_ORDER.filter((r) => r !== route)] : ROUTE_ORDER;
 
       for (const kind of order) {

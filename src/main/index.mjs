@@ -6,6 +6,7 @@ import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { buildContext, trackActiveSince } from './context.mjs';
 import {
   CHANNELS,
   HOVER_POLL_MS,
@@ -55,6 +56,14 @@ let hoverPoll = null;
 let hoverWatch = null;
 let disposeIpc = null;
 let lastPushed = '';
+/**
+ * `{since, last}` for the current working stretch, stepped on every hook event.
+ * The debug ring holds 50 entries and sessions expire after 10 minutes, so
+ * neither can answer "how long has he been at this" once an evening gets busy;
+ * this can, and `trackActiveSince` restarts it after a long enough gap so a
+ * night's sleep is not counted as work.
+ */
+let activity = null;
 
 // ---------------------------------------------------------------------------
 // Production dependencies for the injected modules
@@ -364,7 +373,10 @@ async function composeRuntime() {
   // yields (normalizedEvent, aggregate). If a build of B ever lacks it, fall
   // back to wrapping `ingest` — degrade, never abort (no server = deaf pet).
   if (typeof state.onEvent === 'function') {
-    state.onEvent((event, aggregate) => notifySpeech(event, aggregate));
+    state.onEvent((event, aggregate) => {
+      activity = trackActiveSince(activity, Date.now());
+      notifySpeech(event, aggregate);
+    });
     speechTapped = true;
   } else if (typeof state.ingest === 'function') {
     const rawIngest = state.ingest.bind(state);
@@ -391,7 +403,18 @@ async function composeRuntime() {
   if (brainMod?.loadBrainConfig && brainMod?.createBrain) {
     const brainConfig = brainMod.loadBrainConfig({ envPath: ENV_FILE });
     if (brainConfig.enabled) {
-      brain = brainMod.createBrain({ config: brainConfig, log: console });
+      brain = brainMod.createBrain({
+        config: brainConfig,
+        log: console,
+        // Read fresh per request, and lazily: the server that owns the ring is
+        // created further down this same function.
+        getContext: () => buildContext({
+          ring: typeof server?.debugEvents === 'function' ? server.debugEvents() : [],
+          state,
+          now: Date.now(),
+          activeSinceMs: activity?.since ?? null,
+        }),
+      });
       console.log(`[ganyu] brain: enabled (model ${brainConfig.model})`);
     } else {
       console.log(`[ganyu] brain: disabled (${brainConfig.reason}) — canned lines only`);

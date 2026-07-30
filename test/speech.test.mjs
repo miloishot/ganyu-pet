@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 
 import {
   INTERRUPT_KINDS,
+  RECENT_LINES,
   THROTTLE_MS,
   createSpeech,
   modeForEvent,
@@ -456,6 +457,11 @@ test('an urgent kind shows the canned line at once, then the brain line replaces
     project: null,
     mode: 'waiting',
     source: 'claude',
+    toolInput: {},
+    agentType: null,
+    // The canned line is already in the bubble, so it is the first thing she is
+    // told not to repeat.
+    recentLines: ['Bash needs your approval.'],
   });
   assert.equal(brain.calls[0].summary, 'Claude Code is waiting for permission to run Bash');
 
@@ -542,6 +548,52 @@ test('a brain reply whose bubble was taken by a newer line is dropped', async ()
   assert.equal(h.lines.length, 1, 'a line about the previous event never lands');
   // The throttle is measured from what was actually shown, not from the dropped reply.
   assert.equal(h.speech.stats().lastSpokeAt, h.now());
+});
+
+test('the brain is told the last three lines she said, canned or generated', async () => {
+  const brain = fakeBrain();
+  const h = harness({ brain });
+
+  // Four lines said, so the oldest has to fall out of a ring of three.
+  const first = h.speech.notify(permission); // urgent: the canned line is already out
+  brain.reply(null);
+  await first.pending;
+
+  h.advance(THROTTLE_MS);
+  const greeting = h.speech.notify(sessionStart);
+  brain.reply('A new session in ganyu-pet, Kahweng.'); // a generated line counts too
+  await greeting.pending;
+
+  h.advance(THROTTLE_MS);
+  const done = h.speech.notify(stop);
+  brain.reply(null); // falls back to the canned celebrate line
+  await done.pending;
+
+  h.advance(THROTTLE_MS);
+  h.speech.notify({ ...failure, sessionId: 's7' });
+
+  assert.deepEqual(h.lines.map((l) => l.text), [
+    'Bash needs your approval.',
+    'A new session in ganyu-pet, Kahweng.',
+    'Finished in ganyu-pet.',
+    "Error in Bash. I've noted it.",
+  ]);
+  assert.deepEqual(brain.calls.at(-1).detail.recentLines, [
+    "Error in Bash. I've noted it.", // newest first, and the one in the bubble right now
+    'Finished in ganyu-pet.',
+    'A new session in ganyu-pet, Kahweng.', // generated lines are remembered as well
+  ]);
+  assert.equal(RECENT_LINES, 3);
+});
+
+test('the tool input reaches the brain, filtered to the allowlist', () => {
+  const brain = fakeBrain();
+  const h = harness({ brain });
+  h.speech.notify({
+    ...permission,
+    toolInput: { command: 'npm test', old_string: 'const SECRET = 1', content: 'a whole file' },
+  });
+  assert.deepEqual(brain.calls[0].detail.toolInput, { command: 'npm test' });
 });
 
 test('a throttled event never reaches the brain', () => {

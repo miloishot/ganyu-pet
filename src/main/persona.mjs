@@ -1,6 +1,8 @@
 // Module D — persona: event → human phrase, plus the deterministic status-line
 // table the bubble draws from. Pure data + pure functions, no I/O.
 
+import { describeAction, describeDuration } from './context.mjs';
+
 /** Rendered lines are clamped to this. Every MESSAGES variant is well under it. */
 export const MAX_LINE_CHARS = 70;
 
@@ -123,25 +125,141 @@ export const BRAIN_INSTRUCTIONS = [
   'You are gentle, diligent and a little formal, and you genuinely care about the person you assist.',
   `Address him as ${OWNER_NAME}, plainly — never with a title or honorific of any kind.`,
   'He is coding, and you comment on what his coding agent just did.',
+  'You are handed a short briefing about his machine. React to the specific thing in it:',
+  'the file, the command, the project, the count. Generic encouragement is worse than silence.',
+  'Never invent a detail you were not given — no file names, no numbers, no events of your own.',
+  'Vary how you open. Do not begin every line the same way, and never repeat a line you were just told you said.',
+  'The hour, and how long he has been at it, are worth a word occasionally — not every time.',
   'Reply with exactly one short line, under 120 characters, in English, in your own voice.',
   'No quotation marks around the line. At most one emoji, and only where it feels natural.',
 ].join(' ');
 
+/** Below this, "he has been working for a while" is noise rather than a fact. */
+const MIN_REPORTED_ACTIVE_MS = 30 * 60 * 1000;
+const MAX_LISTED_TOOLS = 3;
+const MAX_LISTED_PROJECTS = 3;
+
+/** "a", "a and b", "a, b and c" */
+function joinList(items) {
+  if (items.length <= 1) return items[0] ?? '';
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** Only worth saying when there is more than one — one session is the normal case. */
+function sessionsLine(sessions) {
+  const count = Number(sessions?.count);
+  if (!Number.isFinite(count) || count < 2) return null;
+  return `Right now: ${count} coding sessions are running at once.`;
+}
+
+/** The event itself: the summary phrase, plus what the tool input says it did. */
+function happenedLine(ev, phrase, tool) {
+  const action = describeAction({
+    tool_name: tool,
+    tool_input: ev.toolInput,
+    agent_type: ev.agentType,
+  });
+  // An unknown tool describes itself as its own name, which the phrase already says.
+  const clause = action && !phrase.includes(action) ? ` — ${action}` : '';
+  return `Just happened: ${phrase}${clause}.`;
+}
+
+/** Counts, repeats and how the failures went. Silent below a few events — noise otherwise. */
+function recentLine(recent) {
+  if (!recent || recent.count < 3) return null;
+  const tools = recent.tools.slice(0, MAX_LISTED_TOOLS).map((t) => plural(t.count, `${t.name} call`));
+  if (tools.length === 0) return null;
+
+  let headline = joinList(tools);
+  if (recent.testRuns > 0) headline += ` (${plural(recent.testRuns, 'test run')} among them)`;
+  const where = recent.projects.length
+    ? ` in ${joinList(recent.projects.slice(0, 2).map((p) => p.name))}`
+    : '';
+  const minutes = Math.round(recent.windowMs / 60_000);
+  const clauses = [`${headline}${where} over the last ${minutes} minutes`];
+
+  const file = recent.files[0];
+  if (file) clauses.push(`${file.name} touched ${file.count} times`);
+  const command = recent.commands[0];
+  if (command) clauses.push(`\`${command.text}\` run ${command.count} times`);
+
+  const failures = recent.failures ?? { count: 0, streak: 0, recovered: [] };
+  if (failures.streak >= 2) clauses.push(`${failures.streak} failures in a row just now`);
+  else if (failures.recovered.length) clauses.push(`${failures.recovered[0]} failed and then recovered`);
+  else if (failures.count > 0) clauses.push(`${plural(failures.count, 'step')} failed`);
+
+  return `Recent activity: ${clauses.join('; ')}.`;
+}
+
+/** The other projects with something going on, so she knows the desk is crowded. */
+function alsoActiveLine(context, currentProject) {
+  const names = new Set(context.sessions?.projects ?? []);
+  for (const p of context.recent?.projects ?? []) names.add(p.name);
+  if (currentProject) names.delete(currentProject);
+  const list = [...names].slice(0, MAX_LISTED_PROJECTS);
+  return list.length ? `Also active: ${list.join(', ')}.` : null;
+}
+
+function timeLine(context) {
+  const time = context.time;
+  if (!time) return null;
+  let line = `Local time: ${time.hhmm}, ${time.daypart}.`;
+  const activeFor = Number(context.sessions?.activeForMs);
+  if (Number.isFinite(activeFor) && activeFor >= MIN_REPORTED_ACTIVE_MS) {
+    const spoken = describeDuration(activeFor);
+    if (spoken) line += ` He has been working for ${spoken}.`;
+  }
+  return line;
+}
+
+/** Her own last few lines, so she does not say the same thing twice in a row. */
+function lastSaidLine(lines) {
+  if (lines.length === 0) return null;
+  const [latest, ...older] = lines;
+  const before = older.length ? ` (before that: ${older.map((l) => `"${l}"`).join(', ')})` : '';
+  return `You last said: "${latest}"${before} — do not repeat yourself.`;
+}
+
 /**
- * The `input` / user text: what just happened, plus the same facts the canned
- * table fills its slots from, so the model never has to guess a tool or project
- * name. `ev` is the speech event ({kind, tool|toolName, project, mode, source,
- * event}); `summary` is buildSummary's phrase, passed in when the caller already
- * has it.
+ * The `input` / user text: a short briefing on what just happened and what is
+ * going on around it. `ev` is the speech event ({kind, tool|toolName, project,
+ * mode, source, event, toolInput}) plus, when module A wired it up, `context`
+ * (see context.mjs) and `recentLines` (what she last said). `summary` is
+ * buildSummary's phrase, passed in when the caller already has it.
+ *
+ * Every line is optional and an unknown fact simply removes its line — she is
+ * never handed "project: unknown" to read out. With neither context nor recent
+ * lines this is the original one-line form, unchanged, which is what a bare
+ * event and every test that predates the briefing still get.
  */
 export function buildBrainInput(ev = {}, summary = null) {
   const tool = ev.tool ?? ev.toolName ?? null;
   const phrase = summary || buildSummary({ ...ev, toolName: tool });
-  const facts = [];
-  if (ev.kind) facts.push(`event: ${ev.kind}`);
-  if (tool) facts.push(`tool: ${tool}`);
-  if (ev.project) facts.push(`project: ${ev.project}`);
-  return facts.length ? `Just happened: ${phrase}. (${facts.join(', ')})` : `Just happened: ${phrase}.`;
+  const context = ev.context && typeof ev.context === 'object' ? ev.context : null;
+  const recentLines = (Array.isArray(ev.recentLines) ? ev.recentLines : [])
+    .filter((line) => typeof line === 'string' && line.trim() !== '')
+    .map((line) => line.trim());
+
+  if (!context && recentLines.length === 0) {
+    const facts = [];
+    if (ev.kind) facts.push(`event: ${ev.kind}`);
+    if (tool) facts.push(`tool: ${tool}`);
+    if (ev.project) facts.push(`project: ${ev.project}`);
+    return facts.length ? `Just happened: ${phrase}. (${facts.join(', ')})` : `Just happened: ${phrase}.`;
+  }
+
+  const lines = [
+    context ? sessionsLine(context.sessions) : null,
+    happenedLine(ev, phrase, tool),
+    context ? recentLine(context.recent) : null,
+    context ? alsoActiveLine(context, ev.project ?? null) : null,
+    context ? timeLine(context) : null,
+    lastSaidLine(recentLines),
+  ];
+  return lines.filter(Boolean).join('\n');
 }
 
 const SLOTS = ['tool', 'project'];

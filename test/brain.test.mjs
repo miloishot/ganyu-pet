@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  DEFAULT_REASONING_EFFORT,
   MAX_BRAIN_LINE_CHARS,
   REQUIRED_KEYS,
   ROUTES,
@@ -119,7 +120,16 @@ test('a full .env.local enables the brain, trimmed and without the trailing slas
     baseUrl: 'https://endpoint.invalid/api',
     model: 'test-model',
     apiKey: 'sk-test-not-a-real-key',
+    reasoningEffort: DEFAULT_REASONING_EFFORT,
   });
+  assert.equal(DEFAULT_REASONING_EFFORT, 'low');
+
+  // Optional, and never required: the brain is usable without ever naming it.
+  const explicit = loadBrainConfig({
+    envPath: tempEnv(t, `${FULL_ENV}GANYU_OPENAI_REASONING_EFFORT=medium\n`),
+  });
+  assert.equal(explicit.reasoningEffort, 'medium');
+  assert.ok(!REQUIRED_KEYS.includes('GANYU_OPENAI_REASONING_EFFORT'));
 });
 
 test('parseEnvFile skips blanks and comments and keeps `=` inside a value', () => {
@@ -311,6 +321,62 @@ test('the responses request body carries store:false, the model and both prompt 
   assert.ok(Number.isInteger(body.max_output_tokens));
   assert.equal(init.method, 'POST');
   assert.equal(init.headers.authorization, `Bearer ${CONFIG.apiKey}`);
+});
+
+test('the responses body asks for low reasoning effort, and the chat body never does', async () => {
+  // Measured on the owner's endpoint: `low` answered in 3.0s against 5.5s, and
+  // wrote better lines. Chat completions has no such parameter at all.
+  const fetchImpl = scriptedFetch(reply(404, {}), chatOk('Noted.'));
+  const brain = createBrain({ config: CONFIG, fetchImpl });
+  await brain.requestLine({ detail: DETAIL });
+
+  assert.deepEqual(fetchImpl.calls[0].body.reasoning, { effort: 'low' });
+  assert.equal(fetchImpl.calls[1].body.reasoning, undefined);
+  assert.equal(fetchImpl.calls[1].body.max_output_tokens, undefined);
+});
+
+test('the reasoning effort is configurable, and `none` omits the field entirely', async () => {
+  const high = scriptedFetch(responsesOk('Noted.'));
+  await createBrain({ config: { ...CONFIG, reasoningEffort: 'high' }, fetchImpl: high })
+    .requestLine({ detail: DETAIL });
+  assert.deepEqual(high.calls[0].body.reasoning, { effort: 'high' });
+
+  // The escape hatch for a model that rejects the parameter.
+  const none = scriptedFetch(responsesOk('Noted.'));
+  await createBrain({ config: { ...CONFIG, reasoningEffort: 'none' }, fetchImpl: none })
+    .requestLine({ detail: DETAIL });
+  assert.equal(none.calls[0].body.reasoning, undefined);
+  assert.equal(none.calls[0].body.store, false, 'the rest of the body is unchanged');
+});
+
+test('injected context is folded into the input, and a broken getter is survivable', async () => {
+  const context = {
+    time: { hhmm: '22:15', daypart: 'late night', lateNight: true },
+    recent: null,
+    sessions: { count: 4, projects: [], activeSince: null, activeForMs: null },
+  };
+  const withContext = scriptedFetch(responsesOk('Noted.'));
+  await createBrain({ config: CONFIG, fetchImpl: withContext, getContext: () => context })
+    .requestLine({ detail: DETAIL, summary: SUMMARY });
+
+  const sent = withContext.calls[0].body.input;
+  assert.equal(sent, buildBrainInput({ ...DETAIL, context }, SUMMARY));
+  assert.match(sent, /^Right now: 4 coding sessions are running at once\.$/m);
+  assert.match(sent, /^Local time: 22:15, late night\.$/m);
+
+  // A getter that throws costs the briefing, never the line.
+  const broken = scriptedFetch(responsesOk('Noted.'));
+  const log = recorder();
+  const line = await createBrain({
+    config: CONFIG,
+    fetchImpl: broken,
+    log,
+    getContext: () => { throw new Error('ring unavailable'); },
+  }).requestLine({ detail: DETAIL, summary: SUMMARY });
+
+  assert.equal(line, 'Noted.');
+  assert.equal(broken.calls[0].body.input, buildBrainInput(DETAIL, SUMMARY), 'back to the thin input');
+  for (const entry of log.lines) assert.ok(!entry.includes('ring unavailable'), entry);
 });
 
 test('the chat-completions body carries the same prompt as system + user', async () => {

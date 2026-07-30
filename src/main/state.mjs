@@ -134,6 +134,13 @@ export function normalizeEvent(source, payload, at = Date.now()) {
     mode: modeForEvent(canonical),
     failed: hasErrorMarker(body),
     tool: body.tool_name ?? body.toolName ?? body.tool ?? null,
+    // Carried through untouched for module D, which reads it through an explicit
+    // allowlist (context.mjs) before any of it can be spoken or sent anywhere.
+    // Without it the normalized event says a tool ran but never which file or
+    // command, and the debug ring — which does have it — is written a moment
+    // after the listeners have already fired.
+    toolInput: body.tool_input ?? body.toolInput ?? null,
+    agentType: body.agent_type ?? body.agentType ?? null,
     cwd: body.cwd ?? body.workspace ?? null,
     message: typeof message === 'string' ? message : null,
     permission: /permission|approve|approval|confirm/i.test(
