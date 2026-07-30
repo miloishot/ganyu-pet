@@ -790,3 +790,99 @@ test('a chat request can carry no more of his machine than an ambient one', asyn
     assert.ok(!smuggled.calls[0].init.body.includes(secret), `an extra argument reached the prompt: ${secret}`);
   }
 });
+
+// ---------------------------------------------------------------- her memory
+//
+// Two digests, read on the chat path only: the ledger's (what she saw and wrote
+// down — ledger.mjs) and the vault's (what he wrote down, and what he left open
+// — vault.mjs). They are what turn "what broke earlier?" from a question she
+// can only guess at into one she can answer, and they are deliberately absent
+// from the ambient path — see persona.buildChatInput for why.
+
+const MEMORY = Object.freeze({
+  ledger: 'You remember, going back about 2 hours: 2 failures (running `npm test`), '
+    + 'the last about 40 minutes ago; one approval you waited on, about an hour ago.\n'
+    + 'Projects: ganyu-pet, GolfCRM.',
+  vault: 'Your notes for GolfCRM — "Bay codes — the timezone fix" (2026-07-29).\n'
+    + 'Still open there: The DST edge case at 02:00; Rotate the CI secret.',
+});
+
+test('what she remembers reaches a chat reply', async () => {
+  const fetchImpl = scriptedFetch(responsesOk('Twice, both on the test run.'));
+  const brain = createBrain({ config: CONFIG, fetchImpl, getMemory: () => MEMORY });
+
+  assert.equal(await brain.requestChat({ text: 'what broke earlier?' }), 'Twice, both on the test run.');
+  const input = fetchImpl.calls[0].body.input;
+  assert.ok(input.includes(MEMORY.ledger), 'the ledger digest is missing from the briefing');
+  assert.ok(input.includes(MEMORY.vault), 'the vault digest is missing from the briefing');
+});
+
+test('and never an ambient one — a status remark is worse for having it', async () => {
+  // The ambient prompt asks for one line under 110 characters about the thing
+  // that just happened. A paragraph of recall pulls the other way, and there is
+  // no room to resolve the two.
+  const fetchImpl = scriptedFetch(responsesOk('That one stopped short.'));
+  const brain = createBrain({ config: CONFIG, fetchImpl, getMemory: () => MEMORY });
+
+  await brain.requestLine({ detail: DETAIL, summary: SUMMARY });
+  const input = fetchImpl.calls[0].body.input;
+  assert.ok(!input.includes('You remember'), 'the ledger digest reached the ambient prompt');
+  assert.ok(!input.includes('Your notes for'), 'the vault digest reached the ambient prompt');
+  assert.ok(!input.includes('Left open'));
+});
+
+test('the briefing puts what is happening first, then what she remembers, then the conversation', () => {
+  const context = {
+    time: null,
+    recent: null,
+    sessions: { count: 4, projects: [], activeSince: null, activeForMs: null },
+  };
+  const input = buildChatInput({
+    text: 'what broke earlier?',
+    history: HISTORY,
+    context,
+    memory: MEMORY,
+  });
+  const order = ['Around him right now:', 'You remember, going back', 'Your notes for GolfCRM', 'Earlier in this conversation:', 'Kahweng says to you:']
+    .map((marker) => input.indexOf(marker));
+  assert.ok(order.every((i) => i >= 0), `a block is missing: ${order.join(', ')}`);
+  assert.deepEqual([...order].sort((a, b) => a - b), order, 'the blocks are out of order');
+
+  // Unlabelled on purpose: both digests already address her ("You remember…"),
+  // and a heading over them reads as a list to recite rather than as memory.
+  assert.ok(!/^(Memory|Recall|Your ledger):/m.test(input));
+});
+
+test('half a memory, no memory and a broken memory are all just less', async () => {
+  assert.ok(!buildChatInput({ text: 'hi', memory: { ledger: null, vault: MEMORY.vault } }).includes('You remember'));
+  assert.ok(!buildChatInput({ text: 'hi', memory: { ledger: '   ', vault: null } }).includes('\n\n'));
+  assert.equal(buildChatInput({ text: 'hi', memory: null }), 'Kahweng says to you: hi');
+  assert.equal(buildChatInput({ text: 'hi', memory: 'not an object' }), 'Kahweng says to you: hi');
+
+  // A reader that throws must cost the recall and nothing else — the reply is
+  // the thing he is sitting there waiting for.
+  const fetchImpl = scriptedFetch(responsesOk('Still here.'));
+  const log = recorder();
+  const brain = createBrain({
+    config: CONFIG,
+    fetchImpl,
+    log,
+    getMemory: () => {
+      throw new Error('the ledger is on fire');
+    },
+  });
+  assert.equal(await brain.requestChat({ text: 'are you there?' }), 'Still here.');
+  assert.ok(log.lines.some((l) => /memory unavailable/.test(l)));
+  assert.ok(!log.lines.some((l) => /on fire/.test(l)), 'the error message is not repeated back');
+});
+
+test('the chat prompt says she may claim what she noted, and nothing else', async () => {
+  // The rule itself is in BRAIN_INSTRUCTIONS, so it is in this prompt verbatim
+  // (see the first test in this section). What is added here is the half that
+  // only chat can reach: on this path he can *ask her to do things*.
+  assert.match(CHAT_INSTRUCTIONS, /You cannot edit a file, run a command, fix anything, set a page aside/i);
+  const added = CHAT_INSTRUCTIONS.slice(BRAIN_INSTRUCTIONS.length);
+  assert.match(added, /Anything else he asks of you, you cannot do/i);
+  assert.match(added, /you tell him so gently instead of agreeing to it/i);
+  assert.match(added, /do not read them out/i, 'the digests are background, not a script');
+});

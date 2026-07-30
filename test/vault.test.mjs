@@ -260,6 +260,51 @@ test('a note with nothing open still says when he last wrote about it', () => {
   assert.equal(text, 'Your notes for GolfCRM — "A quiet day" (2026-07-29).');
 });
 
+test('a numbered, hard-wrapped Left-open list reads as threads, not as nothing', () => {
+  // The owner's current convention, checked against the real vault: Salesbridge
+  // writes `- `, and his two newest notes write `1.` with the text wrapped at
+  // about 80 columns. A dash-only reader returned an empty list for those, and
+  // said nothing at all — silently, which is the worst way for this to fail.
+  const digest = noteDigest([
+    '## Left open',
+    '',
+    '1. The DST edge case at 02:00 on the changeover night still has no test,',
+    '   and the fix in tee_time.ts only papers over it for the northern clubs.',
+    '2. Rotate the CI secret that leaked into the build log.',
+    '3. Decide whether the backfill runs before or after the release.',
+    '4. A fourth thread, which is one too many.',
+    '',
+    '## Decisions',
+    '- something private',
+  ].join('\n'), { name: 'session-2026-07-31.md' });
+
+  assert.equal(digest.open.length, MAX_OPEN_ITEMS);
+  assert.match(digest.open[0], /^The DST edge case at 02:00 on the changeover night still has no test,/);
+  assert.ok(digest.open[0].endsWith('…'), 'a wrapped thread is joined, then honestly cut');
+  assert.equal(digest.open[1], 'Rotate the CI secret that leaked into the build log.');
+  assert.ok(!digest.open.some((i) => i.includes('private')), 'the next section is not a thread');
+  assert.ok(!digest.open.some((i) => i.includes('fourth')));
+});
+
+test('the Left-open heading is matched as loosely as the shell hook matches it', () => {
+  // session-status.sh has been reading these notes for months with
+  // `^## .*[Ll]eft open`. A stricter rule here would find nothing in a note it
+  // reads happily, and the failure would be silent.
+  for (const heading of ['## Left open', '## What is left open', '## Left open / next session', '#### left open']) {
+    const digest = noteDigest(`${heading}\n- the one thing\n`, { name: 'session-2026-07-29.md' });
+    assert.deepEqual(digest.open, ['the one thing'], `missed: ${heading}`);
+  }
+  // A sub-heading inside the section does not end it; the next peer does.
+  const nested = noteDigest([
+    '## Left open',
+    '### tomorrow',
+    '- the DST case',
+    '## Decisions',
+    '- something private',
+  ].join('\n'), { name: 'session-2026-07-29.md' });
+  assert.deepEqual(nested.open, ['the DST case']);
+});
+
 test('a note with no heading falls back to its filename, and no frontmatter to its date', () => {
   const digest = noteDigest('## Left open\n- one thing\n', {
     name: 'handover-2026-07-31-ledger.md',

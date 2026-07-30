@@ -62,10 +62,32 @@ export const MAX_TITLE_CHARS = 70;
 /** `session-2026-07-30.md`, `handover-2026-07-30-ledger.md`. Nothing else is a note. */
 const NOTE_RE = /^(?:session|handover)-(\d{4}-\d{2}-\d{2})(?:-.*)?\.md$/i;
 
-/** A `## Left open` heading, at any heading depth and any capitalisation. */
-const LEFT_OPEN_RE = /^#{1,6}\s*left\s+open\b/i;
-const HEADING_RE = /^#{1,6}\s/;
-const BULLET_RE = /^\s*[-*+]\s+(.*)$/;
+/**
+ * The section heading, and where a section ends.
+ *
+ * `LEFT_OPEN_RE` deliberately matches the *whole* heading text rather than
+ * anchoring at "Left open", because `session-status.sh` — which has been
+ * reading these same notes for months — matches `^## .*[Ll]eft open`, and a
+ * stricter rule here would silently find nothing in a note the shell hook
+ * reads happily ("## What is left open", "## Left open / next session").
+ *
+ * A section ends at the next heading of the same depth or shallower, so a
+ * `### ` grouping *inside* Left open does not truncate the list.
+ */
+const LEFT_OPEN_RE = /^#{1,6}\s+.*left\s+open/i;
+const HEADING_RE = /^(#{1,6})\s/;
+
+/**
+ * One open thread. **Numbered as well as dashed**, and that is not defensive
+ * programming — checked against the real vault, `Salesbridge` writes `- ` and
+ * the two newest notes (`GolfCRM`, `Ganyu Pet`) write `1.`, so a dash-only rule
+ * reads the owner's current convention as an empty list and says nothing at
+ * all. A marker indented by more than one space is a sub-point, not a thread.
+ */
+const ITEM_RE = /^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/;
+
+/** Those notes wrap at ~80 columns, so an item is a marker line plus its tail. */
+const MARKER_RE = /^\s*(?:[-*+]|\d+[.)])\s+/;
 
 /** One line, collapsed, trimmed, hard-capped. Empty and non-strings are null. */
 function shortText(value, max) {
@@ -202,7 +224,7 @@ export function noteDigest(text, { name = '', date = null } = {}) {
   let title = null;
   let frontmatterDate = null;
   let inFrontmatter = false;
-  let inOpen = false;
+  let openDepth = 0; // 0 while outside the section; the heading's depth inside it
   const open = [];
 
   for (let i = 0; i < lines.length; i += 1) {
@@ -220,23 +242,39 @@ export function noteDigest(text, { name = '', date = null } = {}) {
       continue;
     }
 
-    if (HEADING_RE.test(line)) {
-      if (!title && /^#\s/.test(line)) title = shortText(plainText(line.replace(/^#\s+/, '')), MAX_TITLE_CHARS);
-      inOpen = LEFT_OPEN_RE.test(line);
+    const heading = HEADING_RE.exec(line);
+    if (heading) {
+      if (!title && heading[1] === '#') {
+        title = shortText(plainText(line.replace(/^#\s+/, '')), MAX_TITLE_CHARS);
+      }
+      const depth = heading[1].length;
+      if (LEFT_OPEN_RE.test(line)) openDepth = depth;
+      else if (openDepth && depth <= openDepth) openDepth = 0;
       continue;
     }
-    if (!inOpen) continue;
+    if (!openDepth) continue;
 
-    const bullet = BULLET_RE.exec(line);
-    if (!bullet) continue;
-    const item = shortText(plainText(bullet[1]), MAX_ITEM_CHARS);
-    if (item && open.length < MAX_OPEN_ITEMS) open.push(item);
+    const item = ITEM_RE.exec(line);
+    if (item && item[1].length <= 1) {
+      // The fourth thread ends the reading rather than being dropped one line
+      // at a time: nothing after it can belong to a thread she is going to say.
+      if (open.length >= MAX_OPEN_ITEMS) {
+        openDepth = 0;
+        continue;
+      }
+      open.push([item[2]]);
+    } else if (open.length && line.trim() !== '') {
+      // A wrapped line, or a sub-point: part of the thread above it, not a new
+      // one. Clamping happens once, at the end, so the join cannot smuggle in
+      // more than MAX_ITEM_CHARS however many lines it ran to.
+      open[open.length - 1].push(line.replace(MARKER_RE, ''));
+    }
   }
 
   return {
     title: title ?? shortText(String(name).replace(/\.md$/i, ''), MAX_TITLE_CHARS),
     date: frontmatterDate ?? date ?? null,
-    open,
+    open: open.map((parts) => shortText(plainText(parts.join(' ')), MAX_ITEM_CHARS)).filter(Boolean),
   };
 }
 

@@ -965,7 +965,7 @@ test('routine tool traffic is not remembered, even when it is worth a line', () 
   h.advance(1000);
   h.speech.notify(editPre);
   const quiet = h.speech.notify(bashPre);
-  assert.equal(quiet.reason, 'throttled');
+  assert.equal(quiet.reason, 'not-salient');
 
   // And a class change she *does* speak, because ten minutes of silence
   // promotes it. This is the interesting one: the line is worth showing, the
@@ -982,11 +982,10 @@ test('routine tool traffic is not remembered, even when it is worth a line', () 
 test('a pattern she remarks on is remembered as the pattern', () => {
   const ledger = fakeLedger();
   const h = harness({ ledger });
-  const read = {
+  const pass = {
     source: 'claude',
     event: 'PostToolUse',
     sessionId: 's1',
-    toolName: 'Read',
     mode: 'busy',
     cwd: 'C:\\dev\\ganyu-pet',
     toolInput: { file_path: 'C:\\dev\\ganyu-pet\\src\\main\\persona.mjs' },
@@ -994,9 +993,11 @@ test('a pattern she remarks on is remembered as the pattern', () => {
   // A first line, so the long-quiet promotion is not what fires below.
   h.speech.notify(sessionStart);
   h.advance(QUIET_THROTTLE_MS);
+  // Read, edit, read, edit over the same file: a class change every time, so
+  // each one is a `busy` trigger, and the fifth completes the repeat-file tally.
   for (let i = 0; i < 6; i += 1) {
     h.advance(1000);
-    h.speech.notify({ ...read, toolName: i % 2 === 0 ? 'Read' : 'Grep' });
+    h.speech.notify({ ...pass, toolName: i % 2 === 0 ? 'Read' : 'Edit' });
   }
 
   const notable = ledger.entries.filter((e) => e.kind === 'notable');
@@ -1026,16 +1027,18 @@ test('a repeated failure she stays quiet about is not written down either', () =
 test('a line she had no room for is still remembered', () => {
   const ledger = fakeLedger();
   const h = harness({ ledger });
-  // Two sessions hit the same wall two seconds apart. One bubble — the 6s
-  // same-kind floor — but two failures happened, and the digest is the only
-  // place the second one can still reach him.
-  const first = h.speech.notify({ ...failure, sessionId: 'a' });
+  // Two sessions stop for approval two seconds apart. One bubble — the 6s
+  // same-kind floor, which exists so seven sessions hitting one wall is one
+  // piece of news — but two approvals are genuinely waiting on him, and the
+  // digest is the only place the second can still reach him.
+  const first = h.speech.notify({ ...permission, sessionId: 'a' });
   h.advance(2000);
-  const second = h.speech.notify({ ...failure, sessionId: 'b', errorish: true });
+  const second = h.speech.notify({ ...permission, sessionId: 'b' });
 
   assert.equal(first.spoken, true);
   assert.equal(second.reason, 'throttled', 'the bubble refused it');
-  assert.deepEqual(ledger.kinds(), ['failed', 'failed'], 'the record did not');
+  assert.deepEqual(ledger.kinds(), ['waiting', 'waiting'], 'the record did not');
+  assert.deepEqual(ledger.entries.map((e) => e.sessionId), ['a', 'b']);
 });
 
 test('muted is a quiet evening in the record as well as on screen', () => {

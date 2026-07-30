@@ -445,8 +445,16 @@ async function composeRuntime() {
   const ledgerMod = await tryImport('./ledger.mjs');
   if (ledgerMod?.createLedger) {
     // Resolved here rather than at module scope: `getPath` is only dependable
-    // once the app is ready, and composeRuntime runs inside whenReady().
-    ledger = ledgerMod.createLedger({ filePath: path.join(app.getPath('userData'), LEDGER_FILE), fs });
+    // once the app is ready, and composeRuntime runs inside whenReady(). Its
+    // own failure is contained, because everything below this line — the
+    // server, speech, wander — is worth more than her diary.
+    let ledgerPath = null;
+    try {
+      ledgerPath = path.join(app.getPath('userData'), LEDGER_FILE);
+    } catch (err) {
+      console.warn(`[ganyu] ledger: no userData path (${err?.message}) — she will not remember`);
+    }
+    ledger = ledgerMod.createLedger({ filePath: ledgerPath, fs });
     console.log(`[ganyu] ledger: ${ledger.enabled ? ledger.path : 'disabled'}`);
   }
 
