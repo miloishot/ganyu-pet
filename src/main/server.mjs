@@ -6,6 +6,12 @@ import { createState } from './state.mjs';
 
 export const DEFAULT_PORT = 47821;
 export const DEFAULT_HOST = '127.0.0.1';
+// contracts.md says "sweep every 30s", but the sweep is also what re-emits when a
+// *time-based* flag expires with no new event to trigger it — and `celebrate`
+// only lives 10s. A 30s cadence would leave the pet mid-celebration for up to
+// 20s after it should have stopped. 1s pruning is a superset: same TTL, timely
+// flag expiry, and `emitChange` dedupes so an unchanged snapshot emits nothing.
+const SWEEP_MS = 1000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const RING_SIZE = 50;
 const RAW_CAPTURE_LIMIT = 4096;
@@ -173,7 +179,7 @@ export function createHookServer({
   port = DEFAULT_PORT,
   host = DEFAULT_HOST,
   log = console,
-  sweepMs = 1000,
+  sweepMs = SWEEP_MS,
   ringSize = RING_SIZE,
   maxBodyBytes = MAX_BODY_BYTES,
 } = {}) {
@@ -323,6 +329,14 @@ export function createHookServer({
   server.on('clientError', (_err, socket) => {
     if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
   });
+  // A socket error *after* a successful bind must never become an unhandled
+  // 'error' event — inside Electron that takes down the main process, and the
+  // pet dies over a dropped connection. Bind failures are still owned by the
+  // one-shot listener in start(), which is why this one no-ops until bound.
+  server.on('error', (err) => {
+    if (boundPort === null) return;
+    log?.error?.(`ganyu-server: socket error: ${err?.code ?? ''} ${err?.message ?? err}`);
+  });
 
   function start() {
     return new Promise((resolve, reject) => {
@@ -371,7 +385,7 @@ export function createHookServer({
     });
   }
 
-  return {
+  const api = {
     start,
     stop,
     state,
@@ -383,8 +397,27 @@ export function createHookServer({
     get url() {
       return `http://${host}:${boundPort ?? port}`;
     },
+    get listening() {
+      return server.listening;
+    },
     debugEvents: () => ring.slice(),
+    // Module A registers `server.on('error', onServerError)` on whatever this
+    // factory returns. Forward listener registration to the underlying
+    // http.Server so that handler actually lands instead of being dropped.
+    on(...args) {
+      server.on(...args);
+      return api;
+    },
+    once(...args) {
+      server.once(...args);
+      return api;
+    },
+    off(...args) {
+      server.off(...args);
+      return api;
+    },
   };
+  return api;
 }
 
 export { createHookServer as createServer };

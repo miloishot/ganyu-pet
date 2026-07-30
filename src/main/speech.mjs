@@ -22,6 +22,31 @@ export const INTERRUPT_KINDS = new Set(['waiting', 'failed']);
 /** argv for the CLI, per contracts.md §Speech. */
 export const claudeArgs = (prompt) => ['-p', prompt, '--model', 'haiku'];
 
+/**
+ * Environment overrides for the CLI child. Without them `claude -p` re-runs this
+ * machine's whole configuration for every one-line quip — SessionStart /
+ * UserPromptSubmit hooks (which shell out to git), CLAUDE.md, skills, plugin
+ * sync — and answers with extended thinking, which blows the 15s budget
+ * contracts.md fixes and makes every line a canned fallback.
+ *
+ * Measured on this machine (claude 2.1.220, `--model haiku`, stdin closed, the
+ * real built prompt), wall clock to a returned line:
+ *   nothing set ................................. 43.2s (verifier saw 34/46/57s)
+ *   MAX_THINKING_TOKENS=0 only .................. 26.1s, 25.3s
+ *   all three below ............................. 4.2s, 3.9s, 4.6s (3/3 real lines)
+ *
+ * Safe mode also stops the pet from firing the user's hooks as a side effect of
+ * chatting, and keeps CLAUDE.md's output style out of Ganyu's voice. Auth is
+ * unaffected (it is not `--bare`), which matters: this machine has no API key.
+ */
+export const CLI_ENV = Object.freeze({
+  CLAUDE_CODE_SAFE_MODE: '1',
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  MAX_THINKING_TOKENS: '0',
+});
+
+export const cliEnv = (env = process.env) => ({ ...env, ...CLI_ENV });
+
 const BUSY_EVENTS = new Set([
   'PreToolUse',
   'PostToolUse',
@@ -82,6 +107,17 @@ export function hasErrorMarker(payload) {
   return false;
 }
 
+/** A tool name may arrive as a string or as an object ({name} / {tool_name}). */
+export function toolNameOf(value) {
+  if (value == null) return null;
+  if (typeof value === 'object') {
+    const nested = value.name ?? value.tool_name ?? value.toolName ?? null;
+    return typeof nested === 'string' && nested !== '' ? nested : null;
+  }
+  const s = String(value);
+  return s === '' ? null : s;
+}
+
 /** Last path segment, tolerant of both Windows and POSIX separators. */
 export function projectName(p) {
   if (!p) return null;
@@ -134,8 +170,8 @@ function defaultSchedule(fn, ms) {
  * onLine   — called with {text, kind, mode, source, fallback}; `text` matches the ganyu:speak payload.
  * isMuted  — () => bool. Muted means no exec calls at all.
  *
- * Optional (defaults are production-safe): user, random, schedule, bin, args, timeoutMs,
- * cooldownMs, interruptFloorMs, onError.
+ * Optional (defaults are production-safe): user, random, schedule, bin, args, env,
+ * timeoutMs, cooldownMs, interruptFloorMs, onError.
  */
 export function createSpeech({
   exec = execFile,
@@ -147,6 +183,7 @@ export function createSpeech({
   schedule = defaultSchedule,
   bin = resolveClaudeBin(),
   args = claudeArgs,
+  env = cliEnv(),
   timeoutMs = EXEC_TIMEOUT_MS,
   cooldownMs = COOLDOWN_MS,
   interruptFloorMs = INTERRUPT_FLOOR_MS,
@@ -177,11 +214,17 @@ export function createSpeech({
     const event = input.event ?? p.hook_event_name ?? p.event ?? p.type ?? null;
     const sessionId =
       input.sessionId ?? p.session_id ?? p.thread_id ?? p.sessionId ?? `${source}-unknown`;
-    const toolName = input.toolName ?? p.tool_name ?? p.toolName ?? p.tool?.name ?? null;
+    // `tool` and `failed` are module B's spellings (state.mjs normalizeEvent) and
+    // module A forwards B's normalized event verbatim, with no `payload`. Reading
+    // only `toolName`/`errorish` left toolName null in production, so the busy
+    // trigger could never fire and {summary} never carried a tool name.
+    const toolName = toolNameOf(input.toolName ?? input.tool ?? p.tool_name ?? p.toolName ?? p.tool);
     const project =
       input.project ?? projectName(input.cwd ?? p.cwd ?? p.project_dir ?? p.workspace ?? null);
-    const errorish = input.errorish ?? hasErrorMarker(p);
-    const mode = input.mode ?? modeForEvent(event, errorish);
+    const errorish = Boolean(input.errorish ?? input.failed ?? hasErrorMarker(p));
+    // An errorish event is `failed` whatever its event name says: a PostToolUse
+    // carrying an error arrives with mode 'busy', which would otherwise shadow it.
+    const mode = errorish ? 'failed' : (input.mode ?? modeForEvent(event, errorish));
     return { source, event, sessionId, toolName, project, errorish, mode };
   }
 
@@ -284,6 +327,7 @@ export function createSpeech({
       windowsHide: true,
       encoding: 'utf8',
       maxBuffer: 1024 * 1024,
+      env, // see CLI_ENV: the 15s budget is unreachable without it
     };
 
     lastSpokeAt = t; // reserve the slot up front: one CLI call in flight, cooldown starts now
@@ -301,7 +345,15 @@ export function createSpeech({
     };
 
     try {
-      exec(bin, argv, options, done);
+      const child = exec(bin, argv, options, done);
+      // `claude -p` reads stdin for extra context and waits ~3s before giving up
+      // ("Warning: no stdin data received in 3s"). execFile leaves the child's
+      // stdin pipe open, so that 3s would be spent on every call. Closing it is
+      // worth ~3s of the ~4s total; it is NOT sufficient on its own — an earlier
+      // note here claimed 13.1s with the pipe closed and that did not reproduce
+      // (34-57s). CLI_ENV is what brings the call inside the 15s budget.
+      // Test doubles return undefined here.
+      child?.stdin?.end?.();
     } catch (err) {
       done(err, '');
     }

@@ -1,0 +1,16 @@
+{
+  "name": "ganyu-pet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop pet overlay: Ganyu reacts to codex + Claude Code lifecycle hooks, chats via Haiku, and wanders when idle.",
+  "type": "module",
+  "main": "src/main/index.mjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "electron": "^43.2.0"
+  }
+}

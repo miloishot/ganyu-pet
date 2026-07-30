@@ -315,6 +315,25 @@ test('server binds 127.0.0.1 only', async (t) => {
   assert.equal(addr.address, '127.0.0.1');
 });
 
+test('handle forwards listeners and survives a post-listen socket error', async (t) => {
+  const logged = [];
+  const { hooks } = await startServer(t, { log: { error: (m) => logged.push(String(m)) } });
+  assert.equal(hooks.listening, true);
+
+  const seen = [];
+  assert.equal(hooks.on('error', (err) => seen.push(err.code)), hooks, 'on() is chainable');
+
+  // Module A does `server.on('error', ...)` on this handle. An 'error' event with
+  // no listener would take down the Electron main process, so both A's handler
+  // and our own must see it and neither may throw.
+  hooks.server.emit('error', Object.assign(new Error('reset by peer'), { code: 'ECONNRESET' }));
+  assert.deepEqual(seen, ['ECONNRESET'], "module A's handler received it");
+  assert.match(logged.join('\n'), /socket error.*ECONNRESET/);
+
+  // still serving
+  assert.equal(await (await fetch(`${hooks.url}/healthz`)).text(), 'ok');
+});
+
 // ---------------------------------------------------------------------------
 // pure helpers
 // ---------------------------------------------------------------------------

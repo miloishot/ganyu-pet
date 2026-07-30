@@ -61,6 +61,9 @@ body {
   pointer-events: none;
   flex: 0 0 auto;
   align-self: center;
+  /* border-box matters: with the default content-box, max-width 232 + padding
+     + border measured 254px wide inside the 256px window and clipped. */
+  box-sizing: border-box;
   max-width: 232px;
   margin: 0 8px 6px;
   padding: 7px 10px;

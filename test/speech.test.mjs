@@ -6,16 +6,21 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  CLI_ENV,
   COOLDOWN_MS,
   INTERRUPT_FLOOR_MS,
   claudeArgs,
+  cliEnv,
   cleanLine,
   createSpeech,
   hasErrorMarker,
   modeForEvent,
   projectName,
   toolClass,
+  toolNameOf,
 } from '../src/main/speech.mjs';
+import { createState } from '../src/main/state.mjs';
+import { toSpeechDetail } from '../src/main/window.mjs';
 import {
   FALLBACK_LINES,
   MAX_LINE_CHARS,
@@ -26,18 +31,24 @@ import {
   sourceLabel,
 } from '../src/main/persona.mjs';
 
-/** Test harness: manual clock, manual timers, scripted exec. */
+/**
+ * Test harness: manual clock, manual timers, scripted exec.
+ * `opts.defer` makes exec hold its callback (production execFile is async) so a
+ * test can settle it explicitly with `settle()`.
+ */
 function harness(opts = {}) {
   const calls = [];
   const lines = [];
   const timers = [];
+  const deferred = [];
   let t = 1_000_000; // arbitrary non-zero epoch
   let reply = { err: null, stdout: 'A line from Haiku.' };
 
   const speech = createSpeech({
     exec: (file, args, options, cb) => {
       calls.push({ file, args, options });
-      cb(reply.err, reply.stdout, reply.stderr ?? '');
+      if (opts.defer) deferred.push(cb);
+      else cb(reply.err, reply.stdout, reply.stderr ?? '');
     },
     clock: { now: () => t },
     onLine: (line) => lines.push(line),
@@ -66,6 +77,12 @@ function harness(opts = {}) {
     },
     setReply(next) {
       reply = next;
+    },
+    /** Settle the oldest deferred exec call (only with `defer: true`). */
+    settle(err = null, stdout = 'A line from Haiku.') {
+      const cb = deferred.shift();
+      assert.ok(cb, 'no deferred exec call to settle');
+      cb(err, stdout, '');
     },
     /** Fire every live timer whose deadline has passed (order preserved). */
     runTimers() {
@@ -144,6 +161,13 @@ test('exec is called with the claude CLI argv, 15s timeout and the built prompt'
   assert.deepEqual(args, claudeArgs(args[1]));
   assert.equal(options.timeout, 15_000);
   assert.equal(options.windowsHide, true);
+  // Without these the CLI spends 25-57s replaying this machine's whole config
+  // (hooks, CLAUDE.md, plugin sync) plus extended thinking, so every line would
+  // be a timeout fallback. Measured 4.2/3.9/4.6s with them.
+  assert.equal(options.env.CLAUDE_CODE_SAFE_MODE, '1');
+  assert.equal(options.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1');
+  assert.equal(options.env.MAX_THINKING_TOKENS, '0');
+  assert.deepEqual(cliEnv({ PATH: 'x' }), { PATH: 'x', ...CLI_ENV });
   assert.equal(h.lines[0].text, 'A line from Haiku.');
   assert.equal(h.lines[0].fallback, false);
 });
@@ -284,6 +308,61 @@ test('a queued trigger that is still inside its cooldown re-arms instead of spea
   assert.equal(h.calls.length, 1);
   assert.equal(h.speech.stats().pendingKind, 'celebrate');
   assert.equal(h.speech.stats().wakeArmed, true);
+});
+
+// The production exec (child_process.execFile) settles asynchronously, so the
+// cooldown has to hold across the callback boundary, not just within one tick.
+
+test('async exec: a trigger raised in flight is queued, then speaks after the 45s cooldown', () => {
+  const h = harness({ defer: true });
+  h.speech.notify(sessionStart);
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.speech.stats().inFlight, true);
+
+  const queued = h.speech.notify(stop);
+  assert.equal(queued.dispatched, false);
+  assert.equal(h.speech.stats().pendingKind, 'celebrate');
+
+  h.advance(2000); // the CLI took 2s
+  h.settle(null, 'Reporting in.');
+  assert.equal(h.lines.length, 1);
+  assert.equal(h.calls.length, 1, 'the queued line must still wait out the cooldown');
+  assert.equal(h.speech.stats().wakeArmed, true);
+
+  h.advance(COOLDOWN_MS - 2000);
+  h.runTimers();
+  assert.equal(h.calls.length, 2);
+  h.settle(null, 'All finished.');
+  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'celebrate']);
+  assert.equal(h.speech.stats().pendingKind, null);
+});
+
+test('async exec: a waiting trigger queued in flight speaks as soon as the 15s floor is met', () => {
+  const h = harness({ defer: true });
+  h.speech.notify(sessionStart);
+  h.advance(INTERRUPT_FLOOR_MS);
+  assert.equal(h.speech.notify(permission).reason, 'in-flight');
+
+  h.settle(null, 'Reporting in.');
+  assert.equal(h.calls.length, 2, 'the floor is already met, so the queue flushes immediately');
+  h.settle(null, 'Awaiting your word.');
+  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'waiting']);
+});
+
+test('muting while a trigger is pending drops it with no exec call', () => {
+  let muted = false;
+  const h = harness({ muted: () => muted });
+  h.speech.notify(sessionStart);
+  h.advance(1000);
+  h.speech.notify(stop);
+  assert.equal(h.speech.stats().pendingKind, 'celebrate');
+
+  muted = true;
+  h.advance(COOLDOWN_MS);
+  h.runTimers();
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.lines.length, 1);
+  assert.equal(h.speech.stats().pendingKind, null);
 });
 
 test('dispose cancels the pending trigger and its timer', () => {
@@ -455,4 +534,76 @@ test('projectName takes the last segment of either path style', () => {
   assert.equal(projectName('C:\\Users\\kw11l\\Desktop\\ganyu-pet'), 'ganyu-pet');
   assert.equal(projectName('/home/x/ganyu-pet/'), 'ganyu-pet');
   assert.equal(projectName(''), null);
+});
+
+test('toolNameOf accepts the string and object spellings', () => {
+  assert.equal(toolNameOf('Bash'), 'Bash');
+  assert.equal(toolNameOf({ name: 'Bash' }), 'Bash');
+  assert.equal(toolNameOf({ tool_name: 'Bash' }), 'Bash');
+  assert.equal(toolNameOf(null), null);
+  assert.equal(toolNameOf(''), null);
+});
+
+// ------------------------------------------------- cross-module integration (B -> A -> D)
+//
+// The trigger-rule tests above hand-feed `toolName`/`mode`/`errorish`. Module B
+// emits `tool`/`failed` instead and module A forwards its normalized event with
+// no `payload`, so those tests can all pass while the wired app speaks only 3 of
+// the 5 contract-mandated triggers. This drives the real seam: raw hook payload
+// -> state.ingest -> state.onEvent -> toSpeechDetail -> speech.onEvent.
+
+test('all five chatty triggers fire through the real B -> A -> D seam', () => {
+  const h = harness();
+  const state = createState({ clock: { now: () => h.now() } });
+  state.onEvent((event, aggregate) => h.speech.onEvent(toSpeechDetail(event, aggregate), aggregate));
+
+  const cwd = 'C:\\Users\\kw11l\\Desktop\\ganyu-pet';
+  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'SessionStart' });
+
+  h.advance(COOLDOWN_MS);
+  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'PreToolUse', tool_name: 'Edit' });
+  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'PreToolUse', tool_name: 'Bash' });
+
+  h.advance(INTERRUPT_FLOOR_MS);
+  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'Notification', tool_name: 'Bash' });
+
+  h.advance(INTERRUPT_FLOOR_MS);
+  state.ingest('claude', {
+    session_id: 's1', cwd, hook_event_name: 'PostToolUse', tool_name: 'Bash',
+    tool_response: 'Error: exit code 1',
+  });
+
+  h.advance(COOLDOWN_MS);
+  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'Stop' });
+
+  assert.deepEqual(
+    h.lines.map((l) => l.kind),
+    ['greeting', 'busy', 'waiting', 'failed', 'celebrate'],
+  );
+  assert.equal(h.calls.length, 5);
+});
+
+test('the tool name reaches {summary} through the real seam', () => {
+  const h = harness();
+  const state = createState({ clock: { now: () => h.now() } });
+  state.onEvent((event, aggregate) => h.speech.onEvent(toSpeechDetail(event, aggregate), aggregate));
+
+  const cwd = 'C:\\Users\\kw11l\\Desktop\\ganyu-pet';
+  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'Notification', tool_name: 'Bash' });
+
+  // contracts.md §Speech gives this summary verbatim.
+  assert.equal(
+    h.calls[0].args[1],
+    buildPrompt({ user: 'Isaac', summary: 'Claude Code is waiting for permission to run Bash' }),
+  );
+
+  h.advance(INTERRUPT_FLOOR_MS);
+  state.ingest('claude', {
+    session_id: 's1', cwd, hook_event_name: 'PostToolUse', tool_name: 'Bash',
+    tool_response: 'Error: exit code 1',
+  });
+  assert.equal(
+    h.calls[1].args[1],
+    buildPrompt({ user: 'Isaac', summary: 'Claude Code hit an error running Bash in ganyu-pet' }),
+  );
 });

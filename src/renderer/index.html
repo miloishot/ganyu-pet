@@ -6,6 +6,20 @@
         content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file: data:; connect-src 'none';" />
   <title>Ganyu</title>
   <link rel="stylesheet" href="./styles.css" />
+  <!-- INTEGRATION NOTE (module C -> module A): Chromium refuses EXTERNAL module
+       scripts on a file:// page — the module fetch is CORS-checked and a file://
+       origin is opaque. Verified in Chrome 2026-07-30: an external classic script
+       and an inline module both run from file://, `<script type="module" src>`
+       does not. Since main uses win.loadFile(), one of these is required or this
+       renderer never boots (the window stays blank and `npm run smoke` still
+       passes, because SMOKE_OK is printed by main, not here):
+         a) app.commandLine.appendSwitch('allow-file-access-from-files')
+            before app.whenReady() — one line, verified to fix it; or
+         b) serve the renderer from a registered privileged scheme
+            (protocol.handle + loadURL('app://ganyu/index.html')) and add that
+            scheme to the CSP above.
+       Do not "fix" this by bundling or by inlining pet.mjs: contracts.md fixes
+       src/renderer/pet.mjs + bubbles.mjs as separate ESM files. -->
 </head>
 <body>
   <div id="stage">

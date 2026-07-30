@@ -10,11 +10,14 @@ import { fileURLToPath } from 'node:url';
 
 import {
   CHANNELS,
+  HOVER_POLL_MS,
+  createHoverWatch,
   createPetWindow,
   registerIpc,
   resolveSpritePath,
   smokeFlags,
   spriteFileUrl,
+  toSpeechDetail,
   toStatePayload,
 } from './window.mjs';
 
@@ -40,6 +43,8 @@ let state = null;
 let server = null;
 let walk = null;
 let statePoll = null;
+let hoverPoll = null;
+let hoverWatch = null;
 let disposeIpc = null;
 let lastPushed = '';
 
@@ -157,7 +162,14 @@ function pushState(force = false) {
 
 function sendSpeak(line) {
   const text = typeof line === 'string' ? line : line?.text;
-  if (typeof text === 'string' && text.trim()) send(CHANNELS.speak, { text: text.trim() });
+  if (typeof text === 'string' && text.trim()) {
+    // The only externally observable proof that a POST /event reached the speech
+    // trigger path rather than stopping at the state aggregator.
+    if (process.env.GANYU_DEBUG === '1') {
+      console.log(`[ganyu][speak] ${text.trim()}${line?.fallback ? ' (fallback)' : ''}`);
+    }
+    send(CHANNELS.speak, { text: text.trim() });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -177,21 +189,42 @@ function pickMethod(target, names) {
 
 function requireMethod(label, target, names) {
   const found = pickMethod(target, names);
-  if (!found) console.warn(`[ganyu] ${label}: no method among [${names.join(', ')}] — events will not reach it`);
+  if (found && process.env.GANYU_DEBUG === '1') console.log(`[ganyu][wiring] ${label} -> .${found.name}()`);
+  if (!found) {
+    console.warn(
+      `[ganyu][wiring] ${label}: none of [${names.join(', ')}] found on the returned object — ` +
+        `it will receive no events. Add the real name to this list in src/main/index.mjs.`,
+    );
+  }
   return found;
 }
 
 let speechSink = null;
 let wanderSink = null;
 let wanderStop = null;
+let speechTapped = false;
 
-function notifySpeech(source, payload) {
-  if (!speechSink) return;
-  const aggregate = currentAggregate();
-  const event = payload?.hook_event_name ?? payload?.event ?? payload?.type ?? null;
+/** Only for the fallback tap, where no normalized event is available. */
+function payloadHints(payload) {
+  return {
+    event: payload?.hook_event_name ?? payload?.event ?? payload?.type ?? null,
+    sessionId: payload?.session_id ?? payload?.thread_id ?? payload?.sessionId ?? null,
+    tool: payload?.tool_name ?? payload?.tool ?? null,
+  };
+}
+
+/**
+ * `event` is module B's normalized event ({source, event, mode, tool, ...}).
+ * `toSpeechDetail` (window.mjs) builds the detail so the unit test can exercise
+ * this exact seam rather than a copy of it.
+ */
+function notifySpeech(event, aggregate) {
+  if (!speechSink || !event) return;
+  const agg = aggregate ?? currentAggregate();
+  const detail = toSpeechDetail(event, agg);
   try {
-    if (speechSink.name === 'ingest') speechSink.call(source, payload);
-    else speechSink.call({ source, payload, event, mode: aggregate?.mode ?? 'idle', aggregate }, aggregate);
+    if (speechSink.name === 'ingest') speechSink.call(event.source ?? null, detail);
+    else speechSink.call(detail, agg);
   } catch (err) {
     console.warn('[ganyu] speech notify failed:', err?.message);
   }
@@ -246,17 +279,28 @@ async function composeRuntime() {
     return;
   }
 
-  // Speech needs event-level detail (tool-class change during busy), which the
-  // aggregate does not carry. Wrapping ingest is the one seam that sees every
-  // normalized event regardless of how module B routes internally. Installed
-  // before the server is constructed so it captures the wrapped reference.
-  if (typeof state.ingest === 'function') {
+  // Speech needs per-event detail (tool-class change during busy), which the
+  // aggregate does not carry. Module B's `onEvent(cb)` is the clean seam: it
+  // yields (normalizedEvent, aggregate). If a build of B ever lacks it, fall
+  // back to wrapping `ingest` — degrade, never abort (no server = deaf pet).
+  if (typeof state.onEvent === 'function') {
+    state.onEvent((event, aggregate) => notifySpeech(event, aggregate));
+    speechTapped = true;
+  } else if (typeof state.ingest === 'function') {
     const rawIngest = state.ingest.bind(state);
-    state.ingest = (source, payload) => {
-      const result = rawIngest(source, payload);
-      notifySpeech(source, payload);
-      return result;
-    };
+    try {
+      state.ingest = (source, payload) => {
+        const result = rawIngest(source, payload);
+        notifySpeech({ source, ...payloadHints(payload) }, currentAggregate());
+        return result;
+      };
+      speechTapped = state.ingest !== rawIngest;
+    } catch (err) {
+      console.warn(`[ganyu][wiring] could not tap state.ingest (${err?.message})`);
+    }
+    if (!speechTapped) {
+      console.warn('[ganyu][wiring] no state.onEvent and state.ingest is not writable — speech falls back to mode changes only');
+    }
   }
 
   const speechMod = await tryImport('./speech.mjs');
@@ -265,7 +309,9 @@ async function composeRuntime() {
       exec: makeExec(),
       clock,
       onLine: sendSpeak,
-      isMuted: () => flags.muted,
+      // Smoke has a 20s budget and the claude CLI a 15s timeout — never let a
+      // stray line spawn a subprocess during the check.
+      isMuted: () => flags.muted || SMOKE,
     });
     speechSink = requireMethod('speech', speech, ['onEvent', 'handleEvent', 'notify', 'trigger', 'onState', 'ingest', 'speak']);
   }
@@ -279,7 +325,9 @@ async function composeRuntime() {
       getWorkArea: () => screen.getPrimaryDisplay().workArea,
       onWalkState: (next) => {
         walk = next;
-        if (typeof state?.setWandering === 'function') state.setWandering(Boolean(next));
+        // Pass the walk object, not a boolean: state.setWandering(true) coerces to
+        // {dir:'right'}, so GET /state reported the wrong direction while walking left.
+        if (typeof state?.setWandering === 'function') state.setWandering(next ?? null);
         pushState();
       },
       isPinned: () => flags.pinned,
@@ -290,9 +338,12 @@ async function composeRuntime() {
   }
 
   if (typeof state.onChange === 'function') {
-    state.onChange(() => {
+    state.onChange((aggregate, event) => {
       pushState();
       notifyWander();
+      // Only when neither seam above worked: a mode transition is less
+      // information than an event, but better than a silent pet.
+      if (!speechTapped) notifySpeech(event ?? { source: null, event: null, mode: aggregate?.mode }, aggregate);
     });
   }
 
@@ -306,7 +357,8 @@ async function composeRuntime() {
         state,
         port,
         host: '127.0.0.1',
-        logger: console,
+        // Module B's option is `log`, not `logger` — `logger` was silently ignored.
+        log: console,
         ingest: (source, payload) => state.ingest(source, payload),
         onEvent: (source, payload) => state.ingest(source, payload),
         getWandering: () => walk !== null,
@@ -378,7 +430,32 @@ async function main() {
     console.error('[ganyu] failed to load renderer:', err?.message);
   });
 
-  disposeIpc = registerIpc({ ipcMain, getWindow: () => win, getFlags, onMenuAction: handleMenuAction });
+  // Hover interactivity: forwarded mouse-move does not reach this window on
+  // Electron 43 / Win11, so main polls the real cursor (see createHoverWatch).
+  // Without it the pet never becomes interactive and the right-click
+  // Mute/Pin/Quit menu — the only user controls — is unreachable.
+  hoverWatch = createHoverWatch({
+    getBounds: () => (win && !win.isDestroyed() ? win.getBounds() : null),
+    getCursorPoint: () => {
+      try {
+        return screen.getCursorScreenPoint();
+      } catch {
+        return null;
+      }
+    },
+    apply: (interactive) => {
+      if (win && !win.isDestroyed()) win.setIgnoreMouseEvents(!interactive, { forward: true });
+    },
+  });
+  hoverPoll = setInterval(() => hoverWatch.poll(), HOVER_POLL_MS);
+
+  disposeIpc = registerIpc({
+    ipcMain,
+    getWindow: () => win,
+    getFlags,
+    onMenuAction: handleMenuAction,
+    onInteractive: (interactive) => hoverWatch.setRendererWants(interactive),
+  });
 
   try {
     await composeRuntime();
@@ -399,6 +476,8 @@ async function main() {
 function cleanup() {
   if (statePoll) clearInterval(statePoll);
   statePoll = null;
+  if (hoverPoll) clearInterval(hoverPoll);
+  hoverPoll = null;
   if (disposeIpc) disposeIpc();
   disposeIpc = null;
   if (wanderStop) {
@@ -430,5 +509,10 @@ if (!gotLock) {
   });
   app.on('window-all-closed', () => app.quit());
   app.on('will-quit', cleanup);
-  app.whenReady().then(main);
+  app.whenReady().then(main).catch((err) => {
+    // Without this, a throw in main() is an unhandled rejection and `npm run
+    // smoke` reports a 20s timeout instead of the actual cause.
+    console.error('[ganyu] fatal during startup:', err?.stack ?? err?.message ?? err);
+    app.exit(1);
+  });
 }

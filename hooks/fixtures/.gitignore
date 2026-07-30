@@ -1,0 +1,5 @@
+# Scratch copies the install-hooks suite makes here (criterion 8: nothing is
+# written outside the repo). Normally removed by t.after(); ignored so a crashed
+# run cannot leak them into a commit.
+.work-*/
+*.bak-ganyu-*

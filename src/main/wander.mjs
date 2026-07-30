@@ -273,6 +273,19 @@ export function createWander({
       }
     },
 
+    // Reversible cancel: drop the in-flight stroll and any pending timer, then
+    // re-arm the 90s countdown if the aggregate mode is still idle. This is the
+    // right call for a transient "stop moving now" (module A invokes it when the
+    // user pins the pet) — unlike stop(), the pet strolls again once the reason
+    // goes away. Deliberately named `cancel` because module A resolves its
+    // handle with pickMethod(wander, ['cancel', 'stop', ...]) and would
+    // otherwise reach for the irreversible stop() on every pin toggle.
+    cancel() {
+      if (stopped) return;
+      cancelAll();
+      if (mode === 'idle') armTimer = schedule(onArmTimer, D.idleArmMs);
+    },
+
     // Teardown (app quit). Irreversible.
     stop() {
       stopped = true;

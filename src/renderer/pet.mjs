@@ -13,6 +13,8 @@ export const FRAME_W = 192;
 export const FRAME_H = 208;
 export const FRAMES_PER_ROW = 8;
 export const ROW_COUNT = 9;
+export const SHEET_W = FRAME_W * FRAMES_PER_ROW; // 1536
+export const SHEET_H = FRAME_H * ROW_COUNT; // 1872
 
 export const ROW = {
   IDLE: 0,
@@ -220,6 +222,13 @@ export function createInteractivity({ setInteractive }) {
       menuOpen = Boolean(v);
       return sync();
     },
+    /** Pointer left the window entirely — drop every hover latch at once. */
+    releaseAll() {
+      overPet = false;
+      overMenu = false;
+      menuOpen = false;
+      return sync();
+    },
     sync,
     get interactive() {
       return current === true;
@@ -277,16 +286,28 @@ export async function boot({
   const menuEl = doc.getElementById('menu');
   if (!canvas || !bubbleEl || !menuEl) return null;
 
-  const flags = (await ganyu.getFlags()) || {};
-  let muted = Boolean(flags.muted);
-  let pinned = Boolean(flags.pinned);
-
   const bubbles = createBubbles({ el: bubbleEl });
   const animator = createAnimator({ now });
   const interactivity = createInteractivity({
     setInteractive: (v) => ganyu.setInteractive(v),
   });
   interactivity.sync(); // establish the known-false baseline
+
+  // ---- state + speech feeds ------------------------------------------------
+  // Subscribed BEFORE any await: module A force-pushes ganyu:state on
+  // did-finish-load and then only pushes on change, so a listener registered
+  // after `await getFlags()` can miss the only push it will ever get.
+
+  ganyu.onState((state) => {
+    animator.setState(state || {}, now());
+  });
+  ganyu.onSpeak((payload) => {
+    bubbles.show(payload && payload.text);
+  });
+
+  const flags = (await ganyu.getFlags()) || {};
+  let muted = Boolean(flags.muted);
+  let pinned = Boolean(flags.pinned);
 
   // ---- menu ----------------------------------------------------------------
 
@@ -303,6 +324,10 @@ export async function boot({
   function closeMenu() {
     if (menuEl.hidden) return;
     menuEl.hidden = true;
+    // Clearing overMenu too: a menu hidden from under the pointer does not
+    // reliably emit mouseleave, and a stuck latch would leave the overlay
+    // permanently interactive (i.e. blocking the desktop underneath).
+    interactivity.setOverMenu(false);
     interactivity.setMenuOpen(false);
   }
 
@@ -316,10 +341,14 @@ export async function boot({
       /* keep the mirrored values */
     }
     paintMenu();
+    // Measure while invisible so the first paint is already at the final spot.
+    menuEl.style.visibility = 'hidden';
+    menuEl.style.left = '0px';
+    menuEl.style.top = '0px';
     menuEl.hidden = false;
     interactivity.setMenuOpen(true);
     const rect = menuEl.getBoundingClientRect();
-    const view = doc.documentElement;
+    const view = doc.documentElement || { clientWidth: 256, clientHeight: 320 };
     const { x, y } = clampMenu({
       x: clientX,
       y: clientY,
@@ -330,6 +359,7 @@ export async function boot({
     });
     menuEl.style.left = `${x}px`;
     menuEl.style.top = `${y}px`;
+    menuEl.style.visibility = '';
   }
 
   paintMenu();
@@ -338,6 +368,7 @@ export async function boot({
 
   const off = [];
   function on(target, type, handler, opts) {
+    if (!target || typeof target.addEventListener !== 'function') return;
     target.addEventListener(type, handler, opts);
     off.push(() => target.removeEventListener(type, handler, opts));
   }
@@ -347,12 +378,22 @@ export async function boot({
   on(menuEl, 'mouseenter', () => interactivity.setOverMenu(true));
   on(menuEl, 'mouseleave', () => interactivity.setOverMenu(false));
 
+  // Watchdog: pointer left the page. Without this, a fast exit that swallows
+  // the canvas mouseleave would leave the window interactive forever.
+  const root = doc.documentElement;
+  on(root, 'mouseleave', () => {
+    if (!menuEl.hidden) return; // keep an open menu usable
+    interactivity.releaseAll();
+  });
+
   on(canvas, 'contextmenu', (ev) => {
-    ev.preventDefault();
+    if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
     if (menuEl.hidden) openMenuAt(ev.clientX, ev.clientY);
     else closeMenu();
   });
-  on(menuEl, 'contextmenu', (ev) => ev.preventDefault());
+  on(menuEl, 'contextmenu', (ev) => {
+    if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+  });
 
   on(menuEl, 'click', (ev) => {
     const btn = ev.target && ev.target.closest ? ev.target.closest('[data-action]') : null;
@@ -367,13 +408,13 @@ export async function boot({
 
   on(doc, 'mousedown', (ev) => {
     if (menuEl.hidden) return;
-    if (menuEl.contains(ev.target)) return;
+    if (menuEl.contains && menuEl.contains(ev.target)) return;
     closeMenu();
   });
   on(doc, 'keydown', (ev) => {
     if (ev.key === 'Escape') closeMenu();
   });
-  if (win) on(win, 'blur', () => closeMenu());
+  on(win, 'blur', () => closeMenu());
 
   // ---- sprite --------------------------------------------------------------
 
@@ -396,15 +437,6 @@ export async function boot({
     console.error('[ganyu] no spritePath in flags');
   }
 
-  // ---- state + speech feeds ------------------------------------------------
-
-  ganyu.onState((state) => {
-    animator.setState(state || {}, now());
-  });
-  ganyu.onSpeak((payload) => {
-    bubbles.show(payload && payload.text);
-  });
-
   // ---- frame loop ----------------------------------------------------------
 
   let handle = null;
@@ -421,6 +453,7 @@ export async function boot({
     bubbles,
     interactivity,
     renderer,
+    flags: { get muted() { return muted; }, get pinned() { return pinned; }, spritePath },
     dispose() {
       running = false;
       if (handle !== null && cancelRaf) cancelRaf(handle);
@@ -428,6 +461,7 @@ export async function boot({
       for (const undo of off.splice(0)) undo();
       bubbles.hide();
       closeMenu();
+      interactivity.releaseAll();
     },
   };
 }

@@ -310,6 +310,64 @@ test('stop() cancels every timer and clears the walk state', () => {
   assert.equal(h.moves.length, 10);
 });
 
+test('cancel() stops the current stroll and re-arms the 90s countdown', () => {
+  const h = harness({ randoms: [0, 0.9, 0.5] });
+  h.wander.setMode('idle');
+  h.advance(90_000);
+  h.advance(500); // 10 ticks
+  assert.equal(h.moves.length, 10);
+
+  h.wander.cancel();
+  assert.deepEqual(h.dirs(), ['left', null], 'walk state cleared');
+  assert.equal(h.wander.isWandering(), false);
+
+  const frozen = h.moves.at(-1);
+  h.advance(89_999);
+  assert.equal(h.moves.length, 10, 'no movement during the fresh countdown');
+  assert.deepEqual(h.moves.at(-1), frozen, 'window left where it stopped');
+
+  h.advance(1 + WANDER_DEFAULTS.tickMs);
+  assert.equal(h.moves.length, 11, 're-armed: strolls again 90s after cancel');
+});
+
+test('cancel() while not idle does not re-arm', () => {
+  const h = harness({ randoms: [0, 0.9, 0.5] });
+  h.wander.setMode('busy');
+  h.wander.cancel();
+  h.advance(30 * 60_000);
+  assert.equal(h.moves.length, 0);
+  assert.equal(h.wander.isArmed(), false);
+});
+
+// Reproduces module A's toggle-pin handler: it calls the wander cancel handle
+// and flips the pinned flag. Wandering must survive an unpin.
+test('module A pin-toggle sequence: cancel() + pin, then unpin resumes', () => {
+  const h = harness({ randoms: [0, 0.9, 0.5] });
+  h.wander.setMode('idle');
+  h.advance(90_000);
+  h.advance(500);
+  assert.equal(h.moves.length, 10);
+
+  h.pin(true);
+  h.wander.cancel();
+  h.advance(30 * 60_000);
+  assert.equal(h.moves.length, 10, 'pinned: frozen, no strolls');
+
+  h.pin(false);
+  h.advance(WANDER_DEFAULTS.gapMaxMs + WANDER_DEFAULTS.tickMs);
+  assert.ok(h.moves.length > 10, 'unpinned without any state change: strolls again');
+});
+
+test('stop() stays irreversible even after cancel()', () => {
+  const h = harness({ randoms: [0, 0.9, 0.5] });
+  h.wander.setMode('idle');
+  h.wander.stop();
+  h.wander.cancel();
+  assert.equal(h.pending(), 0, 'cancel() must not resurrect a stopped scheduler');
+  h.advance(60 * 60_000);
+  assert.equal(h.moves.length, 0);
+});
+
 test('createWander rejects missing side-effect injections', () => {
   assert.throws(() => createWander(), TypeError);
   assert.throws(() => createWander({ clock: { now: () => 0 }, schedule: () => {} }), TypeError);
