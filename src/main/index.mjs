@@ -27,6 +27,8 @@ import {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PRELOAD = path.join(HERE, 'preload.cjs');
 const RENDERER = path.join(HERE, '..', 'renderer', 'index.html');
+/** Optional, git-ignored, and read only here: the brain's endpoint + key. */
+const ENV_FILE = path.join(HERE, '..', '..', '.env.local');
 
 const SMOKE = process.env.GANYU_SMOKE === '1';
 const SMOKE_DELAY_MS = 5000;
@@ -381,6 +383,21 @@ async function composeRuntime() {
     }
   }
 
+  // The brain is optional in every sense: no .env.local, no key, or an endpoint
+  // that turns us away all mean the same thing — the canned MESSAGES table does
+  // the talking, exactly as it did before. Nothing here logs a config value.
+  let brain = null;
+  const brainMod = await tryImport('./brain.mjs');
+  if (brainMod?.loadBrainConfig && brainMod?.createBrain) {
+    const brainConfig = brainMod.loadBrainConfig({ envPath: ENV_FILE });
+    if (brainConfig.enabled) {
+      brain = brainMod.createBrain({ config: brainConfig, log: console });
+      console.log(`[ganyu] brain: enabled (model ${brainConfig.model})`);
+    } else {
+      console.log(`[ganyu] brain: disabled (${brainConfig.reason}) — canned lines only`);
+    }
+  }
+
   const speechMod = await tryImport('./speech.mjs');
   if (speechMod?.createSpeech) {
     const speech = speechMod.createSpeech({
@@ -388,6 +405,7 @@ async function composeRuntime() {
       onLine: sendSpeak,
       // Smoke is a startup check: keep stray bubbles out of the stdout it parses.
       isMuted: () => flags.muted || SMOKE,
+      brain,
     });
     speechSink = requireMethod('speech', speech, ['onEvent', 'handleEvent', 'notify', 'trigger', 'onState', 'ingest', 'speak']);
   }

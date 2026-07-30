@@ -106,6 +106,44 @@ export const MESSAGES = Object.freeze({
   ]),
 });
 
+// ---------------------------------------------------------------------------
+// Brain prompt (module D optional — src/main/brain.mjs)
+//
+// Lives here, next to MESSAGES, so persona.mjs stays the single home of her
+// voice: the canned table and the generated line have to sound like the same
+// person, and they only will if they are written side by side.
+// ---------------------------------------------------------------------------
+
+/** The owner's preferred name. Bare, always — never a title, see BRAIN_INSTRUCTIONS. */
+export const OWNER_NAME = 'Kahweng';
+
+/** System / `instructions` text. Contains no event data — only the voice. */
+export const BRAIN_INSTRUCTIONS = [
+  `You are Ganyu from Genshin Impact, working as ${OWNER_NAME}'s secretary.`,
+  'You are gentle, diligent and a little formal, and you genuinely care about the person you assist.',
+  `Address him as ${OWNER_NAME}, plainly — never with a title or honorific of any kind.`,
+  'He is coding, and you comment on what his coding agent just did.',
+  'Reply with exactly one short line, under 120 characters, in English, in your own voice.',
+  'No quotation marks around the line. At most one emoji, and only where it feels natural.',
+].join(' ');
+
+/**
+ * The `input` / user text: what just happened, plus the same facts the canned
+ * table fills its slots from, so the model never has to guess a tool or project
+ * name. `ev` is the speech event ({kind, tool|toolName, project, mode, source,
+ * event}); `summary` is buildSummary's phrase, passed in when the caller already
+ * has it.
+ */
+export function buildBrainInput(ev = {}, summary = null) {
+  const tool = ev.tool ?? ev.toolName ?? null;
+  const phrase = summary || buildSummary({ ...ev, toolName: tool });
+  const facts = [];
+  if (ev.kind) facts.push(`event: ${ev.kind}`);
+  if (tool) facts.push(`tool: ${tool}`);
+  if (ev.project) facts.push(`project: ${ev.project}`);
+  return facts.length ? `Just happened: ${phrase}. (${facts.join(', ')})` : `Just happened: ${phrase}.`;
+}
+
 const SLOTS = ['tool', 'project'];
 
 const slotToken = (slot) => `{${slot}}`;
@@ -118,7 +156,7 @@ function fill(template, values) {
 }
 
 /** One displayable line of at most `max` characters. */
-function clampLine(text, max = MAX_LINE_CHARS) {
+export function clampLine(text, max = MAX_LINE_CHARS) {
   const s = String(text ?? '').replace(/\s+/g, ' ').trim();
   if (s.length <= max) return s;
   const cut = s.slice(0, max - 1);

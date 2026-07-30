@@ -1,8 +1,10 @@
-// Module D tests — the bubble is a deterministic status indicator now, so these
+// Module D tests — the bubble is a deterministic status indicator, so these
 // cover: trigger rules, the 6s throttle (with waiting/failed bypassing it),
 // throttled busy lines being DROPPED rather than queued, mute, slot
 // substitution including the unknown-tool / unknown-project variants, and the
-// MESSAGES house rules. No exec, no timers, no CLI: notify() is synchronous.
+// MESSAGES house rules. With no brain injected notify() is synchronous and none
+// of that changes; the last section adds the optional brain (see brain.test.mjs
+// for the client itself) with an injected fake, never a network call.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -36,6 +38,7 @@ function harness(opts = {}) {
     onLine: (line) => lines.push(line),
     isMuted: () => Boolean(opts.muted && opts.muted()),
     random: opts.random ?? (() => 0),
+    brain: opts.brain ?? null,
   });
 
   return {
@@ -404,6 +407,152 @@ test('all five triggers fire through the real B -> A -> D seam', () => {
     "Error in Bash. I've noted it.",
     'Finished in ganyu-pet.',
   ]);
+});
+
+// ------------------------------------------------- optional brain (module D)
+//
+// The brain only ever improves on the canned line: it must not delay an urgent
+// bubble, must not speak through a mute, and must not land a line about an event
+// the bubble has already moved on from.
+
+/**
+ * Stand-in for brain.mjs: every request hangs until the test releases it, and it
+ * enforces the same single-flight rule the real client does.
+ */
+function fakeBrain() {
+  const calls = [];
+  let pending = null;
+  return {
+    calls,
+    requestLine(args) {
+      calls.push(args);
+      if (pending) return Promise.resolve(null); // one in flight at a time
+      return new Promise((resolve) => {
+        pending = resolve;
+      });
+    },
+    reply(line) {
+      const resolve = pending;
+      pending = null;
+      resolve(line);
+    },
+  };
+}
+
+test('an urgent kind shows the canned line at once, then the brain line replaces it', async () => {
+  const brain = fakeBrain();
+  const h = harness({ brain });
+
+  const res = h.speech.notify(permission);
+  assert.equal(res.spoken, true, 'no waiting on the network for a permission prompt');
+  assert.equal(h.lines.length, 1);
+  assert.equal(h.lines[0].text, 'Bash needs your approval.');
+
+  assert.equal(brain.calls.length, 1);
+  assert.deepEqual(brain.calls[0].detail, {
+    kind: 'waiting',
+    event: 'Notification',
+    tool: 'Bash',
+    project: null,
+    mode: 'waiting',
+    source: 'claude',
+  });
+  assert.equal(brain.calls[0].summary, 'Claude Code is waiting for permission to run Bash');
+
+  brain.reply('Kahweng, Bash is waiting on your word.');
+  const settled = await res.pending;
+  assert.equal(settled.spoken, true);
+  assert.equal(h.lines.length, 2, 'a second line replaces the bubble');
+  assert.equal(h.lines[1].text, 'Kahweng, Bash is waiting on your word.');
+  assert.equal(h.lines[1].kind, 'waiting');
+  assert.equal(h.lines[1].summary, h.lines[0].summary);
+});
+
+test('an urgent kind keeps its canned line when the brain returns nothing', async () => {
+  const brain = fakeBrain();
+  const h = harness({ brain });
+  const res = h.speech.notify(failure);
+
+  brain.reply(null);
+  const settled = await res.pending;
+  assert.equal(settled.spoken, false);
+  assert.equal(settled.reason, 'brain-empty');
+  assert.deepEqual(h.lines.map((l) => l.text), ["Error in Bash. I've noted it."]);
+});
+
+test('a non-urgent kind waits for the brain, and falls back to canned on null', async () => {
+  const brain = fakeBrain();
+  const h = harness({ brain });
+
+  const greeting = h.speech.notify(sessionStart);
+  assert.equal(greeting.spoken, false);
+  assert.equal(greeting.reason, 'brain-pending');
+  assert.equal(h.lines.length, 0, 'nothing is shown until the brain answers');
+
+  brain.reply('A new session in ganyu-pet, Kahweng. I have the notes ready.');
+  assert.equal((await greeting.pending).spoken, true);
+  assert.deepEqual(h.lines.map((l) => l.text), [
+    'A new session in ganyu-pet, Kahweng. I have the notes ready.',
+  ]);
+
+  h.advance(THROTTLE_MS);
+  const done = h.speech.notify(stop);
+  brain.reply(null);
+  const settled = await done.pending;
+  assert.equal(settled.spoken, true);
+  assert.equal(settled.text, 'Finished in ganyu-pet.', 'the canned line stands in');
+  assert.equal(h.lines.length, 2);
+});
+
+test('muting between the request and the reply drops the brain line', async () => {
+  let muted = false;
+  const brain = fakeBrain();
+  const h = harness({ brain, muted: () => muted });
+
+  const res = h.speech.notify(permission);
+  assert.equal(h.lines.length, 1, 'the canned line was already out');
+
+  muted = true;
+  brain.reply('Kahweng, a permission is pending.');
+  const settled = await res.pending;
+  assert.equal(settled.spoken, false);
+  assert.equal(settled.reason, 'muted');
+  assert.equal(h.lines.length, 1, 'the brain line is gated exactly like a canned one');
+
+  // And while muted the brain is not asked at all — no tokens, no request.
+  assert.equal(h.speech.notify(stop).reason, 'muted');
+  assert.equal(brain.calls.length, 1);
+});
+
+test('a brain reply whose bubble was taken by a newer line is dropped', async () => {
+  const brain = fakeBrain();
+  const h = harness({ brain });
+
+  const done = h.speech.notify(stop); // non-urgent: in flight, nothing shown yet
+  assert.equal(h.lines.length, 0);
+
+  h.speech.notify(permission); // an interrupt takes the bubble meanwhile
+  assert.equal(h.lines.length, 1);
+  assert.equal(h.lines[0].kind, 'waiting');
+
+  brain.reply('All finished in ganyu-pet, Kahweng.');
+  const settled = await done.pending;
+  assert.equal(settled.spoken, false);
+  assert.equal(settled.reason, 'stale');
+  assert.equal(h.lines.length, 1, 'a line about the previous event never lands');
+  // The throttle is measured from what was actually shown, not from the dropped reply.
+  assert.equal(h.speech.stats().lastSpokeAt, h.now());
+});
+
+test('a throttled event never reaches the brain', () => {
+  const brain = fakeBrain();
+  const h = harness({ brain });
+  h.speech.notify(permission); // urgent: shown, and asks the brain
+  assert.equal(brain.calls.length, 1);
+
+  h.advance(THROTTLE_MS - 1);
+  assert.equal(h.speech.notify(stop).reason, 'throttled');
+  assert.equal(brain.calls.length, 1, 'no request for a line that could not be shown');
 });
 
 test('free-text "error" in a tool response no longer makes her kneel (regression)', () => {

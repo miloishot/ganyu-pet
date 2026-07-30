@@ -31,7 +31,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 | A electron-main | builder-A | `src/main/index.mjs`, `src/main/window.mjs`, `src/main/preload.cjs` |
 | B server+state | builder-B | `src/main/server.mjs`, `src/main/state.mjs`, `test/state.test.mjs`, `test/server.test.mjs` |
 | C renderer | builder-C | `src/renderer/index.html`, `src/renderer/pet.mjs`, `src/renderer/bubbles.mjs`, `src/renderer/styles.css` |
-| D speech | builder-D | `src/main/speech.mjs`, `src/main/persona.mjs`, `test/speech.test.mjs` |
+| D speech | builder-D | `src/main/speech.mjs`, `src/main/persona.mjs`, `src/main/brain.mjs`, `test/speech.test.mjs`, `test/brain.test.mjs` |
 | E wander | builder-E | `src/main/wander.mjs`, `test/wander.test.mjs` |
 | F hooks | builder-F | `hooks/ganyu-hook.cmd`, `hooks/install-hooks.mjs`, `test/install-hooks.test.mjs`, `hooks/fixtures/*` |
 | integrator | integrator | `package.json`, `scripts/smoke.mjs`, plus minimal cross-module wiring fixes |
@@ -121,6 +121,20 @@ Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteract
   Default `{user}` is **Kahweng** (owner's preferred name — no honorific, never "Mr."; `GANYU_USER` env overrides).
   `{summary}` = compact human phrase built from the normalized event (`"codex finished a task in ganyu-pet"`, `"Claude Code is waiting for permission to run Bash"`).
 - On exec error/timeout/empty output → canned fallback per mode (≥6 lines per mode table in `persona.mjs`), same cooldown rules. Muted → no exec calls at all.
+
+### Brain (optional LLM speech — module D)
+
+`src/main/brain.mjs`: `createBrain({config, fetchImpl, now, log, timeoutMs})` → `{requestLine({detail, summary}), isEnabled(), stats()}`. Module A loads the config, constructs it when enabled, and hands it to `createSpeech({…, brain})`. **Optional in every sense** — with no config, or a config that stops working, the deterministic MESSAGES path above behaves exactly as it does today, synchronously. Global `fetch` only; no dependencies.
+
+- **Config** — `<repo>/.env.local` (git-ignored; read here and nowhere else), parsed as plain `KEY=VALUE` with blank lines and `#` comments skipped. Keys: `GANYU_OPENAI_BASE_URL`, `GANYU_OPENAI_MODEL`, `GANYU_OPENAI_API_KEY`. A missing file or any missing/empty key → `{enabled:false, reason}`, and the brain is never constructed.
+- **Secrets** — config **values are never logged and never appear in an error message**. Startup prints only `brain: enabled (model <name>)` or `brain: disabled (<missing key names>)`; a failed request is reported by error *name* (`AbortError`, `TypeError`), because a fetch error's message carries the endpoint URL.
+- **Route fallback** — `POST {base}/v1/responses` with `{model, instructions, input, max_output_tokens, store:false}`; on **404/405 only**, retry `POST {base}/v1/chat/completions` with `{model, messages:[system,user], max_tokens}`. Both routes exist on the owner's endpoint (probed live: each answers 401 unauthenticated), and its codex config sets `wire_api = "responses"`, so that one is tried first. The route that answers 2xx is remembered for the process lifetime and tried first from then on. Parsing: `output_text`, else walk `output[]` → `type:'message'` → `content[]` → `type:'output_text'` → `.text`; chat completions → `choices[0].message.content`.
+- **Failure semantics** — `requestLine` resolves to a line or `null` and **never rejects**. 10s `AbortController` timeout → null. Network error, non-2xx, unparseable body, blank text → null. **401/403 disables the brain for the process lifetime** — one log line (`brain: endpoint rejected the key — falling back to canned lines`), and no further requests are made at all.
+- **Single-flight** — at most one request in flight; a second event resolves null immediately instead of queueing, since a queued line would describe work the owner has already watched finish.
+- **Post-processing** — newlines collapsed to spaces, hard cap **140 chars** truncated at a word boundary with `…` (`persona.clampLine`, the same clamp the canned lines use). The prompt asks for under 120; the cap is the backstop.
+- **Prompt** — lives in `persona.mjs` next to MESSAGES (`OWNER_NAME`, `BRAIN_INSTRUCTIONS`, `buildBrainInput`), so both voices are written side by side. The instructions carry the voice only (gentle, diligent, slightly formal secretary; address him as **Kahweng**, never a title or honorific; one short line, at most one emoji). The input carries `Just happened: <buildSummary phrase>. (event: <kind>, tool: …, project: …)`.
+- **Show rules** (speech.mjs) — urgent kinds (`waiting`, `failed`) show the canned line **immediately, at the old latency**, and a brain line replaces the bubble only if one arrives; non-urgent kinds wait for the reply and show the canned line when it is null. Both sources emit through one `show()` gate, so **mute and the 6s throttle apply identically to generated lines**, and a reply is dropped if a newer line took the bubble while it was in flight. `notify()` keeps its signature and returns synchronously; when a request was fired the descriptor carries `pending`, a promise of the descriptor for whatever is eventually shown.
+- **Privacy** — only event metadata leaves the machine: event kind, tool name, project name. No file contents, no prompt text, no transcript. `store:false` honours the owner's `disable_response_storage` setting.
 
 ### Wander (module E)
 

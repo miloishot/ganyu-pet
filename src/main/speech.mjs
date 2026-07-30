@@ -1,9 +1,14 @@
 // Module D — speech: decides when Ganyu says something and turns the hook event
-// into a deterministic status line from the persona MESSAGES table.
+// into a status line.
 //
-// There is no LLM here any more. The bubble is a status indicator: it has to
-// appear the instant the event lands and read the same way every time, which a
-// ~4s CLI round-trip (and its canned-fallback path) could not do.
+// Two sources, one gate. The deterministic MESSAGES table in persona.mjs is the
+// baseline and is always available: the bubble is a status indicator, so for
+// `waiting` / `failed` it has to appear the instant the event lands, which no
+// network round-trip can promise. An optional brain (brain.mjs) writes a better
+// line for the same event; when it arrives in time it replaces the canned one,
+// and when it doesn't — unconfigured, slow, failing — nothing about the old
+// behaviour changes. Both sources emit through `show()`, so mute and the
+// throttle gate them identically.
 // No Electron import; every side effect is injectable.
 
 import { buildSummary, messageFor } from './persona.mjs';
@@ -68,25 +73,31 @@ export function projectName(p) {
 }
 
 /**
- * createSpeech({clock, onLine, isMuted, random})
+ * createSpeech({clock, onLine, isMuted, random, brain})
  *
  * clock    — {now()} or a () => ms function.
  * onLine   — called synchronously with {text, kind, mode, source, summary};
  *            `text` matches the ganyu:speak payload.
  * isMuted  — () => bool. Muted means no line at all.
  * random   — injectable for deterministic variant choice in tests.
+ * brain    — optional {requestLine({detail, summary})} -> Promise<string|null>.
+ *            Absent (the default) is the original synchronous behaviour, exactly.
  */
 export function createSpeech({
   clock = { now: () => Date.now() },
   onLine = () => {},
   isMuted = () => false,
   random = Math.random,
+  brain = null,
 } = {}) {
   const now = () => (typeof clock === 'function' ? clock() : clock.now());
   const muted = () => (typeof isMuted === 'function' ? Boolean(isMuted()) : Boolean(isMuted));
 
+  const askBrain = typeof brain?.requestLine === 'function' ? brain : null;
+
   let lastSpokeAt = null;
   let lastMode = null;
+  let shownCount = 0; // bumped on every emitted line; a brain reply for an older one is stale
   const toolClasses = new Map(); // sessionId -> last tool class
   const lastLines = new Map(); // kind -> last line used, so variants alternate
 
@@ -154,8 +165,70 @@ export function createSpeech({
   }
 
   /**
+   * The single gate every line passes through, canned or generated. Mute and the
+   * throttle are checked here rather than at the trigger, because a brain reply
+   * is shown some seconds after its event: by then the owner may have muted her,
+   * or a newer line may already own the bubble.
+   */
+  function show(kind, text, ev, summary, fromTable = true) {
+    if (!text) return { spoken: false, reason: 'no-line', kind, summary };
+    if (muted()) return { spoken: false, reason: 'muted', kind, summary };
+
+    const t = now();
+    const wait = waitFor(kind, t);
+    if (wait > 0) {
+      // Dropped, not queued: a status line is only useful while it is still
+      // true, and a queued one would narrate work that ended six seconds ago.
+      return { spoken: false, reason: 'throttled', kind, retryInMs: wait, summary };
+    }
+
+    // Only table lines feed the anti-repeat memory — a generated line is never
+    // one of the variants, so remembering it would just disable `avoid`.
+    if (fromTable) lastLines.set(kind, text);
+    lastSpokeAt = t;
+    shownCount += 1;
+    emit({ text, kind, mode: ev.mode ?? null, source: ev.source, summary });
+    return { spoken: true, reason: 'spoken', kind, text, summary };
+  }
+
+  /** What the brain is told about the event. Metadata only — see brain.mjs. */
+  function brainDetail(ev, kind) {
+    return {
+      kind,
+      event: ev.event,
+      tool: ev.toolName,
+      project: ev.project,
+      mode: ev.mode ?? null,
+      source: ev.source,
+    };
+  }
+
+  /**
+   * Ask the brain, then show its line — or, for a non-urgent kind that got
+   * nothing back, the canned line it was standing in for. `seq` is the emitted-
+   * line count at the moment the request was fired: if it has moved, another
+   * event has taken the bubble since and this reply is about old news.
+   */
+  async function awaitBrain({ kind, ev, summary, canned, seq, urgent }) {
+    let line = null;
+    try {
+      line = await askBrain.requestLine({ detail: brainDetail(ev, kind), summary });
+    } catch {
+      line = null; // requestLine promises never to reject; belt and braces
+    }
+    if (shownCount !== seq) return { spoken: false, reason: 'stale', kind, summary };
+    if (line) return show(kind, line, ev, summary, false);
+    // Urgent kinds already showed their canned line; do not repeat it.
+    if (urgent) return { spoken: false, reason: 'brain-empty', kind, summary };
+    return show(kind, canned, ev, summary);
+  }
+
+  /**
    * Feed one normalized-or-raw event. Returns a descriptor:
-   * {spoken, reason: 'no-trigger'|'muted'|'throttled'|'spoken', kind, ...}
+   * {spoken, reason: 'no-trigger'|'muted'|'throttled'|'spoken'|'brain-pending', kind, ...}
+   *
+   * With a brain configured the descriptor also carries `pending`, a promise of
+   * the descriptor for whatever the brain path ends up showing.
    */
   function notify(input = {}) {
     const ev = normalizeEvent(input);
@@ -163,27 +236,29 @@ export function createSpeech({
     if (!kind) return { spoken: false, reason: 'no-trigger', kind: null };
     if (muted()) return { spoken: false, reason: 'muted', kind };
 
-    const t = now();
-    const wait = waitFor(kind, t);
-    if (wait > 0) {
-      // Dropped, not queued: a status line is only useful while it is still
-      // true, and a queued one would narrate work that ended six seconds ago.
-      return { spoken: false, reason: 'throttled', kind, retryInMs: wait };
-    }
+    const wait = waitFor(kind, now());
+    if (wait > 0) return { spoken: false, reason: 'throttled', kind, retryInMs: wait };
 
     const summary = buildSummary(ev);
-    const text = messageFor(kind, {
+    const canned = messageFor(kind, {
       tool: ev.toolName,
       project: ev.project,
       random,
       avoid: lastLines.get(kind) ?? null,
     });
-    if (!text) return { spoken: false, reason: 'no-line', kind, summary };
 
-    lastLines.set(kind, text);
-    lastSpokeAt = t;
-    emit({ text, kind, mode: ev.mode ?? null, source: ev.source, summary });
-    return { spoken: true, reason: 'spoken', kind, text, summary };
+    if (!askBrain) return show(kind, canned, ev, summary);
+
+    // `waiting` and `failed` are the whole point of the pet: they show at once,
+    // at the old latency, and a better line only replaces them if one arrives.
+    // Everything else can afford to wait for the brain before showing anything,
+    // which avoids a visible flip from canned to generated on every event.
+    const urgent = INTERRUPT_KINDS.has(kind);
+    const first = urgent ? show(kind, canned, ev, summary) : null;
+    const pending = awaitBrain({ kind, ev, summary, canned, seq: shownCount, urgent });
+    return urgent
+      ? { ...first, pending }
+      : { spoken: false, reason: 'brain-pending', kind, summary, pending };
   }
 
   return {
