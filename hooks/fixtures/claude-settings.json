@@ -1,0 +1,216 @@
+{
+  "env": {
+    "EXAMPLE_FLAG": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)",
+      "Bash(npm test:*)"
+    ],
+    "ask": [
+      "Bash(rm -rf:*)"
+    ],
+    "deny": []
+  },
+  "model": "opus",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/session-status.sh",
+            "shell": "bash",
+            "timeout": 15,
+            "statusMessage": "Loading working state"
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/lifecycle/scan.js --hook SessionStart",
+            "timeout": 20,
+            "statusMessage": "Checking for finished workspaces"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/capture-task.js",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/prompt-context.sh",
+            "shell": "bash",
+            "timeout": 25
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/session-note-guard.sh",
+            "shell": "bash",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/improve/sensors/capture-dispatch.js",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/gate-agent-model.js",
+            "timeout": 10,
+            "statusMessage": "Checking subagent model isn't Fable"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/gate-self-edit.js",
+            "timeout": 10,
+            "statusMessage": "Checking edit is outside the improver blast radius"
+          },
+          {
+            "type": "agent",
+            "prompt": "Verify that a file edit is on-task. $ARGUMENTS is a PreToolUse payload. Report PASSED when the edit serves the user's current instruction.",
+            "timeout": 45,
+            "model": "claude-haiku-4-5-20251001",
+            "statusMessage": "Checking edit is in scope"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.claude/hooks/merge-cleanup.js",
+            "timeout": 20,
+            "statusMessage": "Checking for post-merge cleanup"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -f 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd' ]; then 'C:/Users/kw11l/.orca/agent-hooks/claude-hook.cmd'; else cat >/dev/null 2>&1 || :; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bash ~/.claude/statusline.sh"
+  },
+  "effortLevel": "xhigh"
+}

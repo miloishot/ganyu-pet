@@ -1,0 +1,10 @@
+{
+  "model": "opus",
+  "permissions": {
+    "allow": [
+      "Bash(git status:*)"
+    ],
+    "deny": []
+  },
+  "effortLevel": "high"
+}

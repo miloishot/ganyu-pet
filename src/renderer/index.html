@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file: data:; connect-src 'none';" />
+  <title>Ganyu</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div id="stage">
+    <div id="bubble" role="status" aria-live="polite" hidden></div>
+    <canvas id="pet" width="192" height="208" aria-label="Ganyu"></canvas>
+    <div id="menu" role="menu" hidden>
+      <button type="button" id="menu-mute" role="menuitem" data-action="toggle-mute">Mute</button>
+      <button type="button" id="menu-pin" role="menuitem" data-action="toggle-pin">Pin</button>
+      <button type="button" id="menu-quit" role="menuitem" data-action="quit">Quit</button>
+    </div>
+  </div>
+  <script type="module" src="./pet.mjs"></script>
+</body>
+</html>

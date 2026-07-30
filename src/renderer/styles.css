@@ -1,0 +1,158 @@
+/* Module C — renderer overlay styles.
+   The window is frameless + transparent, so every surface here is opaque only
+   where we deliberately paint. #stage is pointer-events:none: only the sprite
+   and the menu are hoverable, which is what keeps the transparent corners
+   click-through even while the window is interactive. */
+
+:root {
+  --ganyu-ink: #eef4ff;
+  --ganyu-panel: rgba(26, 32, 54, 0.9);
+  --ganyu-edge: rgba(150, 190, 255, 0.42);
+  --ganyu-accent: rgba(126, 176, 255, 0.22);
+  --ganyu-shadow: 0 6px 18px rgba(6, 10, 24, 0.45);
+  --ganyu-font: "Segoe UI", system-ui, -apple-system, sans-serif;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  cursor: default;
+  -webkit-user-select: none;
+  user-select: none;
+  font-family: var(--ganyu-font);
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  pointer-events: none;
+}
+
+/* ---- sprite ---- */
+
+#pet {
+  display: block;
+  width: 192px;
+  height: 208px;
+  image-rendering: pixelated;
+  pointer-events: auto;
+  flex: 0 0 auto;
+}
+
+#pet[data-broken] {
+  /* spritesheet failed to load — leave a faint outline so the window is findable */
+  outline: 1px dashed var(--ganyu-edge);
+  outline-offset: -8px;
+}
+
+/* ---- speech bubble ---- */
+
+#bubble {
+  position: relative;
+  pointer-events: none;
+  flex: 0 0 auto;
+  align-self: center;
+  max-width: 232px;
+  margin: 0 8px 6px;
+  padding: 7px 10px;
+  border-radius: 12px;
+  background: var(--ganyu-panel);
+  border: 1px solid var(--ganyu-edge);
+  box-shadow: var(--ganyu-shadow);
+  color: var(--ganyu-ink);
+  font-size: 12px;
+  line-height: 1.35;
+  text-align: center;
+  overflow-wrap: break-word;
+  opacity: 0;
+  transform: translateY(4px);
+  transition: opacity 320ms ease, transform 320ms ease;
+}
+
+#bubble[hidden] {
+  display: none;
+}
+
+#bubble.is-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+#bubble::after {
+  content: "";
+  position: absolute;
+  bottom: -5px;
+  left: 50%;
+  margin-left: -4px;
+  width: 8px;
+  height: 8px;
+  background: var(--ganyu-panel);
+  border-right: 1px solid var(--ganyu-edge);
+  border-bottom: 1px solid var(--ganyu-edge);
+  transform: rotate(45deg);
+}
+
+/* ---- context menu ---- */
+
+#menu {
+  position: absolute;
+  z-index: 10;
+  min-width: 104px;
+  padding: 4px;
+  border-radius: 9px;
+  background: var(--ganyu-panel);
+  border: 1px solid var(--ganyu-edge);
+  box-shadow: var(--ganyu-shadow);
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+#menu[hidden] {
+  display: none;
+}
+
+#menu button {
+  appearance: none;
+  border: 0;
+  margin: 0;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ganyu-ink);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+#menu button:hover,
+#menu button:focus-visible {
+  background: var(--ganyu-accent);
+  outline: none;
+}
+
+#menu button[data-action="quit"] {
+  color: #ffc9c9;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #bubble {
+    transition-duration: 1ms;
+    transform: none;
+  }
+
+  #bubble.is-visible {
+    transform: none;
+  }
+}
