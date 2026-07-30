@@ -1,9 +1,19 @@
-// Module E — idle wander scheduler.
+// Module E — wander scheduler.
 //
 // Every side effect is injected, so this file imports nothing: no Electron, no
 // timers of its own, no Date. That is what lets `test/wander.test.mjs` drive it
 // with a fake clock and a virtual scheduler and still exercise the real
-// constants (90s arming, 2-5min gaps, 60px/s, 50ms ticks, 3-8s pauses).
+// constants (20s arming, 45-120s gaps, 60px/s, 50ms ticks, 3-8s pauses).
+//
+// Why `busy` is a *calm* mode rather than a reason to stand still: the owner
+// always has codex or Claude Code sessions open, so the lifecycle-hook stream
+// keeps the aggregate mode pinned at `busy` for hours on end and `idle` never
+// arrives. Gating the stroll on `idle` alone therefore meant she never strolled
+// at all — she just looped the non-directional busy run on the spot. She now
+// walks through `idle` and `busy` alike (CALM_MODES); only the attention modes
+// (`waiting`, `failed`) freeze her where she stands, which is the whole point of
+// those modes — she should be beside whatever needs looking at, not halfway
+// across the screen.
 //
 // Production wiring (module A):
 //   createWander({
@@ -18,9 +28,9 @@
 // then, on every aggregate state change: wander.setMode(state.aggregate())
 
 export const WANDER_DEFAULTS = Object.freeze({
-  idleArmMs: 90_000, // aggregate mode must stay `idle` this long before we stroll
-  gapMinMs: 120_000, // 2 min
-  gapMaxMs: 300_000, // 5 min
+  armMs: 20_000, // aggregate mode must stay calm this long before the first stroll
+  gapMinMs: 45_000,
+  gapMaxMs: 120_000,
   speedPxPerSec: 60,
   tickMs: 50,
   pauseChance: 0.35, // odds of one mid-walk breather per stroll
@@ -30,6 +40,11 @@ export const WANDER_DEFAULTS = Object.freeze({
   windowWidth: 256, // contracts.md "Window (module A)" — ~256x320
   windowHeight: 320,
 });
+
+// The modes she is content to stroll through. `busy` is in here deliberately —
+// see the header. Anything outside this list (`waiting`, `failed`, and any mode
+// a future module B invents) aborts a stroll instantly and keeps her put.
+export const CALM_MODES = Object.freeze(['idle', 'busy']);
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const num = (v, fallback) => (Number.isFinite(v) ? v : fallback);
@@ -48,6 +63,12 @@ function readMode(value) {
   if (typeof value === 'string') return value;
   if (value && typeof value.mode === 'string') return value.mode;
   return 'unknown';
+}
+
+// Accepts a mode string or a whole module B state object, so callers can hand it
+// the same value they hand setMode(). An unset mode (null) is not calm.
+export function isCalm(value) {
+  return CALM_MODES.includes(readMode(value));
 }
 
 export function createWander({
@@ -81,7 +102,7 @@ export function createWander({
   let mode = null; // last aggregate mode we were told about
   let stopped = false;
 
-  let armTimer = null; // the 90s idle countdown, or the 2-5min gap between strolls
+  let armTimer = null; // the 20s calm countdown, or the 45-120s gap between strolls
   let tickTimer = null;
   let pauseTimer = null;
 
@@ -156,7 +177,7 @@ export function createWander({
 
   function onArmTimer() {
     armTimer = null;
-    if (stopped || mode !== 'idle') return;
+    if (stopped || !isCalm(mode)) return;
     // Pinned never strolls; keep polling so unpinning resumes without needing
     // another state change.
     if (isPinned()) {
@@ -192,7 +213,7 @@ export function createWander({
   function tick() {
     tickTimer = null;
     if (stopped) return;
-    if (mode !== 'idle') {
+    if (!isCalm(mode)) {
       abortStroll();
       return;
     }
@@ -232,7 +253,7 @@ export function createWander({
   function resume() {
     pauseTimer = null;
     if (stopped) return;
-    if (mode !== 'idle') {
+    if (!isCalm(mode)) {
       abortStroll();
       return;
     }
@@ -257,24 +278,28 @@ export function createWander({
 
   return {
     // Call on every aggregate state change. Accepts a mode string or the whole
-    // state object from module B (`{mode, ...}`). Repeated `idle` notifications
-    // are ignored, so a busy event stream that keeps the aggregate at `idle`
-    // never restarts the 90s countdown.
+    // state object from module B (`{mode, ...}`). Repeated identical modes are
+    // ignored, and so is every hop between two calm modes — idle<->busy churns
+    // constantly as sessions start and stop, and treating that as a state change
+    // would abort her stroll every few seconds. So a calm->calm transition
+    // leaves an in-flight stroll walking and leaves the countdown running;
+    // only arriving in a calm mode from a non-calm one arms it.
     setMode(next) {
       if (stopped) return;
       const m = readMode(next);
       if (m === mode) return;
+      const wasCalm = isCalm(mode);
       mode = m;
-      if (m === 'idle') {
-        cancelHandle(armTimer);
-        armTimer = schedule(onArmTimer, D.idleArmMs);
-      } else {
+      if (!isCalm(m)) {
         cancelAll(); // instant cancel: window stays where it is, walk state cleared
+      } else if (!wasCalm) {
+        cancelHandle(armTimer);
+        armTimer = schedule(onArmTimer, D.armMs);
       }
     },
 
     // Reversible cancel: drop the in-flight stroll and any pending timer, then
-    // re-arm the 90s countdown if the aggregate mode is still idle. This is the
+    // re-arm the countdown if the aggregate mode is still calm. This is the
     // right call for a transient "stop moving now" (module A invokes it when the
     // user pins the pet) — unlike stop(), the pet strolls again once the reason
     // goes away. Deliberately named `cancel` because module A resolves its
@@ -283,7 +308,7 @@ export function createWander({
     cancel() {
       if (stopped) return;
       cancelAll();
-      if (mode === 'idle') armTimer = schedule(onArmTimer, D.idleArmMs);
+      if (isCalm(mode)) armTimer = schedule(onArmTimer, D.armMs);
     },
 
     // Teardown (app quit). Irreversible.

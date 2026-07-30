@@ -54,7 +54,8 @@ export function fpsForRow(row) {
 
 /**
  * The row a state resolves to ignoring the celebrate pulse: a walk direction
- * wins over the mode (wander only runs while idle), otherwise mode -> row.
+ * wins over the mode, otherwise mode -> row. The precedence matters now that
+ * the pet also strolls while busy — walking legs beat the run-in-place row.
  */
 export function baseRowFor(state) {
   const dir = state && state.walk && state.walk.dir;

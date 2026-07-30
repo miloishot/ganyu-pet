@@ -1,6 +1,6 @@
 # ganyu-pet — Contracts & Spec
 
-Desktop pet overlay: Ganyu (from the installed Codex pet `ganyu--chenxin-dlut`) lives on the Windows desktop, reacts to codex CLI **and** Claude Code lifecycle-hook events, chats in character via Haiku, and wanders the bottom edge of the screen when everything is idle.
+Desktop pet overlay: Ganyu (from the installed Codex pet `ganyu--chenxin-dlut`) lives on the Windows desktop, reacts to codex CLI **and** Claude Code lifecycle-hook events, chats in character via Haiku, and wanders the bottom edge of the screen whenever nothing needs the owner's attention.
 
 This file is the single source of truth for parallel builders. **Own only your files. Interfaces here are binding.**
 
@@ -12,7 +12,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 4. `echo <sample JSON> | cmd /c hooks\ganyu-hook.cmd codex 47899` delivers the payload to a listening server (test with a throwaway node listener).
 5. `node hooks/install-hooks.mjs` (dry-run, default) against **fixture copies** of `hooks.json` / `settings.json` produces valid JSON that preserves every pre-existing hook entry and adds ours exactly once (idempotent on re-run). It must never touch real config without `--apply`.
 6. Speech unit tests: prompt template correct, 45s global cooldown enforced (15s floor for `waiting`/`failed` interrupts), canned fallback used when the CLI call fails. Live Haiku call is exercised once by the integrator (`claude -p --model haiku`); if offline, flag it — don't fail the build.
-7. Wander scheduler unit tests with an injected clock: engages only after ≥90s aggregate idle, picks targets inside the primary display work area, cancels immediately on any state change.
+7. Wander scheduler unit tests with an injected clock: engages 20s after the aggregate mode becomes calm (`idle` **or** `busy`), picks targets inside the primary display work area, keeps walking across idle↔busy transitions, and cancels immediately on a non-calm mode (`waiting`/`failed`).
 8. Server binds `127.0.0.1` only. No secrets, no telemetry, nothing written outside the repo (except the installer with explicit `--apply`).
 
 ## Machine facts (Windows 11)
@@ -107,7 +107,10 @@ Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteract
 
 `createWander({clock, schedule, moveWindow, getWorkArea, onWalkState, isPinned})` — all side effects injected; `schedule(fn, ms)` returns a cancel handle (production: setTimeout).
 
-- Arms when aggregate mode is `idle` ≥90s. Then every 2–5 min (deterministic from injected `random`): pick target x in work area, walk at ~60 px/s (move window every 50ms tick), face travel direction (`onWalkState({dir})`), occasional mid-walk pause (idle 3–8s). Any non-idle state change → instant cancel, `onWalkState(null)`. Pinned → never arms. Y stays fixed at bottom edge.
+- **Calm modes** (`WANDER_DEFAULTS`-adjacent export `CALM_MODES = ['idle', 'busy']`, plus an `isCalm(mode)` helper): she strolls while the aggregate mode is `idle` **or** `busy`. `busy` counts as calm because the owner always has codex/Claude Code sessions open, so the lifecycle-hook stream pins the aggregate at `busy` indefinitely and `idle` effectively never arrives — gating on `idle` alone meant she never walked at all, just looped the non-directional busy run on the spot.
+- Arms **20s** after entering a calm mode from a non-calm one. Then every **45–120s** (deterministic from injected `random`): pick target x in work area, walk at ~60 px/s (move window every 50ms tick), face travel direction (`onWalkState({dir})`), occasional mid-walk pause (idle 3–8s).
+- A transition **between** two calm modes (idle↔busy, which the hook stream does constantly as sessions start and stop) neither interrupts a stroll in progress nor restarts the countdown. Only a **non-calm** mode (`waiting`, `failed`, or any unrecognized mode) → instant cancel, `onWalkState(null)`. Repeated identical modes are ignored. Pinned → never arms. Y stays fixed at bottom edge.
+- Renderer precedence follows from this: `walk.dir` outranks the mode row, so a stroll under `busy` draws the directional run rows (1/2), not the run-in-place row 7.
 
 ### Hook delivery (module F)
 
