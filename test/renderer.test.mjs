@@ -12,12 +12,14 @@ import {
   FRAME_W,
   FRAME_H,
   FRAMES_PER_ROW,
+  ROW_FRAMES,
   ROW_COUNT,
   SHEET_W,
   SHEET_H,
   DEFAULT_FPS,
   WALK_FPS,
   fpsForRow,
+  framesForRow,
   baseRowFor,
   createAnimator,
   createSpriteRenderer,
@@ -194,6 +196,22 @@ test('grid constants match the installed spritesheet (1536x1872)', () => {
   assert.equal(SHEET_H, 1872);
 });
 
+test('per-row frame counts are the measured ones, with a full-row fallback', () => {
+  assert.deepEqual(ROW_FRAMES, [6, 8, 8, 4, 5, 8, 6, 6, 6]);
+  assert.equal(ROW_FRAMES.length, ROW_COUNT, 'one count per row');
+  assert.equal(Object.isFrozen(ROW_FRAMES), true);
+
+  assert.equal(framesForRow(ROW.IDLE), 6, 'cols 6-7 are transparent');
+  assert.equal(framesForRow(ROW.RUN_RIGHT), 8);
+  assert.equal(framesForRow(ROW.WAVE), 4);
+  assert.equal(framesForRow(ROW.JUMP), 5);
+
+  // Unknown rows fall back to the grid width rather than yielding undefined.
+  assert.equal(framesForRow(ROW_COUNT), FRAMES_PER_ROW);
+  assert.equal(framesForRow(-1), FRAMES_PER_ROW);
+  assert.equal(framesForRow(undefined), FRAMES_PER_ROW);
+});
+
 test('mode -> row map follows contracts.md', () => {
   assert.deepEqual(MODE_ROW, { idle: 0, busy: 7, waiting: 6, failed: 5 });
   assert.deepEqual(WALK_ROW, { right: 1, left: 2 });
@@ -229,19 +247,58 @@ test('walk rows animate at 6 fps, everything else at 8', () => {
 // animator
 // ---------------------------------------------------------------------------
 
-test('animator loops all 8 frames of a row at the row fps', () => {
+test("animator loops a row's real frames at the row fps", () => {
   let t = 0;
   const a = createAnimator({ now: () => t });
   a.setState({ mode: 'busy' }, 0);
   assert.equal(a.row, ROW.BUSY);
+  const frames = framesForRow(ROW.BUSY); // 6, not the full 8
   const step = 1000 / DEFAULT_FPS;
-  for (let i = 1; i < FRAMES_PER_ROW; i += 1) {
+  for (let i = 1; i < frames; i += 1) {
     t = i * step;
     assert.equal(a.tick(t).frame, i, `frame ${i}`);
   }
-  t = FRAMES_PER_ROW * step;
+  t = frames * step;
   assert.equal(a.tick(t).frame, 0, 'wraps to 0');
   assert.equal(a.row, ROW.BUSY, 'stays on the same row');
+});
+
+test('idle never draws the two empty trailing cells', () => {
+  let t = 0;
+  const a = createAnimator({ now: () => t });
+  a.setState({ mode: 'idle' }, 0);
+  const step = 1000 / DEFAULT_FPS;
+  const seen = [a.frame];
+  for (let i = 1; i <= 12; i += 1) {
+    t = i * step;
+    seen.push(a.tick(t).frame);
+  }
+  // Two clean loops of 6: the blink came from frames 6 and 7 rendering blank.
+  assert.deepEqual(seen, [0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0]);
+  assert.equal(a.row, ROW.IDLE, 'idle never leaves its row');
+});
+
+test('rows that do fill the sheet still run all 8 frames', () => {
+  const cases = [
+    [ROW.RUN_RIGHT, { mode: 'idle', walk: { dir: 'right' } }],
+    [ROW.RUN_LEFT, { mode: 'idle', walk: { dir: 'left' } }],
+    [ROW.FAILED, { mode: 'failed' }],
+  ];
+  for (const [row, state] of cases) {
+    assert.equal(framesForRow(row), FRAMES_PER_ROW, `row ${row} is full`);
+    let t = 0;
+    const a = createAnimator({ now: () => t });
+    a.setState(state, 0);
+    assert.equal(a.row, row);
+    const step = 1000 / fpsForRow(row);
+    // +1ms of slack: the walk step (1000/6) is not exact in binary.
+    for (let i = 1; i < FRAMES_PER_ROW; i += 1) {
+      t = i * step + 1;
+      assert.equal(a.tick(t).frame, i, `row ${row} frame ${i}`);
+    }
+    t = FRAMES_PER_ROW * step + 1;
+    assert.equal(a.tick(t).frame, 0, `row ${row} wraps at 8`);
+  }
 });
 
 test('animator advances walk rows slower than default rows', () => {
@@ -276,11 +333,11 @@ test('celebrate pulses jump then wave exactly once, then returns to the base row
   assert.equal(a.row, ROW.JUMP, 'jump first');
   assert.equal(a.pulsing, true);
 
-  t = FRAMES_PER_ROW * step;
+  t = framesForRow(ROW.JUMP) * step;
   assert.equal(a.tick(t).row, ROW.WAVE, 'then wave');
   assert.equal(a.pulsing, true);
 
-  t = 2 * FRAMES_PER_ROW * step;
+  t = (framesForRow(ROW.JUMP) + framesForRow(ROW.WAVE)) * step;
   assert.equal(a.tick(t).row, ROW.IDLE, 'back to base');
   assert.equal(a.pulsing, false);
 
@@ -295,6 +352,30 @@ test('celebrate pulses jump then wave exactly once, then returns to the base row
   assert.equal(a.row, ROW.JUMP);
 });
 
+test('the pulse hands over on each row\'s own last frame', () => {
+  let t = 0;
+  const a = createAnimator({ now: () => t });
+  const step = 1000 / DEFAULT_FPS;
+  const jump = framesForRow(ROW.JUMP); // 5
+  const wave = framesForRow(ROW.WAVE); // 4
+  a.setState({ mode: 'idle', celebrate: true }, 0);
+
+  for (let i = 1; i < jump; i += 1) {
+    t = i * step;
+    assert.deepEqual(a.tick(t), { row: ROW.JUMP, frame: i });
+  }
+  t = jump * step;
+  assert.deepEqual(a.tick(t), { row: ROW.WAVE, frame: 0 }, 'jump ends after 5, not 8');
+
+  for (let i = 1; i < wave; i += 1) {
+    t = (jump + i) * step;
+    assert.deepEqual(a.tick(t), { row: ROW.WAVE, frame: i });
+  }
+  t = (jump + wave) * step;
+  assert.deepEqual(a.tick(t), { row: ROW.IDLE, frame: 0 }, 'wave ends after 4, not 8');
+  assert.equal(a.pulsing, false);
+});
+
 test('mid-pulse mode changes are deferred until the pulse finishes', () => {
   let t = 0;
   const a = createAnimator({ now: () => t });
@@ -303,8 +384,9 @@ test('mid-pulse mode changes are deferred until the pulse finishes', () => {
   a.setState({ mode: 'busy', celebrate: true }, 0);
   assert.equal(a.row, ROW.JUMP, 'pulse is not interrupted');
   assert.equal(a.baseRow, ROW.BUSY);
-  t = 2 * FRAMES_PER_ROW * step;
+  t = (framesForRow(ROW.JUMP) + framesForRow(ROW.WAVE)) * step;
   assert.equal(a.tick(t).row, ROW.BUSY, 'lands on the newest base row');
+  assert.equal(a.frame, 0, 'the new row starts at frame 0, never mid-row');
 });
 
 test('a long stall resyncs instead of replaying every skipped frame', () => {
@@ -313,7 +395,7 @@ test('a long stall resyncs instead of replaying every skipped frame', () => {
   a.setState({ mode: 'busy' }, 0);
   const before = a.tick(60 * 60 * 1000); // one hour of skipped frames
   assert.equal(before.row, ROW.BUSY);
-  assert.ok(before.frame >= 0 && before.frame < FRAMES_PER_ROW);
+  assert.ok(before.frame >= 0 && before.frame < framesForRow(ROW.BUSY));
 });
 
 // ---------------------------------------------------------------------------

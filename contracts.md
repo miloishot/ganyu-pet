@@ -99,7 +99,13 @@ Canvas-based sprite engine. Spritesheet grid — 8 columns × 9 rows, frame 192�
 |---|---|
 | 0 idle · 1 run-right · 2 run-left · 3 waving · 4 jumping · 5 failed · 6 waiting · 7 busy (non-directional) · 8 review |
 
-Mode → row: `idle→0`, `busy→7`, `waiting→6`, `failed→5`, `celebrate` pulse → 4 (jump) then 3 (wave) once, `walk.dir right→1 / left→2`. 8 fps default, 6 fps for walk rows. Loop all 8 frames per row. Chromium decodes `.webp` natively — draw via offscreen `<img>` → `drawImage` crops.
+**Frames per row are not uniform.** The grid is 8 wide but only rows 1, 2 and 5 fill it; the rest end early and their trailing cells are fully transparent. Measured opaque-pixel counts (`ROW_FRAMES` in `pet.mjs`):
+
+| Row | 0 idle | 1 run-right | 2 run-left | 3 waving | 4 jumping | 5 failed | 6 waiting | 7 busy | 8 review |
+|---|---|---|---|---|---|---|---|---|---|
+| Frames | 6 | 8 | 8 | 4 | 5 | 8 | 6 | 6 | 6 |
+
+Mode → row: `idle→0`, `busy→7`, `waiting→6`, `failed→5`, `celebrate` pulse → 4 (jump) then 3 (wave) once, `walk.dir right→1 / left→2`. 8 fps default, 6 fps for walk rows. Loop each row's real frame count, never the full 8 — drawing a blank trailing cell blinks the pet out (idle at 8 fps lost 250ms of every second). Chromium decodes `.webp` natively — draw via offscreen `<img>` → `drawImage` crops.
 
 Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteractive(true)`; `mouseleave` → `false`. Right-click on sprite → minimal in-window menu (Mute/Unmute · Pin/Unpin · **Home** · Quit) → `ganyu.menuAction(...)`. `home` is wired end to end in main (§Window) but **module C has not added the menu entry yet**, so the recall action is reachable over IPC and unlabelled in the UI until it does. Speech bubble: styled div above the sprite, fades after 8s, newest replaces current.
 

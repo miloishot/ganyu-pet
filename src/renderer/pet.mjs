@@ -16,6 +16,11 @@ export const ROW_COUNT = 9;
 export const SHEET_W = FRAME_W * FRAMES_PER_ROW; // 1536
 export const SHEET_H = FRAME_H * ROW_COUNT; // 1872
 
+// Measured real (non-transparent) frame count per row — the grid is 8 wide but
+// most rows stop short and their trailing cells are fully transparent. Drawing
+// those blanks is a visible blink, so animation must wrap here, not at 8.
+export const ROW_FRAMES = Object.freeze([6, 8, 8, 4, 5, 8, 6, 6, 6]);
+
 export const ROW = {
   IDLE: 0,
   RUN_RIGHT: 1,
@@ -50,6 +55,10 @@ export const WALK_FPS = 6;
 
 export function fpsForRow(row) {
   return row === ROW.RUN_RIGHT || row === ROW.RUN_LEFT ? WALK_FPS : DEFAULT_FPS;
+}
+
+export function framesForRow(row) {
+  return ROW_FRAMES[row] ?? FRAMES_PER_ROW;
 }
 
 /**
@@ -87,7 +96,7 @@ export function createAnimator({ now = () => Date.now() } = {}) {
 
   function advance() {
     frame += 1;
-    if (frame < FRAMES_PER_ROW) return;
+    if (frame < framesForRow(row)) return;
     frame = 0;
     if (pulseIndex < 0) return;
     pulseIndex += 1;
