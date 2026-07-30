@@ -35,9 +35,22 @@ const REAL_TARGETS = [
   path.join(os.homedir(), '.codex', 'hooks.json'),
   path.join(os.homedir(), '.claude', 'settings.json'),
 ];
+/** `<name>.bak-ganyu-N` files currently sitting next to a real config file. */
+function backupsFor(file) {
+  const dir = path.dirname(file);
+  if (!fs.existsSync(dir)) return [];
+  const prefix = `${path.basename(file)}.bak-ganyu-`;
+  return fs.readdirSync(dir).filter((n) => n.startsWith(prefix)).sort();
+}
+
+// Snapshot which backups are ALREADY there rather than asserting none exists:
+// a real `--apply` leaves .bak-ganyu-N behind on purpose as the owner's rollback,
+// so once the hooks are genuinely installed a bare non-existence check fails
+// forever. What this suite must prove is that it changed nothing.
 const realBefore = REAL_TARGETS.map((f) => ({
   file: f,
   stat: fs.existsSync(f) ? fs.statSync(f) : null,
+  backups: backupsFor(f),
 }));
 const fixtureBefore = fs.readdirSync(FIXTURES)
   .filter((n) => n.endsWith('.json'))
@@ -354,7 +367,8 @@ test('parseArgs defaults to dry run and both targets', () => {
 });
 
 test('real config files and fixtures were never touched by this suite', () => {
-  for (const { file, stat } of realBefore) {
+  for (const { file, stat, backups } of realBefore) {
+    assert.deepEqual(backupsFor(file), backups, `${file} backup set changed`);
     if (stat === null) {
       assert.equal(fs.existsSync(file), false, `${file} was created by the tests`);
       continue;
@@ -362,7 +376,6 @@ test('real config files and fixtures were never touched by this suite', () => {
     const now = fs.statSync(file);
     assert.equal(now.size, stat.size, `${file} size changed`);
     assert.equal(now.mtimeMs, stat.mtimeMs, `${file} mtime changed`);
-    assert.equal(fs.existsSync(`${file}.bak-ganyu-1`), false, `${file}.bak-ganyu-1 was created`);
   }
   for (const { n, text } of fixtureBefore) {
     assert.equal(read(path.join(FIXTURES, n)), text, `fixture ${n} was modified`);
