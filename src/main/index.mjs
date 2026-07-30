@@ -3,8 +3,6 @@
 // production dependencies injected.
 
 import { app, BrowserWindow, ipcMain, screen } from 'electron';
-import { execFile } from 'node:child_process';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -72,45 +70,6 @@ function schedule(fn, ms) {
   return cancel;
 }
 
-/**
- * Speech's `exec`. Accepts either shape module D may use:
- *   exec(prompt)                        -> Promise<string>   (trimmed stdout)
- *   exec(prompt, cb)                    -> execFile callback (err, stdout, stderr)
- *   exec(file, args[, opts][, cb])      -> execFile passthrough (promise when no cb)
- * The claude CLI is spawned with a 15s timeout and killed on expiry.
- */
-function makeExec() {
-  const bin = process.env.GANYU_CLAUDE_BIN || path.join(os.homedir(), '.local', 'bin', 'claude');
-  const base = { timeout: 15000, killSignal: 'SIGKILL', windowsHide: true, maxBuffer: 1024 * 1024 };
-
-  const run = (file, args, options, cb) => {
-    if (cb) return execFile(file, args, { ...base, ...options }, cb);
-    return new Promise((resolve, reject) => {
-      execFile(file, args, { ...base, ...options }, (err, stdout, stderr) => {
-        if (err) {
-          err.stdout = stdout;
-          err.stderr = stderr;
-          reject(err);
-        } else {
-          resolve({ stdout: String(stdout ?? ''), stderr: String(stderr ?? '') });
-        }
-      });
-    });
-  };
-
-  return function exec(a, b, c, d) {
-    const cb = [b, c, d].find((x) => typeof x === 'function');
-    const opts = [b, c, d].find((x) => x && typeof x === 'object' && !Array.isArray(x));
-
-    if (typeof a === 'string' && Array.isArray(b)) return run(a, b, opts, cb);
-
-    const prompt = typeof a === 'string' ? a : String(a?.prompt ?? a ?? '');
-    const args = ['-p', prompt, '--model', 'haiku'];
-    if (cb) return run(bin, args, opts, cb);
-    return run(bin, args, opts, null).then((r) => r.stdout.trim());
-  };
-}
-
 /** Wander's `moveWindow`. Accepts (x, y), (x) or ({x, y}). */
 function moveWindow(a, b) {
   if (!win || win.isDestroyed()) return;
@@ -166,7 +125,7 @@ function sendSpeak(line) {
     // The only externally observable proof that a POST /event reached the speech
     // trigger path rather than stopping at the state aggregator.
     if (process.env.GANYU_DEBUG === '1') {
-      console.log(`[ganyu][speak] ${text.trim()}${line?.fallback ? ' (fallback)' : ''}`);
+      console.log(`[ganyu][speak] ${text.trim()}${line?.summary ? ` — ${line.summary}` : ''}`);
     }
     send(CHANNELS.speak, { text: text.trim() });
   }
@@ -307,11 +266,9 @@ async function composeRuntime() {
   const speechMod = await tryImport('./speech.mjs');
   if (speechMod?.createSpeech) {
     const speech = speechMod.createSpeech({
-      exec: makeExec(),
       clock,
       onLine: sendSpeak,
-      // Smoke has a 20s budget and the claude CLI a 60s timeout — never let a
-      // stray line spawn a subprocess during the check.
+      // Smoke is a startup check: keep stray bubbles out of the stdout it parses.
       isMuted: () => flags.muted || SMOKE,
     });
     speechSink = requireMethod('speech', speech, ['onEvent', 'handleEvent', 'notify', 'trigger', 'onState', 'ingest', 'speak']);

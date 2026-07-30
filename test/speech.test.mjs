@@ -1,19 +1,16 @@
-// Module D tests — success criterion 6: prompt template, 45s cooldown with 15s
-// interrupt floor for waiting/failed, canned fallback when the CLI call fails.
-// Everything runs with a mocked exec + injected clock: no Electron, no live CLI.
+// Module D tests — the bubble is a deterministic status indicator now, so these
+// cover: trigger rules, the 6s throttle (with waiting/failed bypassing it),
+// throttled busy lines being DROPPED rather than queued, mute, slot
+// substitution including the unknown-tool / unknown-project variants, and the
+// MESSAGES house rules. No exec, no timers, no CLI: notify() is synchronous.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  CLI_ENV,
-  COOLDOWN_MS,
-  INTERRUPT_FLOOR_MS,
-  claudeArgs,
-  cliEnv,
-  cleanLine,
+  INTERRUPT_KINDS,
+  THROTTLE_MS,
   createSpeech,
-  hasErrorMarker,
   modeForEvent,
   projectName,
   toolClass,
@@ -22,75 +19,31 @@ import {
 import { createState } from '../src/main/state.mjs';
 import { toSpeechDetail } from '../src/main/window.mjs';
 import {
-  FALLBACK_LINES,
   MAX_LINE_CHARS,
-  PROMPT_TEMPLATE,
-  buildPrompt,
+  MESSAGES,
   buildSummary,
-  fallbackFor,
+  messageFor,
   sourceLabel,
 } from '../src/main/persona.mjs';
 
-/**
- * Test harness: manual clock, manual timers, scripted exec.
- * `opts.defer` makes exec hold its callback (production execFile is async) so a
- * test can settle it explicitly with `settle()`.
- */
+/** Test harness: manual clock, captured lines, deterministic variant choice. */
 function harness(opts = {}) {
-  const calls = [];
   const lines = [];
-  const timers = [];
-  const deferred = [];
   let t = 1_000_000; // arbitrary non-zero epoch
-  let reply = { err: null, stdout: 'A line from Haiku.' };
 
   const speech = createSpeech({
-    exec: (file, args, options, cb) => {
-      calls.push({ file, args, options });
-      if (opts.defer) deferred.push(cb);
-      else cb(reply.err, reply.stdout, reply.stderr ?? '');
-    },
     clock: { now: () => t },
     onLine: (line) => lines.push(line),
     isMuted: () => Boolean(opts.muted && opts.muted()),
-    user: 'Isaac',
-    random: () => 0,
-    schedule: (fn, ms) => {
-      const timer = { fn, ms, cancelled: false };
-      timers.push(timer);
-      return () => {
-        timer.cancelled = true;
-      };
-    },
-    bin: 'C:\\fake\\claude.exe',
-    ...opts.overrides,
+    random: opts.random ?? (() => 0),
   });
 
   return {
     speech,
-    calls,
     lines,
-    timers,
     now: () => t,
     advance(ms) {
       t += ms;
-    },
-    setReply(next) {
-      reply = next;
-    },
-    /** Settle the oldest deferred exec call (only with `defer: true`). */
-    settle(err = null, stdout = 'A line from Haiku.') {
-      const cb = deferred.shift();
-      assert.ok(cb, 'no deferred exec call to settle');
-      cb(err, stdout, '');
-    },
-    /** Fire every live timer whose deadline has passed (order preserved). */
-    runTimers() {
-      const due = timers.filter((x) => !x.cancelled && !x.fired);
-      for (const timer of due) {
-        timer.fired = true;
-        timer.fn();
-      }
     },
   };
 }
@@ -102,36 +55,249 @@ const stop = { source: 'codex', event: 'Stop', sessionId: 's1', cwd: 'C:\\dev\\g
 const permission = { source: 'claude', event: 'Notification', sessionId: 's2', toolName: 'Bash', mode: 'waiting' };
 const failure = { source: 'claude', event: 'PostToolUse', sessionId: 's2', toolName: 'Bash', mode: 'failed' };
 
-// ---------------------------------------------------------------- prompt template
+const CWD = 'C:\\Users\\kw11l\\Desktop\\ganyu-pet';
 
-test('PROMPT_TEMPLATE matches the contract text with both slots', () => {
-  assert.equal(
-    PROMPT_TEMPLATE,
-    "You are Ganyu from Genshin Impact, working as {user}'s diligent secretary. React to this " +
-      'coding-agent event in ONE short line (max 90 chars), gentle and dutiful, in English, at ' +
-      'most one emoji, occasionally hinting you could use a nap. Address them by name only, never ' +
-      'with an honorific (no Mr., Miss, or Sir). Event: {summary}. Reply with ' +
-      'ONLY the line.',
-  );
+// ---------------------------------------------------------------- trigger rules
+
+test('SessionStart greets, synchronously, with the project name in the line', () => {
+  const h = harness();
+  const res = h.speech.notify(sessionStart);
+  assert.equal(res.spoken, true);
+  assert.equal(res.reason, 'spoken');
+  assert.equal(res.kind, 'greeting');
+  assert.equal(h.lines.length, 1, 'the line is emitted before notify() returns');
+  assert.equal(h.lines[0].text, 'Session started in ganyu-pet.');
+  assert.equal(h.lines[0].text, res.text);
 });
 
-test('buildPrompt substitutes user and summary and leaves no slots behind', () => {
-  const prompt = buildPrompt({ user: 'Isaac', summary: 'codex finished a task in ganyu-pet' });
-  assert.equal(
-    prompt,
-    "You are Ganyu from Genshin Impact, working as Isaac's diligent secretary. React to this " +
-      'coding-agent event in ONE short line (max 90 chars), gentle and dutiful, in English, at ' +
-      'most one emoji, occasionally hinting you could use a nap. Address them by name only, never ' +
-      'with an honorific (no Mr., Miss, or Sir). Event: codex finished a task in ' +
-      'ganyu-pet. Reply with ONLY the line.',
-  );
-  assert.ok(!prompt.includes('{user}'));
-  assert.ok(!prompt.includes('{summary}'));
+test('unknown events and a first tool use do not speak', () => {
+  const h = harness();
+  assert.equal(h.speech.notify({ source: 'codex', event: 'MysteryEvent', sessionId: 's1' }).reason, 'no-trigger');
+  assert.equal(h.speech.notify({ source: 'codex', event: 'PostToolUse', sessionId: 's9', toolName: 'Read' }).reason, 'no-trigger');
+  assert.equal(h.lines.length, 0);
 });
 
-test('buildPrompt treats $-sequences in the summary literally', () => {
-  const prompt = buildPrompt({ user: 'Isaac', summary: 'codex ran $& in $`repo`' });
-  assert.ok(prompt.includes('Event: codex ran $& in $`repo`.'));
+test('tool-class change during busy speaks; the same class again does not', () => {
+  const h = harness();
+  h.speech.notify(editPre); // first tool of the session: no previous class, no line
+  assert.equal(h.lines.length, 0);
+  h.speech.notify({ ...editPre, toolName: 'Write' }); // still the edit class
+  assert.equal(h.lines.length, 0);
+  const res = h.speech.notify(bashPre); // edit -> shell: a class change
+  assert.equal(res.kind, 'busy');
+  assert.equal(res.text, 'Running Bash…');
+  assert.equal(h.lines.length, 1);
+});
+
+test('Stop celebrates, Notification waits, a failed event sympathises', () => {
+  const h = harness();
+  assert.equal(h.speech.notify(stop).kind, 'celebrate');
+  assert.equal(h.speech.notify(permission).kind, 'waiting');
+  assert.equal(h.speech.notify(failure).kind, 'failed');
+  assert.deepEqual(h.lines.map((l) => l.kind), ['celebrate', 'waiting', 'failed']);
+  assert.deepEqual(h.lines.map((l) => l.text), [
+    'Finished in ganyu-pet.',
+    'Bash needs your approval.',
+    "Error in Bash. I've noted it.",
+  ]);
+});
+
+test('module B spellings (`tool`, `failed`) drive the failed trigger', () => {
+  const h = harness();
+  const res = h.speech.notify({
+    source: 'claude', event: 'PostToolUse', sessionId: 's1', tool: 'Bash', mode: 'busy', failed: true,
+  });
+  assert.equal(res.kind, 'failed', 'a failing PostToolUse arrives with mode busy');
+  assert.equal(res.text, "Error in Bash. I've noted it.");
+});
+
+test('speech never re-derives failure from payload text — module B decides', () => {
+  const h = harness();
+  const res = h.speech.handleEvent('claude', {
+    session_id: 's1',
+    cwd: CWD,
+    hook_event_name: 'Stop',
+    tool_response: 'Error: exit code 1',
+    last_message: 'the build failed',
+  });
+  assert.equal(res.kind, 'celebrate');
+  assert.equal(res.text, 'Finished in ganyu-pet.');
+});
+
+test('onEvent takes the object shape module A pushes; handleEvent takes both', () => {
+  const h = harness();
+  const res = h.speech.onEvent(
+    {
+      source: 'claude',
+      payload: { session_id: 'abc', cwd: CWD, hook_event_name: 'Stop' },
+      event: 'Stop',
+      mode: 'idle',
+    },
+    { mode: 'idle', celebrate: true },
+  );
+  assert.equal(res.kind, 'celebrate');
+  assert.equal(res.summary, 'Claude Code finished a task in ganyu-pet');
+
+  const h2 = harness();
+  assert.equal(h2.speech.handleEvent({ source: 'codex', event: 'SessionStart', sessionId: 's1' }).kind, 'greeting');
+  const raw = h2.speech.handleEvent('claude', {
+    session_id: 'abc', cwd: CWD, hook_event_name: 'Notification', tool_name: 'Bash',
+  });
+  assert.equal(raw.kind, 'waiting');
+  assert.equal(raw.summary, 'Claude Code is waiting for permission to run Bash');
+});
+
+test('the emitted line carries kind, mode, source and the summary', () => {
+  const h = harness();
+  h.speech.notify(permission);
+  assert.deepEqual(h.lines[0], {
+    text: 'Bash needs your approval.',
+    kind: 'waiting',
+    mode: 'waiting',
+    source: 'claude',
+    summary: 'Claude Code is waiting for permission to run Bash',
+  });
+});
+
+// ---------------------------------------------------------------- throttle
+
+test('throttle is 6s: 5.999s is refused, 6s speaks', () => {
+  const h = harness();
+  assert.equal(h.speech.notify(sessionStart).spoken, true);
+
+  h.advance(THROTTLE_MS - 1);
+  const blocked = h.speech.notify(stop);
+  assert.equal(blocked.spoken, false);
+  assert.equal(blocked.reason, 'throttled');
+  assert.equal(blocked.retryInMs, 1);
+  assert.equal(h.lines.length, 1);
+
+  h.advance(1);
+  assert.equal(h.speech.notify(stop).spoken, true);
+  assert.equal(h.lines.length, 2);
+});
+
+test('waiting and failed bypass the throttle and always speak', () => {
+  const h = harness();
+  h.speech.notify(sessionStart);
+  assert.deepEqual([...INTERRUPT_KINDS], ['waiting', 'failed']);
+
+  // Same millisecond as the greeting: neither is refused.
+  assert.equal(h.speech.notify(permission).spoken, true);
+  assert.equal(h.speech.notify({ ...failure, sessionId: 's7' }).spoken, true);
+  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'waiting', 'failed']);
+});
+
+test('a throttled busy line is dropped, not queued', () => {
+  const h = harness();
+  h.speech.notify(sessionStart); // speaks
+  h.speech.notify(editPre); // first class of the session, no line
+  assert.equal(h.speech.notify(bashPre).reason, 'throttled');
+
+  h.advance(60 * 60 * 1000); // an hour later: there was never anything held
+  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting']);
+  // A stale status is worse than none, so there is no queue and no timer to flush.
+  assert.deepEqual(Object.keys(h.speech.stats()).sort(), ['lastMode', 'lastSpokeAt']);
+});
+
+test('a spoken interrupt still restarts the throttle for ordinary kinds', () => {
+  const h = harness();
+  h.speech.notify(permission); // interrupt speaks with no history
+  h.advance(THROTTLE_MS - 1);
+  assert.equal(h.speech.notify(stop).reason, 'throttled');
+  h.advance(1);
+  assert.equal(h.speech.notify(stop).spoken, true);
+});
+
+// ---------------------------------------------------------------- mute
+
+test('muted: no lines at all, and unmuting resumes', () => {
+  let muted = true;
+  const h = harness({ muted: () => muted });
+  assert.equal(h.speech.notify(sessionStart).reason, 'muted');
+  assert.equal(h.speech.notify(failure).reason, 'muted', 'not even the interrupt kinds');
+  assert.equal(h.lines.length, 0);
+  assert.equal(h.speech.stats().lastSpokeAt, null);
+
+  muted = false;
+  assert.equal(h.speech.notify(stop).spoken, true);
+  assert.equal(h.lines.length, 1);
+});
+
+// ---------------------------------------------------------------- messages & slots
+
+test('MESSAGES: five kinds, 3-5 variants, <= 70 chars, one emoji, no honorific', () => {
+  assert.equal(MAX_LINE_CHARS, 70);
+  assert.deepEqual(Object.keys(MESSAGES).sort(), ['busy', 'celebrate', 'failed', 'greeting', 'waiting']);
+
+  for (const [kind, table] of Object.entries(MESSAGES)) {
+    assert.ok(Array.isArray(table), `${kind} table missing`);
+    assert.ok(table.length >= 3 && table.length <= 5, `${kind} has ${table.length} variants`);
+    assert.equal(new Set(table).size, table.length, `${kind} has duplicate variants`);
+    assert.ok(table.some((t) => !t.includes('{')), `${kind} has no slot-free variant`);
+    for (const line of table) {
+      assert.ok(line.length > 0 && line.length <= MAX_LINE_CHARS, `too long (${line.length}): ${line}`);
+      const emoji = line.match(/\p{Extended_Pictographic}/gu) ?? [];
+      assert.ok(emoji.length <= 1, `more than one emoji: ${line}`);
+      assert.ok(!/\b(mr|mrs|ms|miss|sir|madam|master)\b/i.test(line), `honorific: ${line}`);
+      assert.ok(!/\{(?!tool\}|project\})/.test(line), `unknown slot: ${line}`);
+    }
+  }
+});
+
+test('every kind renders with no tool and no project without leaking a slot', () => {
+  for (const kind of Object.keys(MESSAGES)) {
+    for (const r of [0, 0.2, 0.4, 0.6, 0.8, 0.99]) {
+      const line = messageFor(kind, { random: () => r });
+      assert.ok(line.length > 0, `${kind} produced no line at random=${r}`);
+      assert.ok(!line.includes('{'), `${kind} leaked a slot: ${line}`);
+      assert.ok(!/\b(undefined|null)\b/.test(line), `${kind} leaked a value: ${line}`);
+    }
+  }
+});
+
+test('an event with no tool and no project still gets a natural line', () => {
+  const h = harness();
+  const greeting = h.speech.notify({ source: 'codex', event: 'SessionStart', sessionId: 's1' });
+  assert.equal(greeting.text, "Reporting in. I'll keep the records.");
+
+  h.advance(THROTTLE_MS);
+  const idle = h.speech.notify({ source: 'codex', event: 'SessionEnd', sessionId: 's1' });
+  assert.equal(idle.kind, 'celebrate');
+  assert.equal(idle.text, 'Task complete. I\'ll file the report.');
+
+  const waiting = h.speech.notify({ source: 'codex', event: 'PermissionRequest', sessionId: 's1' });
+  assert.equal(waiting.text, 'Paused — a permission request needs you.');
+});
+
+test('slot substitution is literal: $& and $` in a name stay as typed', () => {
+  const line = messageFor('busy', { tool: '$&-$`tool', project: 'p', random: () => 0 });
+  assert.equal(line, 'Running $&-$`tool…');
+});
+
+test('messageFor is deterministic with an injected random and avoids repeats', () => {
+  assert.equal(messageFor('waiting', { tool: 'Bash', random: () => 0 }), 'Bash needs your approval.');
+  assert.equal(
+    messageFor('waiting', { tool: 'Bash', random: () => 0, avoid: 'Bash needs your approval.' }),
+    'Waiting on your approval for Bash. 🙏',
+  );
+  assert.equal(messageFor('nonsense-kind', { random: () => 0 }), '');
+});
+
+test('consecutive lines of the same kind do not repeat the previous one', () => {
+  const h = harness();
+  h.speech.notify(permission);
+  h.speech.notify({ ...permission, sessionId: 's5' });
+  assert.equal(h.lines.length, 2);
+  assert.notEqual(h.lines[0].text, h.lines[1].text);
+});
+
+test('a very long project name is clamped instead of overflowing the bubble', () => {
+  const h = harness();
+  const res = h.speech.notify({ source: 'codex', event: 'Stop', sessionId: 's1', project: 'x'.repeat(200) });
+  assert.ok(res.text.length <= MAX_LINE_CHARS, `length ${res.text.length}`);
+  assert.ok(res.text.endsWith('…'));
+  assert.equal(h.lines[0].text, res.text);
 });
 
 test('buildSummary reproduces both contract examples verbatim', () => {
@@ -146,360 +312,24 @@ test('buildSummary reproduces both contract examples verbatim', () => {
   assert.equal(sourceLabel('claude'), 'Claude Code');
 });
 
-test('exec is called with the claude CLI argv, 60s timeout and the built prompt', () => {
-  const h = harness();
-  const res = h.speech.notify(sessionStart);
-  assert.equal(res.dispatched, true);
-  assert.equal(res.kind, 'greeting');
-  assert.equal(h.calls.length, 1);
+// ---------------------------------------------------------------- robustness
 
-  const { file, args, options } = h.calls[0];
-  assert.equal(file, 'C:\\fake\\claude.exe');
-  assert.equal(args.length, 4);
-  assert.equal(args[0], '-p');
-  assert.equal(args[2], '--model');
-  assert.equal(args[3], 'haiku');
-  assert.equal(args[1], buildPrompt({ user: 'Isaac', summary: 'codex started a session in ganyu-pet' }));
-  assert.deepEqual(args, claudeArgs(args[1]));
-  assert.equal(options.timeout, 60_000);
-  assert.equal(options.windowsHide, true);
-  // Without these the CLI spends 25-57s replaying this machine's whole config
-  // (hooks, CLAUDE.md, plugin sync) plus extended thinking, so every line would
-  // be a timeout fallback. Measured 4.2/3.9/4.6s with them.
-  assert.equal(options.env.CLAUDE_CODE_SAFE_MODE, '1');
-  assert.equal(options.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, '1');
-  assert.equal(options.env.MAX_THINKING_TOKENS, '0');
-  assert.deepEqual(cliEnv({ PATH: 'x' }), { PATH: 'x', ...CLI_ENV });
-  assert.equal(h.lines[0].text, 'A line from Haiku.');
-  assert.equal(h.lines[0].fallback, false);
-});
-
-// ---------------------------------------------------------------- trigger rules
-
-test('SessionStart greets; unknown events and plain idle do not speak', () => {
-  const h = harness();
-  assert.equal(h.speech.notify(sessionStart).kind, 'greeting');
-  h.advance(COOLDOWN_MS);
-  assert.equal(h.speech.notify({ source: 'codex', event: 'MysteryEvent', sessionId: 's1' }).reason, 'no-trigger');
-  assert.equal(h.speech.notify({ source: 'codex', event: 'PostToolUse', sessionId: 's9', toolName: 'Read' }).reason, 'no-trigger');
-  assert.equal(h.calls.length, 1);
-});
-
-test('tool-class change during busy speaks; the same class again does not', () => {
-  const h = harness();
-  h.speech.notify(editPre); // first tool of the session: no previous class, no line
-  assert.equal(h.calls.length, 0);
-  h.speech.notify({ ...editPre, toolName: 'Write' }); // still the edit class
-  assert.equal(h.calls.length, 0);
-  const res = h.speech.notify(bashPre); // edit -> shell: a class change
-  assert.equal(res.kind, 'busy');
-  assert.equal(h.calls.length, 1);
-});
-
-test('Stop triggers the celebrate kind', () => {
-  const h = harness();
-  assert.equal(h.speech.notify(stop).kind, 'celebrate');
-  assert.equal(h.calls.length, 1);
-});
-
-test('onEvent takes the object shape module A pushes (event + aggregate mode)', () => {
-  const h = harness();
-  const res = h.speech.onEvent(
-    {
-      source: 'claude',
-      payload: { session_id: 'abc', cwd: 'C:\\dev\\ganyu-pet', hook_event_name: 'Stop' },
-      event: 'Stop',
-      mode: 'idle',
-    },
-    { mode: 'idle', celebrate: true },
-  );
-  assert.equal(res.kind, 'celebrate');
-  assert.equal(res.summary, 'Claude Code finished a task in ganyu-pet');
-});
-
-test('handleEvent also accepts a single event object', () => {
-  const h = harness();
-  assert.equal(h.speech.handleEvent({ source: 'codex', event: 'SessionStart', sessionId: 's1' }).kind, 'greeting');
-});
-
-test('raw hook payloads normalize through handleEvent', () => {
-  const h = harness();
-  const res = h.speech.handleEvent('claude', {
-    session_id: 'abc',
-    cwd: 'C:\\Users\\kw11l\\Desktop\\ganyu-pet',
-    hook_event_name: 'Notification',
-    tool_name: 'Bash',
-  });
-  assert.equal(res.kind, 'waiting');
-  assert.equal(res.summary, 'Claude Code is waiting for permission to run Bash');
-});
-
-// ---------------------------------------------------------------- cooldown
-
-test('global cooldown is 45s: 44.999s is refused, 45s speaks', () => {
-  const h = harness();
-  h.speech.notify(sessionStart);
-  assert.equal(h.calls.length, 1);
-
-  h.advance(COOLDOWN_MS - 1);
-  const blocked = h.speech.notify(stop);
-  assert.equal(blocked.dispatched, false);
-  assert.equal(blocked.reason, 'cooldown');
-  assert.equal(blocked.retryInMs, 1);
-  assert.equal(h.calls.length, 1);
-
-  h.advance(1);
-  h.speech.notify(stop);
-  assert.equal(h.calls.length, 2);
-  assert.equal(h.lines.length, 2);
-});
-
-test('waiting interrupts at 15s but not at 14.999s', () => {
-  const h = harness();
-  h.speech.notify(sessionStart);
-  h.advance(INTERRUPT_FLOOR_MS - 1);
-  assert.equal(h.speech.notify(permission).reason, 'cooldown');
-  assert.equal(h.calls.length, 1);
-
-  h.advance(1);
-  const res = h.speech.notify({ ...permission, sessionId: 's3' });
-  assert.equal(res.kind, 'waiting');
-  assert.equal(h.calls.length, 2);
-});
-
-test('failed interrupts at the 15s floor; busy still waits the full 45s', () => {
-  const h = harness();
-  h.speech.notify(sessionStart);
-
-  h.advance(20_000); // past the interrupt floor, inside the global cooldown
-  h.speech.notify(editPre);
-  h.speech.notify(bashPre);
-  assert.equal(h.calls.length, 1, 'busy triggers must not interrupt inside 45s');
-
-  assert.equal(h.speech.notify(failure).kind, 'failed');
-  assert.equal(h.calls.length, 2);
-});
-
-test('queue depth 1: the newest pending trigger replaces the older one', () => {
-  const h = harness();
-  h.speech.notify(sessionStart);
-  assert.equal(h.calls.length, 1);
-
-  h.advance(1000);
-  h.speech.notify(editPre);
-  h.speech.notify(bashPre); // queued busy
-  h.advance(1000);
-  h.speech.notify(stop); // replaces it
-  assert.equal(h.speech.stats().pendingKind, 'celebrate');
-  assert.equal(h.calls.length, 1);
-
-  h.advance(COOLDOWN_MS);
-  h.runTimers();
-  assert.equal(h.calls.length, 2, 'exactly one queued line is emitted');
-  assert.equal(h.lines.length, 2);
-  assert.equal(h.lines[1].kind, 'celebrate');
-  assert.equal(h.speech.stats().pendingKind, null);
-});
-
-test('a queued trigger that is still inside its cooldown re-arms instead of speaking', () => {
-  const h = harness();
-  h.speech.notify(sessionStart);
-  h.advance(1000);
-  h.speech.notify(stop); // queued, wake armed for 44s out
-  h.runTimers(); // fire the wake early: cooldown not elapsed
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.speech.stats().pendingKind, 'celebrate');
-  assert.equal(h.speech.stats().wakeArmed, true);
-});
-
-// The production exec (child_process.execFile) settles asynchronously, so the
-// cooldown has to hold across the callback boundary, not just within one tick.
-
-test('async exec: a trigger raised in flight is queued, then speaks after the 45s cooldown', () => {
-  const h = harness({ defer: true });
-  h.speech.notify(sessionStart);
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.speech.stats().inFlight, true);
-
-  const queued = h.speech.notify(stop);
-  assert.equal(queued.dispatched, false);
-  assert.equal(h.speech.stats().pendingKind, 'celebrate');
-
-  h.advance(2000); // the CLI took 2s
-  h.settle(null, 'Reporting in.');
-  assert.equal(h.lines.length, 1);
-  assert.equal(h.calls.length, 1, 'the queued line must still wait out the cooldown');
-  assert.equal(h.speech.stats().wakeArmed, true);
-
-  h.advance(COOLDOWN_MS - 2000);
-  h.runTimers();
-  assert.equal(h.calls.length, 2);
-  h.settle(null, 'All finished.');
-  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'celebrate']);
-  assert.equal(h.speech.stats().pendingKind, null);
-});
-
-test('async exec: a waiting trigger queued in flight speaks as soon as the 15s floor is met', () => {
-  const h = harness({ defer: true });
-  h.speech.notify(sessionStart);
-  h.advance(INTERRUPT_FLOOR_MS);
-  assert.equal(h.speech.notify(permission).reason, 'in-flight');
-
-  h.settle(null, 'Reporting in.');
-  assert.equal(h.calls.length, 2, 'the floor is already met, so the queue flushes immediately');
-  h.settle(null, 'Awaiting your word.');
-  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'waiting']);
-});
-
-test('muting while a trigger is pending drops it with no exec call', () => {
-  let muted = false;
-  const h = harness({ muted: () => muted });
-  h.speech.notify(sessionStart);
-  h.advance(1000);
-  h.speech.notify(stop);
-  assert.equal(h.speech.stats().pendingKind, 'celebrate');
-
-  muted = true;
-  h.advance(COOLDOWN_MS);
-  h.runTimers();
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.lines.length, 1);
-  assert.equal(h.speech.stats().pendingKind, null);
-});
-
-test('dispose cancels the pending trigger and its timer', () => {
-  const h = harness();
-  h.speech.notify(sessionStart);
-  h.advance(1000);
-  h.speech.notify(stop);
-  h.speech.dispose();
-  h.advance(COOLDOWN_MS);
-  h.runTimers();
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.speech.stats().pendingKind, null);
-});
-
-// ---------------------------------------------------------------- fallback
-
-test('every fallback table has >= 6 lines within 90 chars and at most one emoji', () => {
-  const kinds = ['greeting', 'busy', 'waiting', 'failed', 'celebrate', 'idle'];
-  for (const kind of kinds) {
-    const table = FALLBACK_LINES[kind];
-    assert.ok(Array.isArray(table), `${kind} table missing`);
-    assert.ok(table.length >= 6, `${kind} has only ${table.length} lines`);
-    assert.equal(new Set(table).size, table.length, `${kind} has duplicate lines`);
-    for (const line of table) {
-      assert.ok(line.length > 0 && line.length <= MAX_LINE_CHARS, `too long: ${line}`);
-      const emoji = line.match(/\p{Extended_Pictographic}/gu) ?? [];
-      assert.ok(emoji.length <= 1, `more than one emoji: ${line}`);
-    }
-  }
-});
-
-test('exec error falls back to a canned line for that kind', () => {
-  const h = harness();
-  h.setReply({ err: new Error('spawn ENOENT'), stdout: '' });
-  h.speech.notify(sessionStart);
-  assert.equal(h.lines.length, 1);
-  assert.equal(h.lines[0].fallback, true);
-  assert.equal(h.lines[0].kind, 'greeting');
-  assert.ok(FALLBACK_LINES.greeting.includes(h.lines[0].text));
-});
-
-test('timeout kill falls back, and the cooldown still applies afterwards', () => {
-  const h = harness();
-  const killed = Object.assign(new Error('Command failed: timeout'), { killed: true, signal: 'SIGKILL' });
-  h.setReply({ err: killed, stdout: '' });
-  h.speech.notify(permission);
-  assert.equal(h.lines.length, 1);
-  assert.ok(FALLBACK_LINES.waiting.includes(h.lines[0].text));
-
-  h.advance(INTERRUPT_FLOOR_MS - 1);
-  assert.equal(h.speech.notify({ ...permission, sessionId: 's4' }).reason, 'cooldown');
-  assert.equal(h.calls.length, 1);
-});
-
-test('empty or whitespace-only CLI output falls back', () => {
-  for (const stdout of ['', '   \n\n  ', undefined]) {
-    const h = harness();
-    h.setReply({ err: null, stdout });
-    h.speech.notify(failure);
-    assert.equal(h.lines.length, 1);
-    assert.equal(h.lines[0].fallback, true);
-    assert.ok(FALLBACK_LINES.failed.includes(h.lines[0].text));
-  }
-});
-
-test('a throwing exec is caught and falls back', () => {
-  const lines = [];
+test('a throwing onLine listener does not break notify', () => {
   const speech = createSpeech({
-    exec: () => {
-      throw new Error('no such file');
-    },
     clock: { now: () => 0 },
-    onLine: (line) => lines.push(line),
+    onLine: () => {
+      throw new Error('boom');
+    },
     random: () => 0,
-    schedule: () => () => {},
   });
-  speech.notify(stop);
-  assert.equal(lines.length, 1);
-  assert.equal(lines[0].fallback, true);
-  assert.ok(FALLBACK_LINES.celebrate.includes(lines[0].text));
+  assert.equal(speech.notify(sessionStart).spoken, true);
 });
 
-test('consecutive fallbacks of the same kind avoid repeating the previous line', () => {
+test('dispose clears the tool-class memory', () => {
   const h = harness();
-  h.setReply({ err: new Error('nope'), stdout: '' });
-  h.speech.notify(permission);
-  h.advance(INTERRUPT_FLOOR_MS);
-  h.speech.notify({ ...permission, sessionId: 's5' });
-  assert.equal(h.lines.length, 2);
-  assert.notEqual(h.lines[0].text, h.lines[1].text);
-});
-
-test('fallbackFor is deterministic with an injected random and defaults to idle', () => {
-  assert.equal(fallbackFor('waiting', { random: () => 0 }), FALLBACK_LINES.waiting[0]);
-  assert.equal(fallbackFor('waiting', { random: () => 0.99 }), FALLBACK_LINES.waiting.at(-1));
-  assert.ok(FALLBACK_LINES.idle.includes(fallbackFor('nonsense-kind', { random: () => 0 })));
-});
-
-// ---------------------------------------------------------------- mute
-
-test('muted: no exec calls at all and no lines', () => {
-  let muted = true;
-  const h = harness({ muted: () => muted });
-  assert.equal(h.speech.notify(sessionStart).reason, 'muted');
-  assert.equal(h.calls.length, 0);
-  assert.equal(h.lines.length, 0);
-  assert.equal(h.speech.stats().pendingKind, null);
-
-  muted = false;
-  h.speech.notify(stop);
-  assert.equal(h.calls.length, 1);
-});
-
-// ---------------------------------------------------------------- line hygiene
-
-test('cleanLine strips quotes, prefixes and extra lines and clamps to 90 chars', () => {
-  assert.equal(cleanLine('"All finished. Well done."'), 'All finished. Well done.');
-  assert.equal(cleanLine('Ganyu: I will take note of that.'), 'I will take note of that.');
-  assert.equal(cleanLine('\n\n  First line.  \nSecond line.\n'), 'First line.');
-  assert.equal(cleanLine('`Done.`'), 'Done.');
-  assert.equal(cleanLine('a [note] in brackets'), 'a [note] in brackets');
-
-  const long = `${'word '.repeat(40)}end`;
-  const clamped = cleanLine(long);
-  assert.ok(clamped.length <= MAX_LINE_CHARS, `length ${clamped.length}`);
-  assert.ok(clamped.endsWith('…'));
-  assert.equal(cleanLine(null), '');
-});
-
-test('long CLI output is clamped before reaching onLine', () => {
-  const h = harness();
-  h.setReply({ err: null, stdout: 'x'.repeat(300) });
-  h.speech.notify(sessionStart);
-  assert.ok(h.lines[0].text.length <= MAX_LINE_CHARS);
-  assert.equal(h.lines[0].fallback, false);
+  h.speech.notify(editPre);
+  h.speech.dispose();
+  assert.equal(h.speech.notify(bashPre).reason, 'no-trigger', 'nothing left to compare the class against');
 });
 
 // ---------------------------------------------------------------- normalization helpers
@@ -523,15 +353,6 @@ test('modeForEvent mirrors the module B table', () => {
   assert.equal(modeForEvent('Whatever'), null);
 });
 
-test('hasErrorMarker only scans the response/message fields', () => {
-  assert.equal(hasErrorMarker({ tool_response: 'Error: exit code 1' }), true);
-  assert.equal(hasErrorMarker({ last_message: 'the build FAILED' }), true);
-  assert.equal(hasErrorMarker({ error: true }), true);
-  assert.equal(hasErrorMarker({ tool_input: { command: 'grep error src' } }), false);
-  assert.equal(hasErrorMarker({ tool_response: 'all good' }), false);
-  assert.equal(hasErrorMarker(null), false);
-});
-
 test('projectName takes the last segment of either path style', () => {
   assert.equal(projectName('C:\\Users\\kw11l\\Desktop\\ganyu-pet'), 'ganyu-pet');
   assert.equal(projectName('/home/x/ganyu-pet/'), 'ganyu-pet');
@@ -548,64 +369,56 @@ test('toolNameOf accepts the string and object spellings', () => {
 
 // ------------------------------------------------- cross-module integration (B -> A -> D)
 //
-// The trigger-rule tests above hand-feed `toolName`/`mode`/`errorish`. Module B
-// emits `tool`/`failed` instead and module A forwards its normalized event with
-// no `payload`, so those tests can all pass while the wired app speaks only 3 of
-// the 5 contract-mandated triggers. This drives the real seam: raw hook payload
-// -> state.ingest -> state.onEvent -> toSpeechDetail -> speech.onEvent.
+// The trigger tests above hand-feed `toolName`/`mode`/`failed`. Module B emits
+// `tool`/`failed` and module A forwards its normalized event with no `payload`,
+// so those tests can all pass while the wired app speaks only some of the five
+// triggers. This drives the real seam: raw hook payload -> state.ingest ->
+// state.onEvent -> toSpeechDetail -> speech.onEvent.
 
-test('all five chatty triggers fire through the real B -> A -> D seam', () => {
+test('all five triggers fire through the real B -> A -> D seam', () => {
   const h = harness();
   const state = createState({ clock: { now: () => h.now() } });
   state.onEvent((event, aggregate) => h.speech.onEvent(toSpeechDetail(event, aggregate), aggregate));
 
-  const cwd = 'C:\\Users\\kw11l\\Desktop\\ganyu-pet';
-  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'SessionStart' });
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'SessionStart' });
 
-  h.advance(COOLDOWN_MS);
-  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'PreToolUse', tool_name: 'Edit' });
-  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'PreToolUse', tool_name: 'Bash' });
+  h.advance(THROTTLE_MS);
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PreToolUse', tool_name: 'Edit' });
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PreToolUse', tool_name: 'Bash' });
 
-  h.advance(INTERRUPT_FLOOR_MS);
-  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'Notification', tool_name: 'Bash' });
-
-  h.advance(INTERRUPT_FLOOR_MS);
+  // Both interrupts land inside the throttle window on purpose.
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'Notification', tool_name: 'Bash' });
   state.ingest('claude', {
-    session_id: 's1', cwd, hook_event_name: 'PostToolUse', tool_name: 'Bash',
-    tool_response: 'Error: exit code 1',
+    session_id: 's1', cwd: CWD, hook_event_name: 'PostToolUse', tool_name: 'Bash',
+    tool_response: { is_error: true },
   });
 
-  h.advance(COOLDOWN_MS);
-  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'Stop' });
+  h.advance(THROTTLE_MS);
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'Stop' });
 
-  assert.deepEqual(
-    h.lines.map((l) => l.kind),
-    ['greeting', 'busy', 'waiting', 'failed', 'celebrate'],
-  );
-  assert.equal(h.calls.length, 5);
+  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'busy', 'waiting', 'failed', 'celebrate']);
+  assert.deepEqual(h.lines.map((l) => l.text), [
+    'Session started in ganyu-pet.',
+    'Running Bash…',
+    'Bash needs your approval.',
+    "Error in Bash. I've noted it.",
+    'Finished in ganyu-pet.',
+  ]);
 });
 
-test('the tool name reaches {summary} through the real seam', () => {
+test('free-text "error" in a tool response no longer makes her kneel (regression)', () => {
   const h = harness();
   const state = createState({ clock: { now: () => h.now() } });
   state.onEvent((event, aggregate) => h.speech.onEvent(toSpeechDetail(event, aggregate), aggregate));
 
-  const cwd = 'C:\\Users\\kw11l\\Desktop\\ganyu-pet';
-  state.ingest('claude', { session_id: 's1', cwd, hook_event_name: 'Notification', tool_name: 'Bash' });
-
-  // contracts.md §Speech gives this summary verbatim.
-  assert.equal(
-    h.calls[0].args[1],
-    buildPrompt({ user: 'Isaac', summary: 'Claude Code is waiting for permission to run Bash' }),
-  );
-
-  h.advance(INTERRUPT_FLOOR_MS);
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PreToolUse', tool_name: 'Read' });
   state.ingest('claude', {
-    session_id: 's1', cwd, hook_event_name: 'PostToolUse', tool_name: 'Bash',
-    tool_response: 'Error: exit code 1',
+    session_id: 's1', cwd: CWD, hook_event_name: 'PostToolUse', tool_name: 'Bash',
+    tool_input: { command: 'rg -n error src' },
+    tool_response: 'npm ERR! the build failed\nTraceback (most recent call last):',
   });
-  assert.equal(
-    h.calls[1].args[1],
-    buildPrompt({ user: 'Isaac', summary: 'Claude Code hit an error running Bash in ganyu-pet' }),
-  );
+
+  assert.equal(state.aggregate().mode, 'busy', 'the aggregate never enters failed');
+  assert.deepEqual(h.lines.map((l) => l.kind), ['busy'], 'read -> shell is a class change, not a failure');
+  assert.equal(h.speech.stats().lastMode, 'busy');
 });

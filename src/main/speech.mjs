@@ -1,53 +1,16 @@
-// Module D — speech: decides when Ganyu talks, asks the claude CLI for a line,
-// falls back to canned persona lines. No Electron import; every side effect is injectable.
+// Module D — speech: decides when Ganyu says something and turns the hook event
+// into a deterministic status line from the persona MESSAGES table.
+//
+// There is no LLM here any more. The bubble is a status indicator: it has to
+// appear the instant the event lands and read the same way every time, which a
+// ~4s CLI round-trip (and its canned-fallback path) could not do.
+// No Electron import; every side effect is injectable.
 
-import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
-import path from 'node:path';
+import { buildSummary, messageFor } from './persona.mjs';
 
-import {
-  MAX_LINE_CHARS,
-  buildPrompt,
-  buildSummary,
-  defaultUser,
-  fallbackFor,
-} from './persona.mjs';
-
-export const COOLDOWN_MS = 45_000;
-export const INTERRUPT_FLOOR_MS = 15_000;
-// Measured claude-CLI latency on this machine is 23–57s; 15s starved every
-// live call, so every line came out canned (verify round 1, 2026-07-30).
-export const EXEC_TIMEOUT_MS = 60_000;
+/** Minimum gap between lines. `waiting` / `failed` ignore it — they are the point. */
+export const THROTTLE_MS = 6_000;
 export const INTERRUPT_KINDS = new Set(['waiting', 'failed']);
-
-/** argv for the CLI, per contracts.md §Speech. */
-export const claudeArgs = (prompt) => ['-p', prompt, '--model', 'haiku'];
-
-/**
- * Environment overrides for the CLI child. Without them `claude -p` re-runs this
- * machine's whole configuration for every one-line quip — SessionStart /
- * UserPromptSubmit hooks (which shell out to git), CLAUDE.md, skills, plugin
- * sync — and answers with extended thinking, which blows the 15s budget
- * contracts.md fixes and makes every line a canned fallback.
- *
- * Measured on this machine (claude 2.1.220, `--model haiku`, stdin closed, the
- * real built prompt), wall clock to a returned line:
- *   nothing set ................................. 43.2s (verifier saw 34/46/57s)
- *   MAX_THINKING_TOKENS=0 only .................. 26.1s, 25.3s
- *   all three below ............................. 4.2s, 3.9s, 4.6s (3/3 real lines)
- *
- * Safe mode also stops the pet from firing the user's hooks as a side effect of
- * chatting, and keeps CLAUDE.md's output style out of Ganyu's voice. Auth is
- * unaffected (it is not `--bare`), which matters: this machine has no API key.
- */
-export const CLI_ENV = Object.freeze({
-  CLAUDE_CODE_SAFE_MODE: '1',
-  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-  MAX_THINKING_TOKENS: '0',
-});
-
-export const cliEnv = (env = process.env) => ({ ...env, ...CLI_ENV });
 
 const BUSY_EVENTS = new Set([
   'PreToolUse',
@@ -86,29 +49,6 @@ export function modeForEvent(event, errorish = false) {
   return null;
 }
 
-const ERROR_FIELDS = ['tool_response', 'toolResponse', 'last_message', 'lastMessage', 'message', 'result', 'error', 'stderr'];
-const ERROR_MARKER = /(^|[^a-z])(error|failed|failure)([^a-z]|$)/i;
-
-export function hasErrorMarker(payload) {
-  if (!payload || typeof payload !== 'object') return false;
-  for (const key of ERROR_FIELDS) {
-    const v = payload[key];
-    if (v == null) continue;
-    if (typeof v === 'boolean') {
-      if (v && (key === 'error' || key === 'failed')) return true;
-      continue;
-    }
-    let s;
-    try {
-      s = typeof v === 'string' ? v : JSON.stringify(v);
-    } catch {
-      s = String(v);
-    }
-    if (s && ERROR_MARKER.test(s)) return true;
-  }
-  return false;
-}
-
 /** A tool name may arrive as a string or as an object ({name} / {tool_name}). */
 export function toolNameOf(value) {
   if (value == null) return null;
@@ -127,82 +67,28 @@ export function projectName(p) {
   return parts.length ? parts[parts.length - 1] : null;
 }
 
-/** Trim CLI noise down to one displayable line of at most `max` characters. */
-export function cleanLine(raw, max = MAX_LINE_CHARS) {
-  if (raw == null) return '';
-  let s = String(raw).replace(/\u001B\[[0-9;?]*[A-Za-z]/g, '');
-  s = s.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) || '';
-  s = s.replace(/^(?:ganyu|line|response|output)\s*[:：]\s*/i, '');
-  s = s.replace(/^[\s`"'*_“‘]+/, '').replace(/[\s`"'*_”’]+$/, '');
-  s = s.replace(/\s+/g, ' ').trim();
-  if (s.length > max) {
-    const cut = s.slice(0, max - 1);
-    const sp = cut.lastIndexOf(' ');
-    const head = sp > Math.floor(max * 0.6) ? cut.slice(0, sp) : cut;
-    s = `${head.replace(/[\s,.;:!?\-–—]+$/, '')}…`;
-  }
-  return s;
-}
-
-/** GANYU_CLAUDE_BIN > %USERPROFILE%\.local\bin\claude(.exe). */
-export function resolveClaudeBin(env = process.env) {
-  if (env.GANYU_CLAUDE_BIN) return env.GANYU_CLAUDE_BIN;
-  const home = env.USERPROFILE || env.HOME || homedir();
-  const base = path.join(home, '.local', 'bin', 'claude');
-  const exe = `${base}.exe`;
-  try {
-    if (existsSync(exe)) return exe;
-  } catch {
-    /* fall through to the extensionless path */
-  }
-  return base;
-}
-
-function defaultSchedule(fn, ms) {
-  const t = setTimeout(fn, ms);
-  if (typeof t.unref === 'function') t.unref();
-  return () => clearTimeout(t);
-}
-
 /**
- * createSpeech({exec, clock, onLine, isMuted, ...})
+ * createSpeech({clock, onLine, isMuted, random})
  *
- * exec     — execFile-shaped: exec(file, args, options, cb(err, stdout, stderr)). Default: node execFile.
  * clock    — {now()} or a () => ms function.
- * onLine   — called with {text, kind, mode, source, fallback}; `text` matches the ganyu:speak payload.
- * isMuted  — () => bool. Muted means no exec calls at all.
- *
- * Optional (defaults are production-safe): user, random, schedule, bin, args, env,
- * timeoutMs, cooldownMs, interruptFloorMs, onError.
+ * onLine   — called synchronously with {text, kind, mode, source, summary};
+ *            `text` matches the ganyu:speak payload.
+ * isMuted  — () => bool. Muted means no line at all.
+ * random   — injectable for deterministic variant choice in tests.
  */
 export function createSpeech({
-  exec = execFile,
   clock = { now: () => Date.now() },
   onLine = () => {},
   isMuted = () => false,
-  user = defaultUser(),
   random = Math.random,
-  schedule = defaultSchedule,
-  bin = resolveClaudeBin(),
-  args = claudeArgs,
-  env = cliEnv(),
-  timeoutMs = EXEC_TIMEOUT_MS,
-  cooldownMs = COOLDOWN_MS,
-  interruptFloorMs = INTERRUPT_FLOOR_MS,
-  onError = () => {},
 } = {}) {
   const now = () => (typeof clock === 'function' ? clock() : clock.now());
   const muted = () => (typeof isMuted === 'function' ? Boolean(isMuted()) : Boolean(isMuted));
 
   let lastSpokeAt = null;
   let lastMode = null;
-  let inFlight = false;
-  let pending = null; // queue depth 1 — newest trigger replaces the previous one
-  let cancelWake = null;
   const toolClasses = new Map(); // sessionId -> last tool class
-  const lastLines = new Map(); // kind -> last canned line used
-
-  const floorFor = (kind) => (INTERRUPT_KINDS.has(kind) ? interruptFloorMs : cooldownMs);
+  const lastLines = new Map(); // kind -> last line used, so variants alternate
 
   function rememberClass(sessionId, cls) {
     toolClasses.delete(sessionId);
@@ -219,18 +105,21 @@ export function createSpeech({
     // `tool` and `failed` are module B's spellings (state.mjs normalizeEvent) and
     // module A forwards B's normalized event verbatim, with no `payload`. Reading
     // only `toolName`/`errorish` left toolName null in production, so the busy
-    // trigger could never fire and {summary} never carried a tool name.
+    // trigger could never fire and the line never carried a tool name.
     const toolName = toolNameOf(input.toolName ?? input.tool ?? p.tool_name ?? p.toolName ?? p.tool);
     const project =
       input.project ?? projectName(input.cwd ?? p.cwd ?? p.project_dir ?? p.workspace ?? null);
-    const errorish = Boolean(input.errorish ?? input.failed ?? hasErrorMarker(p));
+    // Whether something failed is module B's call (state.mjs hasErrorMarker), and
+    // speech trusts it. Speech used to re-derive it by scanning payload text,
+    // which flagged 36 of 42 live events as failures.
+    const errorish = Boolean(input.errorish ?? input.failed);
     // An errorish event is `failed` whatever its event name says: a PostToolUse
     // carrying an error arrives with mode 'busy', which would otherwise shadow it.
     const mode = errorish ? 'failed' : (input.mode ?? modeForEvent(event, errorish));
     return { source, event, sessionId, toolName, project, errorish, mode };
   }
 
-  /** Chatty-mode trigger rules. Also updates mode / tool-class tracking. */
+  /** Trigger rules. Also updates mode / tool-class tracking. */
   function decideTrigger(ev) {
     const prevMode = lastMode;
     if (ev.mode) lastMode = ev.mode;
@@ -251,152 +140,50 @@ export function createSpeech({
     return null;
   }
 
-  /** `schedule` may hand back a function, or an object with .cancel()/.clear(). */
-  function toCancel(handle) {
-    if (typeof handle === 'function') return handle;
-    if (handle && typeof handle.cancel === 'function') return () => handle.cancel();
-    if (handle && typeof handle.clear === 'function') return () => handle.clear();
-    return () => {};
-  }
-
-  function armWake(delayMs) {
-    if (cancelWake) cancelWake();
-    cancelWake = toCancel(schedule(wake, Math.max(0, delayMs)));
-  }
-
-  function wake() {
-    if (cancelWake) cancelWake();
-    cancelWake = null;
-    if (!pending) return;
-    if (muted()) {
-      pending = null;
-      return;
-    }
-    if (inFlight) return; // the in-flight completion flushes the queue
-    const t = now();
-    const wait = waitFor(pending.kind, t);
-    if (wait > 0) {
-      armWake(wait);
-      return;
-    }
-    const trigger = pending;
-    pending = null;
-    dispatch(trigger, t);
-  }
-
   function waitFor(kind, t) {
-    if (lastSpokeAt === null) return 0;
-    return Math.max(0, floorFor(kind) - (t - lastSpokeAt));
+    if (lastSpokeAt === null || INTERRUPT_KINDS.has(kind)) return 0;
+    return Math.max(0, THROTTLE_MS - (t - lastSpokeAt));
   }
 
-  function flushPending() {
-    if (!pending) return;
-    const t = now();
-    const wait = waitFor(pending.kind, t);
-    if (wait > 0) armWake(wait);
-    else wake();
-  }
-
-  function emit(text, trigger, fallback) {
-    if (!text) return null;
-    if (muted()) return null; // mute flipped while the CLI was running
-    const line = { text, kind: trigger.kind, mode: trigger.ev.mode ?? null, source: trigger.ev.source, fallback };
+  function emit(line) {
     try {
       onLine(line);
-    } catch (err) {
-      try {
-        onError(err);
-      } catch {
-        /* never let a listener break the pet */
-      }
+    } catch {
+      /* never let a listener break the pet */
     }
-    return line;
-  }
-
-  function cannedLine(kind) {
-    const line = fallbackFor(kind, { random, avoid: lastLines.get(kind) ?? null });
-    lastLines.set(kind, line);
-    return line;
-  }
-
-  function dispatch(trigger, t) {
-    const summary = buildSummary(trigger.ev);
-    const prompt = buildPrompt({ user, summary });
-    const argv = args(prompt);
-    const options = {
-      timeout: timeoutMs,
-      killSignal: 'SIGKILL',
-      windowsHide: true,
-      encoding: 'utf8',
-      maxBuffer: 1024 * 1024,
-      env, // see CLI_ENV: the 15s budget is unreachable without it
-    };
-
-    lastSpokeAt = t; // reserve the slot up front: one CLI call in flight, cooldown starts now
-    inFlight = true;
-
-    let emitted = null;
-    let settled = false;
-    const done = (err, stdout) => {
-      if (settled) return;
-      settled = true;
-      inFlight = false;
-      const text = cleanLine(stdout);
-      emitted = err || !text ? emit(cannedLine(trigger.kind), trigger, true) : emit(text, trigger, false);
-      flushPending();
-    };
-
-    try {
-      const child = exec(bin, argv, options, done);
-      // `claude -p` reads stdin for extra context and waits ~3s before giving up
-      // ("Warning: no stdin data received in 3s"). execFile leaves the child's
-      // stdin pipe open, so that 3s would be spent on every call. Closing it is
-      // worth ~3s of the ~4s total; it is NOT sufficient on its own — an earlier
-      // note here claimed 13.1s with the pipe closed and that did not reproduce
-      // (34-57s). CLI_ENV is what brings the call inside the 15s budget.
-      // Test doubles return undefined here.
-      child?.stdin?.end?.();
-    } catch (err) {
-      done(err, '');
-    }
-
-    return {
-      dispatched: true,
-      reason: 'dispatched',
-      kind: trigger.kind,
-      summary,
-      prompt,
-      args: argv,
-      spoken: Boolean(emitted),
-      text: emitted ? emitted.text : null,
-      fallback: emitted ? emitted.fallback : null,
-    };
   }
 
   /**
    * Feed one normalized-or-raw event. Returns a descriptor:
-   * {dispatched, reason: 'no-trigger'|'muted'|'cooldown'|'in-flight'|'dispatched', kind, ...}
+   * {spoken, reason: 'no-trigger'|'muted'|'throttled'|'spoken', kind, ...}
    */
   function notify(input = {}) {
     const ev = normalizeEvent(input);
     const kind = decideTrigger(ev);
-    if (!kind) return { dispatched: false, spoken: false, reason: 'no-trigger', kind: null };
-    if (muted()) return { dispatched: false, spoken: false, reason: 'muted', kind };
+    if (!kind) return { spoken: false, reason: 'no-trigger', kind: null };
+    if (muted()) return { spoken: false, reason: 'muted', kind };
 
-    const trigger = { kind, ev };
     const t = now();
     const wait = waitFor(kind, t);
     if (wait > 0) {
-      pending = trigger;
-      armWake(wait);
-      return { dispatched: false, spoken: false, reason: 'cooldown', kind, retryInMs: wait };
+      // Dropped, not queued: a status line is only useful while it is still
+      // true, and a queued one would narrate work that ended six seconds ago.
+      return { spoken: false, reason: 'throttled', kind, retryInMs: wait };
     }
-    if (inFlight) {
-      pending = trigger;
-      return { dispatched: false, spoken: false, reason: 'in-flight', kind };
-    }
-    pending = null;
-    return dispatch(trigger, t);
+
+    const summary = buildSummary(ev);
+    const text = messageFor(kind, {
+      tool: ev.toolName,
+      project: ev.project,
+      random,
+      avoid: lastLines.get(kind) ?? null,
+    });
+    if (!text) return { spoken: false, reason: 'no-line', kind, summary };
+
+    lastLines.set(kind, text);
+    lastSpokeAt = t;
+    emit({ text, kind, mode: ev.mode ?? null, source: ev.source, summary });
+    return { spoken: true, reason: 'spoken', kind, text, summary };
   }
 
   return {
@@ -413,18 +200,9 @@ export function createSpeech({
     },
     /** Introspection for tests and debugging. */
     stats() {
-      return {
-        lastSpokeAt,
-        lastMode,
-        inFlight,
-        pendingKind: pending ? pending.kind : null,
-        wakeArmed: Boolean(cancelWake),
-      };
+      return { lastSpokeAt, lastMode };
     },
     dispose() {
-      if (cancelWake) cancelWake();
-      cancelWake = null;
-      pending = null;
       toolClasses.clear();
       lastLines.clear();
     },

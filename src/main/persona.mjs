@@ -1,27 +1,8 @@
-// Module D — persona: prompt template, event → summary phrasing, canned fallbacks.
-// Pure data + pure functions. No I/O beyond reading process.env for the default user name.
+// Module D — persona: event → human phrase, plus the deterministic status-line
+// table the bubble draws from. Pure data + pure functions, no I/O.
 
-export const MAX_LINE_CHARS = 90;
-
-/** Exact template from contracts.md §Speech. `{user}` and `{summary}` are the only slots. */
-export const PROMPT_TEMPLATE =
-  "You are Ganyu from Genshin Impact, working as {user}'s diligent secretary. " +
-  'React to this coding-agent event in ONE short line (max 90 chars), gentle and dutiful, ' +
-  'in English, at most one emoji, occasionally hinting you could use a nap. ' +
-  'Address them by name only, never with an honorific (no Mr., Miss, or Sir). ' +
-  'Event: {summary}. Reply with ONLY the line.';
-
-/** Owner's preferred name (2026-07-30). GANYU_USER overrides. */
-export function defaultUser(env = process.env) {
-  return env.GANYU_USER || 'Kahweng';
-}
-
-/** Literal slot substitution — replacement text is never treated as a regex/`$&` pattern. */
-export function buildPrompt({ user, summary } = {}) {
-  const u = String(user ?? defaultUser());
-  const s = String(summary ?? 'an unspecified event');
-  return PROMPT_TEMPLATE.replace('{user}', () => u).replace('{summary}', () => s);
-}
+/** Rendered lines are clamped to this. Every MESSAGES variant is well under it. */
+export const MAX_LINE_CHARS = 70;
 
 const SOURCE_LABELS = { codex: 'codex', claude: 'Claude Code', 'claude-code': 'Claude Code' };
 
@@ -31,7 +12,8 @@ export function sourceLabel(source) {
 }
 
 /**
- * Compact human phrase for the prompt's `{summary}` slot.
+ * Compact human phrase for the event — used for the debug log and the `summary`
+ * field on the emitted line, not for the bubble text itself.
  * ev: {source, event, toolName, project, mode, errorish}
  * Matches the two examples in contracts.md verbatim:
  *   {source:'codex',  event:'Stop',         project:'ganyu-pet'} -> "codex finished a task in ganyu-pet"
@@ -83,75 +65,84 @@ export function buildSummary(ev = {}) {
 }
 
 /**
- * Canned lines used when the CLI call fails, times out, or returns nothing.
- * Keyed by speech kind: greeting | busy | waiting | failed | celebrate | idle.
- * >= 6 lines per key, each <= 90 chars, at most one emoji.
+ * Status lines, keyed by speech kind. Each variant says what just happened, in
+ * Ganyu's gentle-secretary register. `{tool}` and `{project}` are the only slots.
+ *
+ * House rules, all enforced by test/speech.test.mjs:
+ *   3-5 variants per kind · <= MAX_LINE_CHARS · at most one emoji · no honorific
+ *   · at least one variant per kind needs no slot, so an event with no tool or
+ *     project name still gets a natural line instead of a literal "{tool}".
  */
-export const FALLBACK_LINES = Object.freeze({
+export const MESSAGES = Object.freeze({
   greeting: Object.freeze([
-    'Good day. Ganyu reporting for duty — the ledger is open.',
-    "I've tidied the desk and brewed the tea. Shall we begin?",
-    "Reporting in. I'll keep the records while you work.",
-    "A new session, then. I'll stay close by.",
-    "Ready when you are. I've set out today's notes.",
-    'Ganyu, at your service. Steady progress today, I hope.',
-    'Welcome back. Shall I take minutes of this one? 📖',
+    'Session started in {project}.',
+    'A new session in {project}. I have the notes ready.',
+    "Reporting in. I'll keep the records.",
+    'Session started. Ganyu at your service. 📖',
   ]),
   busy: Object.freeze([
-    "Switching tools already? I'll update the paperwork.",
-    "Noted — I'll log this step in the ledger.",
-    "Diligent as ever. I'm keeping the notes tidy.",
-    "A new task in hand. I'll track it for you.",
-    "Steady work is best. I'm keeping count.",
-    "I'll file this alongside the rest. Do carry on.",
-    'Mm, busy work. Perhaps a short nap after this? 🌙',
+    'Running {tool}…',
+    '{tool} is underway.',
+    'Working with {tool} in {project}.',
+    'Moving on to the next step.',
   ]),
   waiting: Object.freeze([
-    'There is a request awaiting your approval. 🙏',
-    'Pardon me — this one needs your permission first.',
-    'Everything is paused until you say the word.',
-    'A small decision is waiting on your desk.',
-    "I'll hold here until you approve it.",
-    'One signature needed, then we continue.',
-    "Awaiting your word. I'll keep the seat warm.",
+    '{tool} needs your approval.',
+    'Waiting on your approval for {tool}. 🙏',
+    'Paused — a permission request needs you.',
+    'One approval needed, then we continue.',
   ]),
   failed: Object.freeze([
-    "It didn't go through. Shall we look again together?",
-    "An error, I'm afraid. Nothing we cannot sort out.",
-    "That step failed. I've noted where it stopped.",
-    'Setbacks happen. Take a breath, then retry. 🍃',
-    'Something went wrong — I kept the details for you.',
-    "Not our finest attempt. Let's try once more.",
-    "I've marked the error in the margin for later.",
+    "Error in {tool}. I've noted it.",
+    '{tool} failed. I kept the details.',
+    'Something failed in {project}.',
+    'That step failed. I marked where it stopped.',
   ]),
   celebrate: Object.freeze([
-    'All finished. Well done — the ledger balances. ✨',
+    'Finished in {project}.',
+    'All done in {project}. ✨',
     "Task complete. I'll file the report.",
-    'Done and dusted. Perhaps a nap now? 🌙',
-    "That's settled. Lovely work.",
-    "Finished. I'll tidy up the notes.",
-    "Complete. Rest a moment; you've earned it.",
-    'Another one closed. I do enjoy a neat record.',
-  ]),
-  idle: Object.freeze([
-    "All quiet. I'll keep watch.",
-    'Nothing pending. I might close my eyes a moment. 🌙',
-    'The desk is clear. Call me when needed.',
-    "Idle hands... though I don't mind the quiet.",
-    "I'll tidy the archives while we wait.",
-    "Peaceful, isn't it? I'll stay nearby.",
+    'Finished. Nothing else is pending.',
   ]),
 });
 
+const SLOTS = ['tool', 'project'];
+
+const slotToken = (slot) => `{${slot}}`;
+
+/** Literal substitution — the replacement is never read as a regex / `$&` pattern. */
+function fill(template, values) {
+  let out = template;
+  for (const slot of SLOTS) out = out.replaceAll(slotToken(slot), () => values[slot]);
+  return out;
+}
+
+/** One displayable line of at most `max` characters. */
+function clampLine(text, max = MAX_LINE_CHARS) {
+  const s = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (s.length <= max) return s;
+  const cut = s.slice(0, max - 1);
+  const sp = cut.lastIndexOf(' ');
+  const head = sp > Math.floor(max * 0.6) ? cut.slice(0, sp) : cut;
+  return `${head.replace(/[\s,.;:!?\-–—]+$/, '')}…`;
+}
+
 /**
- * Pick a canned line for `kind`. Deterministic when `random` is injected.
- * `avoid` (the previous line for this kind) is skipped when the table has room.
+ * Pick the status line for `kind`. Only variants whose slots are all known are
+ * eligible, so an unknown tool or project can never leak "{tool}" or "undefined"
+ * into the bubble. Deterministic when `random` is injected; `avoid` (the previous
+ * line for this kind) is skipped when the table has room.
  */
-export function fallbackFor(kind, { random = Math.random, avoid = null } = {}) {
-  const table = FALLBACK_LINES[kind] ?? FALLBACK_LINES.idle;
+export function messageFor(kind, { tool = null, project = null, random = Math.random, avoid = null } = {}) {
+  const table = MESSAGES[kind];
+  if (!table) return '';
+  const values = { tool: tool ? String(tool) : null, project: project ? String(project) : null };
+  const usable = table.filter((t) => SLOTS.every((s) => values[s] || !t.includes(slotToken(s))));
+  if (usable.length === 0) return '';
+
+  const render = (variant) => clampLine(fill(variant, values));
   const r = Number(random());
-  const base = Number.isFinite(r) ? Math.floor(Math.abs(r) * table.length) % table.length : 0;
-  let i = base;
-  if (table.length > 1 && table[i] === avoid) i = (i + 1) % table.length;
-  return table[i];
+  let i = Number.isFinite(r) ? Math.floor(Math.abs(r) * usable.length) % usable.length : 0;
+  if (usable.length > 1 && render(usable[i]) === avoid) i = (i + 1) % usable.length;
+  return render(usable[i]);
 }

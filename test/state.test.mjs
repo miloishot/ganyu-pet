@@ -65,25 +65,88 @@ test('modeForEvent: full mapping table from contracts.md', () => {
   assert.equal(normalizeEvent('codex', { event: 'session-start' }).mode, 'busy');
 });
 
-test('hasErrorMarker: explicit flags and text scan, no path false-positives', () => {
-  assert.equal(hasErrorMarker({ tool_response: { stderr: 'npm ERR! build failed', success: false } }), true);
-  assert.equal(hasErrorMarker({ tool_response: { stdout: 'Error: cannot find module' } }), true);
-  assert.equal(hasErrorMarker({ last_message: 'that FAILED unfortunately' }), true, 'case-insensitive');
-  assert.equal(hasErrorMarker({ error: 'ENOENT' }), true);
+test('hasErrorMarker: structured flags flag, at the top level and one level deep', () => {
   assert.equal(hasErrorMarker({ tool_response: { is_error: true } }), true);
+  assert.equal(hasErrorMarker({ tool_response: { success: false } }), true);
   assert.equal(hasErrorMarker({ exit_code: 2 }), true);
   assert.equal(hasErrorMarker({ status: 'failed' }), true);
+  assert.equal(hasErrorMarker({ error: 'boom' }), true);
 
-  assert.equal(hasErrorMarker({ error: null }), false);
-  assert.equal(hasErrorMarker({ tool_response: { is_error: false, success: true } }), false);
-  assert.equal(hasErrorMarker({ exit_code: 0 }), false);
-  assert.equal(hasErrorMarker(claudePayload()), false);
-  assert.equal(
-    hasErrorMarker(claudePayload({ cwd: 'C:\\repos\\error-handling', tool_input: { command: 'grep failed *.log' } })),
-    false,
-    'cwd / tool_input are never scanned',
-  );
-  assert.equal(hasErrorMarker(null), false);
+  assert.equal(hasErrorMarker({ isError: true }), true);
+  assert.equal(hasErrorMarker({ isErr: true }), true);
+  assert.equal(hasErrorMarker({ isFailure: true }), true);
+  assert.equal(hasErrorMarker({ failed: true }), true);
+  assert.equal(hasErrorMarker({ ok: false }), true);
+  assert.equal(hasErrorMarker({ state: '  ERRORED  ' }), true, 'trimmed and case-insensitive');
+  assert.equal(hasErrorMarker({ errors: ['tsc: 3 errors'] }), true);
+  assert.equal(hasErrorMarker({ failure: { code: 'E1' } }), true);
+  assert.equal(hasErrorMarker({ exitCode: 1 }), true);
+  assert.equal(hasErrorMarker({ tool_result: { exit_code: 127 } }), true, 'one level deep');
+  assert.equal(hasErrorMarker({ result: { status: 'fail' } }), true);
+  assert.equal(hasErrorMarker({ response: { errors: [{ msg: 'x' }] } }), true);
+});
+
+test('hasErrorMarker: empty, zero and benign structured fields do not flag', () => {
+  const benign = [
+    { error: '' },
+    { error: null },
+    { errors: [] },
+    { errors: {} },
+    { failure: '' },
+    { exit_code: 0 },
+    { exitCode: 0 },
+    { code: 'ENOENT' },
+    { code: 1 },
+    { status_code: 200 },
+    { failed: false },
+    { is_error: false },
+    { tool_response: { is_error: false, success: true } },
+    { status: 'completed' },
+    { state: 'running' },
+    { exit_code: '2' }, // only a numeric exit code is a signal
+    claudePayload(),
+    null,
+  ];
+  for (const payload of benign) {
+    assert.equal(hasErrorMarker(payload), false, JSON.stringify(payload));
+  }
+});
+
+// The "why does she keep kneeling" bug. Measured on the running app 2026-07-30:
+// the old free-text scan flagged 36 of 42 ingested events as failures, and
+// `failed` is sticky for 30s and draws the kneeling sprite row.
+test('hasErrorMarker: free text is never a failure signal (regression)', () => {
+  const textish = [
+    { tool_response: 'Error: cannot find module' },
+    { tool_response: { stdout: 'npm ERR! the build failed' } },
+    { stdout: 'Traceback (most recent call last):' },
+    { stderr: 'warning: 3 errors ignored' },
+    { last_message: 'that FAILED unfortunately' },
+    { message: 'no exception was raised' },
+    { output: 'error handling looks fine' },
+    { result: 'finished, no failure' },
+    { tool_input: { command: 'Get-Item x -ErrorAction SilentlyContinue' } },
+    claudePayload({ tool_input: { command: 'rg -n "error|failed" src' } }),
+    claudePayload({ cwd: 'C:\\repos\\error-handling', tool_input: { command: 'grep failed *.log' } }),
+  ];
+  for (const payload of textish) {
+    assert.equal(hasErrorMarker(payload), false, JSON.stringify(payload));
+  }
+
+  // Same payload, one structured flag added: now it is a failure.
+  assert.equal(hasErrorMarker({ tool_response: { stdout: 'npm ERR! the build failed', success: false } }), true);
+});
+
+test('a PostToolUse whose output only talks about errors stays busy (regression)', () => {
+  const clock = fakeClock();
+  const state = createState({ clock });
+  state.ingest('claude', claudePayload({
+    hook_event_name: 'PostToolUse',
+    tool_input: { command: 'npm test' },
+    tool_response: 'FAIL test/x.test.mjs\nError: expected 200, got 401\nTraceback:',
+  }));
+  assert.equal(state.aggregate().mode, 'busy');
+  assert.equal(normalizeEvent('claude', claudePayload({ tool_response: 'Error: nope' })).failed, false);
 });
 
 test('per-session modes: busy / waiting / idle+celebrate', () => {
@@ -138,7 +201,7 @@ test('failed is sticky for 30s then falls back to the underlying mode', () => {
 test('a failing Stop suppresses celebrate', () => {
   const clock = fakeClock();
   const state = createState({ clock });
-  state.ingest('claude', claudePayload({ hook_event_name: 'Stop', last_message: 'the build failed' }));
+  state.ingest('claude', claudePayload({ hook_event_name: 'Stop', error: 'the build failed' }));
   const snap = state.aggregate();
   assert.equal(snap.mode, 'failed');
   assert.equal(snap.celebrate, false);

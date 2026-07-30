@@ -24,15 +24,8 @@ const BUSY_EVENTS = new Set([
 const WAITING_EVENTS = new Set(['permissionrequest', 'notification']);
 const IDLE_EVENTS = new Set(['stop', 'sessionend']);
 
-/** Fields whose *values* are scanned for error/failure wording. */
-const ERROR_TEXT_FIELDS = [
-  'tool_response', 'toolResponse', 'tool_result', 'toolResult', 'result', 'response',
-  'output', 'stdout', 'stderr', 'error', 'errors', 'message', 'last_message', 'lastMessage',
-  'last_assistant_message', 'summary', 'reason', 'detail', 'details',
-];
 /** Objects inspected one level deep for explicit failure flags. */
 const ERROR_FLAG_CONTAINERS = ['tool_response', 'toolResponse', 'tool_result', 'toolResult', 'result', 'response'];
-const ERROR_TEXT_RE = /\b(error|errors|errored|failed|failing|failure|exception|traceback)\b/i;
 
 function normalizeClock(clock) {
   if (typeof clock === 'function') return () => Number(clock());
@@ -47,35 +40,40 @@ function isPresent(value) {
   return true;
 }
 
+/**
+ * One structured failure signal, by key. Every branch needs an explicit shape —
+ * a key on its own is never enough, or `{error: ''}` and `{exit_code: 0}` (both
+ * "no error") would flag.
+ */
 function isErrorFlag(key, value) {
   const k = canon(key);
-  if (k === 'error' || k === 'errors' || k === 'failed' || k === 'failure') return isPresent(value);
-  if (k === 'iserror' || k === 'isfailure' || k === 'iserr') return value === true;
+  // Present and non-empty: '' / null / [] / {} all mean "no error".
+  if (k === 'error' || k === 'errors' || k === 'failure') return isPresent(value);
+  if (k === 'failed' || k === 'iserror' || k === 'iserr' || k === 'isfailure') return value === true;
   if (k === 'success' || k === 'ok') return value === false;
-  if (k === 'exitcode' || k === 'returncode' || k === 'statuscode') {
-    return value != null && value !== '' && Number(value) !== 0;
-  }
+  // Numbers only, and never a generic `code` — `code: 'ENOENT'` and
+  // `status_code: 200` are routine non-error identifiers.
+  if (k === 'exitcode' || k === 'returncode') return typeof value === 'number' && value !== 0;
   if (k === 'status' || k === 'state' || k === 'outcome' || k === 'resultstatus') {
     return typeof value === 'string' && /^(error|errored|failed|failure|fail)$/i.test(value.trim());
   }
   return false;
 }
 
-/** Flatten values (not keys) to text, depth- and width-capped. */
-function textOf(value, depth = 0) {
-  if (value == null) return '';
-  const t = typeof value;
-  if (t === 'string') return value;
-  if (t === 'number' || t === 'boolean') return String(value);
-  if (t !== 'object' || depth >= 4) return '';
-  if (Array.isArray(value)) return value.slice(0, 25).map((v) => textOf(v, depth + 1)).join(' \n');
-  return Object.values(value).slice(0, 50).map((v) => textOf(v, depth + 1)).join(' \n');
-}
-
 /**
- * True when the payload carries an error/failure marker. Only the fields listed
- * above are inspected — scanning the whole payload would false-positive on
- * `cwd: "C:\\repos\\error-handling"` or a `tool_input` command mentioning errors.
+ * True only when the payload carries a *structured* failure signal — an explicit
+ * flag, at the top level or one level inside a response container.
+ *
+ * Free-text scanning used to live here too: the values of `output` / `stdout` /
+ * `stderr` / `message` / `last_message` / … were matched against
+ * /\b(error|failed|failure|exception|traceback)\b/i. Measured on the running app
+ * (2026-07-30) that flagged **36 of 42** ingested events as failures — a command
+ * carrying `-ErrorAction SilentlyContinue`, a grep for "error", or reading a
+ * source file that merely discusses errors all matched. `failed` is sticky for
+ * 30s and draws the kneeling sprite row, so the pet knelt permanently.
+ *
+ * Agent work talks about errors constantly, so the *wording* of a tool's output
+ * carries no signal. Only the flags below do.
  */
 export function hasErrorMarker(payload) {
   if (!payload || typeof payload !== 'object') return false;
@@ -88,10 +86,6 @@ export function hasErrorMarker(payload) {
     for (const [key, value] of Object.entries(container)) {
       if (isErrorFlag(key, value)) return true;
     }
-  }
-  for (const name of ERROR_TEXT_FIELDS) {
-    if (!(name in payload)) continue;
-    if (ERROR_TEXT_RE.test(textOf(payload[name]))) return true;
   }
   return false;
 }
