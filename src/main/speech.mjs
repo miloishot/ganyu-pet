@@ -11,15 +11,92 @@
 // throttle gate them identically.
 // No Electron import; every side effect is injectable.
 
-import { pickToolInput, projectFromCwd } from './context.mjs';
-import { buildSummary, messageFor } from './persona.mjs';
+import { RECENT_WINDOW_MS, basename, pickToolInput, projectFromCwd } from './context.mjs';
+import { buildSummary, createMentionMemory, messageFor } from './persona.mjs';
 
-/** Minimum gap between lines. `waiting` / `failed` ignore it — they are the point. */
+/**
+ * Floor between two lines of the *same* urgent kind. Urgent lines are otherwise
+ * immediate, but seven sessions hitting the same wall inside two seconds is one
+ * piece of news, not seven bubbles.
+ */
 export const THROTTLE_MS = 6_000;
+
+/**
+ * Gap required for every non-urgent line. Was 6s, which — with several agents
+ * emitting PreToolUse/PostToolUse continuously — meant a line about every tenth
+ * Read she happened to catch. Silence is what makes the remaining lines mean
+ * anything, so the cost of a line went up by 15x.
+ */
+export const QUIET_THROTTLE_MS = 90_000;
+
+/** After this much silence, the next thing worth a trigger is worth hearing. */
+export const QUIET_STRETCH_MS = 10 * 60 * 1000;
+
+/** At most one "I noticed a pattern" line per this long. */
+export const NOTABLE_INTERVAL_MS = 10 * 60 * 1000;
+
+/** How far back the pattern tallies look. Same window context.mjs summarises over. */
+export const PATTERN_WINDOW_MS = RECENT_WINDOW_MS;
+
+/** What counts as a pattern rather than ordinary work. */
+export const REPEAT_FILE_TIMES = 5;
+export const REPEAT_COMMAND_TIMES = 3;
+export const PROJECT_RUN_EVENTS = 25;
+export const SESSION_SURGE_COUNT = 4;
+
+/**
+ * Failures worth a line: the first, then only when the streak grows notably.
+ * Narrating every retry is how a sympathetic line becomes nagging.
+ */
+export const FAILURE_STREAK_STEPS = Object.freeze([1, 3, 5]);
 
 /** How many of her own lines she remembers, and is reminded of, at a time. */
 export const RECENT_LINES = 3;
 export const INTERRUPT_KINDS = new Set(['waiting', 'failed']);
+
+/** Kinds that are always worth a line: the moments the owner asked to always see. */
+export const ALWAYS_KINDS = new Set(['greeting', 'celebrate', 'recovered']);
+
+/** How long a line of each salience level must wait behind the previous one. */
+const THROTTLE_FOR = { urgent: 0, always: QUIET_THROTTLE_MS, notable: QUIET_THROTTLE_MS };
+
+const isNotableStreak = (n) => FAILURE_STREAK_STEPS.includes(n) || (n > 5 && n % 5 === 0);
+
+/**
+ * `salienceOf({kind, failStreak, quietForMs, sinceNotableMs, patterns})`
+ *   -> `{level: 'urgent'|'always'|'notable'|null, reason}`
+ *
+ * Whether this is worth interrupting him for. Pure: everything it reads is
+ * passed in, so a test names a situation directly instead of replaying twenty
+ * events to reach it. It lives here rather than in context.mjs because it is a
+ * decision about *speaking*, and context.mjs is deliberately a set of pure
+ * functions over module B's ring with no notion of what the pet has said.
+ *
+ * `patterns` is the list of notable things this event completed (see
+ * `trackPatterns`); an empty list is ordinary work, which is most of it.
+ */
+export function salienceOf({
+  kind = null,
+  failStreak = 0,
+  quietForMs = Infinity,
+  sinceNotableMs = Infinity,
+  patterns = [],
+} = {}) {
+  if (!kind) return { level: null, reason: 'no-trigger' };
+  if (kind === 'waiting') return { level: 'urgent', reason: 'waiting' };
+  if (kind === 'failed') {
+    if (!isNotableStreak(failStreak)) return { level: null, reason: 'repeat-failure' };
+    return { level: 'urgent', reason: failStreak <= 1 ? 'failure' : `failure-streak-${failStreak}` };
+  }
+  if (ALWAYS_KINDS.has(kind)) return { level: 'always', reason: kind };
+  // She has said nothing for ten minutes; the next real trigger is allowed
+  // through whatever it is, so a long working stretch is not total silence.
+  if (quietForMs >= QUIET_STRETCH_MS) return { level: 'always', reason: 'long-quiet' };
+  if (patterns.length > 0 && sinceNotableMs >= NOTABLE_INTERVAL_MS) {
+    return { level: 'notable', reason: patterns[0] };
+  }
+  return { level: null, reason: 'routine' };
+}
 
 const BUSY_EVENTS = new Set([
   'PreToolUse',
@@ -87,6 +164,9 @@ export const projectName = projectFromCwd;
  * random   — injectable for deterministic variant choice in tests.
  * brain    — optional {requestLine({detail, summary})} -> Promise<string|null>.
  *            Absent (the default) is the original synchronous behaviour, exactly.
+ * mentionMemory — the suppression state for the rate-limited briefing lines
+ *            (persona.createMentionMemory). Injectable so a test can start her
+ *            mid-evening, having already mentioned the hour.
  */
 export function createSpeech({
   clock = { now: () => Date.now() },
@@ -94,6 +174,7 @@ export function createSpeech({
   isMuted = () => false,
   random = Math.random,
   brain = null,
+  mentionMemory = createMentionMemory(),
 } = {}) {
   const now = () => (typeof clock === 'function' ? clock() : clock.now());
   const muted = () => (typeof isMuted === 'function' ? Boolean(isMuted()) : Boolean(isMuted));
@@ -101,9 +182,17 @@ export function createSpeech({
   const askBrain = typeof brain?.requestLine === 'function' ? brain : null;
 
   let lastSpokeAt = null;
+  let lastKind = null;
   let lastMode = null;
   let shownCount = 0; // bumped on every emitted line; a brain reply for an older one is stale
+  let failStreak = 0; // consecutive failures; only some of them are worth a line
+  let lastNotableAt = null; // when she last remarked on a pattern
   const toolClasses = new Map(); // sessionId -> last tool class
+  // What the last PATTERN_WINDOW_MS looked like, kept only as far as the four
+  // patterns below need: one small record per event, pruned by age. This is not
+  // a second copy of context.summarizeRecent — that reads module B's ring, which
+  // speech has no access to, and it is one event behind at the moment speech runs.
+  const trail = [];
   // The last few lines she actually said, newest first. One store serving two
   // readers: `avoid` keeps the canned table off the variant it just used, and the
   // brain is told the same lines so it does not paraphrase itself all evening.
@@ -122,6 +211,42 @@ export function createSpeech({
     toolClasses.delete(sessionId);
     toolClasses.set(sessionId, cls);
     if (toolClasses.size > 32) toolClasses.delete(toolClasses.keys().next().value);
+  }
+
+  const countIn = (key, value) => trail.reduce((n, e) => n + (e[key] === value ? 1 : 0), 0);
+
+  /**
+   * Record this event and report which patterns it completes, commonest phrasing
+   * first. These are the only things routine tool traffic is ever allowed to
+   * interrupt him for — and even then only once per NOTABLE_INTERVAL_MS.
+   */
+  function trackPatterns(ev, t) {
+    const input = ev.toolInput ?? {};
+    trail.push({
+      at: t,
+      file: basename(input.file_path ?? input.notebook_path ?? input.path),
+      command: input.command ?? null,
+      project: ev.project ?? null,
+      sessionId: ev.sessionId ?? null,
+    });
+    const cutoff = t - PATTERN_WINDOW_MS;
+    while (trail.length > 0 && trail[0].at < cutoff) trail.shift();
+    if (trail.length > 400) trail.splice(0, trail.length - 400);
+
+    const last = trail[trail.length - 1];
+    const patterns = [];
+    if (last.file && countIn('file', last.file) >= REPEAT_FILE_TIMES) patterns.push('repeat-file');
+    if (last.command && countIn('command', last.command) >= REPEAT_COMMAND_TIMES) {
+      patterns.push('repeat-command');
+    }
+    const sessions = new Set(trail.map((e) => e.sessionId).filter(Boolean));
+    if (sessions.size >= SESSION_SURGE_COUNT) patterns.push('many-sessions');
+    if (last.project) {
+      let run = 0;
+      for (let i = trail.length - 1; i >= 0 && trail[i].project === last.project; i -= 1) run += 1;
+      if (run >= PROJECT_RUN_EVENTS) patterns.push('project-run');
+    }
+    return patterns;
   }
 
   function normalizeEvent(input = {}) {
@@ -168,15 +293,29 @@ export function createSpeech({
     }
     if (ev.event === 'SessionStart') return 'greeting';
     if (IDLE_EVENTS.has(ev.event)) return 'celebrate';
+    // The first step that works after something broke. No tool-class change is
+    // required: that it ran at all is the news. Module B's event carries its own
+    // mode (`busy`), not the session's sticky `failed`, so this fires on the very
+    // next successful event rather than 30 seconds later.
+    if (prevMode === 'failed' && ev.mode === 'busy' && !ev.errorish) return 'recovered';
     if (ev.mode === 'busy' && cls !== 'none' && prevClass !== null && cls !== prevClass) {
       return 'busy';
     }
     return null;
   }
 
-  function waitFor(kind, t) {
-    if (lastSpokeAt === null || INTERRUPT_KINDS.has(kind)) return 0;
-    return Math.max(0, THROTTLE_MS - (t - lastSpokeAt));
+  /**
+   * How long this line must wait. Urgent kinds are immediate, except against
+   * another line of the same urgent kind; everything else waits out
+   * QUIET_THROTTLE_MS. The first line she ever says never waits.
+   */
+  function waitFor(level, kind, t) {
+    if (lastSpokeAt === null) return 0;
+    const elapsed = t - lastSpokeAt;
+    const gap = level === 'urgent'
+      ? (kind === lastKind ? THROTTLE_MS : 0)
+      : (THROTTLE_FOR[level] ?? QUIET_THROTTLE_MS);
+    return Math.max(0, gap - elapsed);
   }
 
   function emit(line) {
@@ -193,27 +332,41 @@ export function createSpeech({
    * is shown some seconds after its event: by then the owner may have muted her,
    * or a newer line may already own the bubble.
    */
-  function show(kind, text, ev, summary, fromTable = true) {
+  /**
+   * `replacing` is the brain upgrading a canned line already in the bubble, not
+   * a second line asking for attention: it must skip the throttle (the same-kind
+   * urgent floor would otherwise refuse every replacement, since the line it is
+   * replacing is by definition the same kind, six seconds ago at most). Mute and
+   * the staleness check still apply — `awaitBrain` has already proved nothing
+   * else took the bubble meanwhile.
+   */
+  function show(kind, text, ev, summary, { fromTable = true, level = 'always', replacing = false } = {}) {
     if (!text) return { spoken: false, reason: 'no-line', kind, summary };
     if (muted()) return { spoken: false, reason: 'muted', kind, summary };
 
     const t = now();
-    const wait = waitFor(kind, t);
+    const wait = replacing ? 0 : waitFor(level, kind, t);
     if (wait > 0) {
       // Dropped, not queued: a status line is only useful while it is still
-      // true, and a queued one would narrate work that ended six seconds ago.
+      // true, and a queued one would narrate work that ended minutes ago.
       return { spoken: false, reason: 'throttled', kind, retryInMs: wait, summary };
     }
 
     rememberLine(kind, text, fromTable);
     lastSpokeAt = t;
+    lastKind = kind;
     shownCount += 1;
     emit({ text, kind, mode: ev.mode ?? null, source: ev.source, summary });
     return { spoken: true, reason: 'spoken', kind, text, summary };
   }
 
-  /** What the brain is told about the event. Metadata only — see brain.mjs. */
-  function brainDetail(ev, kind) {
+  /**
+   * What the brain is told about the event. Metadata only — see brain.mjs.
+   * `narration` carries the mention-suppression state through to
+   * persona.buildBrainInput, which is the only place that can see both it and
+   * the context the decision reads.
+   */
+  function brainDetail(ev, kind, narration) {
     return {
       kind,
       event: ev.event,
@@ -224,6 +377,7 @@ export function createSpeech({
       toolInput: ev.toolInput ?? {},
       agentType: ev.agentType ?? null,
       recentLines: spokenLines(),
+      narration,
     };
   }
 
@@ -233,18 +387,18 @@ export function createSpeech({
    * line count at the moment the request was fired: if it has moved, another
    * event has taken the bubble since and this reply is about old news.
    */
-  async function awaitBrain({ kind, ev, summary, canned, seq, urgent }) {
+  async function awaitBrain({ kind, ev, summary, canned, seq, urgent, level, narration }) {
     let line = null;
     try {
-      line = await askBrain.requestLine({ detail: brainDetail(ev, kind), summary });
+      line = await askBrain.requestLine({ detail: brainDetail(ev, kind, narration), summary });
     } catch {
       line = null; // requestLine promises never to reject; belt and braces
     }
     if (shownCount !== seq) return { spoken: false, reason: 'stale', kind, summary };
-    if (line) return show(kind, line, ev, summary, false);
+    if (line) return show(kind, line, ev, summary, { fromTable: false, level, replacing: urgent });
     // Urgent kinds already showed their canned line; do not repeat it.
     if (urgent) return { spoken: false, reason: 'brain-empty', kind, summary };
-    return show(kind, canned, ev, summary);
+    return show(kind, canned, ev, summary, { level });
   }
 
   /**
@@ -256,12 +410,43 @@ export function createSpeech({
    */
   function notify(input = {}) {
     const ev = normalizeEvent(input);
+    const t = now();
     const kind = decideTrigger(ev);
+    // The streak is the event's, not the line's: a failure she stays quiet about
+    // still counts towards the third and fifth, which she does not.
+    if (kind === 'failed') failStreak += 1;
+    else if (ev.mode && ev.mode !== 'failed' && !ev.errorish) failStreak = 0;
+    const patterns = trackPatterns(ev, t);
+
     if (!kind) return { spoken: false, reason: 'no-trigger', kind: null };
     if (muted()) return { spoken: false, reason: 'muted', kind };
 
-    const wait = waitFor(kind, now());
+    const salience = salienceOf({
+      kind,
+      failStreak,
+      quietForMs: lastSpokeAt === null ? Infinity : t - lastSpokeAt,
+      sinceNotableMs: lastNotableAt === null ? Infinity : t - lastNotableAt,
+      patterns,
+    });
+    if (!salience.level) {
+      return { spoken: false, reason: 'not-salient', kind, salience: salience.reason };
+    }
+    const level = salience.level;
+
+    const wait = waitFor(level, kind, t);
     if (wait > 0) return { spoken: false, reason: 'throttled', kind, retryInMs: wait };
+
+    // Marked here rather than on the way out: a pattern she decided to remark on
+    // has been spent whether or not the brain ever answers about it.
+    if (level === 'notable') lastNotableAt = t;
+
+    // Captured before anything is shown — for an urgent kind the canned line
+    // lands first and would otherwise make every line look like a continuation.
+    const narration = {
+      memory: mentionMemory,
+      now: t,
+      firstLine: lastSpokeAt === null || t - lastSpokeAt >= QUIET_STRETCH_MS,
+    };
 
     const summary = buildSummary(ev);
     const canned = messageFor(kind, {
@@ -271,15 +456,15 @@ export function createSpeech({
       avoid: avoidFor(kind),
     });
 
-    if (!askBrain) return show(kind, canned, ev, summary);
+    if (!askBrain) return show(kind, canned, ev, summary, { level });
 
     // `waiting` and `failed` are the whole point of the pet: they show at once,
     // at the old latency, and a better line only replaces them if one arrives.
     // Everything else can afford to wait for the brain before showing anything,
     // which avoids a visible flip from canned to generated on every event.
     const urgent = INTERRUPT_KINDS.has(kind);
-    const first = urgent ? show(kind, canned, ev, summary) : null;
-    const pending = awaitBrain({ kind, ev, summary, canned, seq: shownCount, urgent });
+    const first = urgent ? show(kind, canned, ev, summary, { level }) : null;
+    const pending = awaitBrain({ kind, ev, summary, canned, seq: shownCount, urgent, level, narration });
     return urgent
       ? { ...first, pending }
       : { spoken: false, reason: 'brain-pending', kind, summary, pending };
@@ -299,11 +484,13 @@ export function createSpeech({
     },
     /** Introspection for tests and debugging. */
     stats() {
-      return { lastSpokeAt, lastMode };
+      return { lastSpokeAt, lastMode, lastKind, failStreak, lastNotableAt };
     },
     dispose() {
       toolClasses.clear();
       recentLines.length = 0;
+      trail.length = 0;
+      failStreak = 0;
     },
   };
 }

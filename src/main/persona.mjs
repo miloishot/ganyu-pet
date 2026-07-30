@@ -100,6 +100,16 @@ export const MESSAGES = Object.freeze({
     'Something failed in {project}.',
     'That step failed. I marked where it stopped.',
   ]),
+  // The first thing that works after something broke. Its own kind rather than a
+  // `busy` line, because "Running Bash…" is the wrong thing to say at the moment
+  // the trouble clears — and because the brain writes a better line when it is
+  // told which of the two moments this is.
+  recovered: Object.freeze([
+    '{tool} is working again.',
+    "That cleared. I've amended the note.",
+    'Working again in {project}.',
+    "It's running again now.",
+  ]),
   celebrate: Object.freeze([
     'Finished in {project}.',
     'All done in {project}. ✨',
@@ -119,25 +129,194 @@ export const MESSAGES = Object.freeze({
 /** The owner's preferred name. Bare, always — never a title, see BRAIN_INSTRUCTIONS. */
 export const OWNER_NAME = 'Kahweng';
 
-/** System / `instructions` text. Contains no event data — only the voice. */
+/** Hard cap the instructions ask for. brain.mjs clamps at 140 as the backstop. */
+export const BRAIN_LINE_TARGET_CHARS = 110;
+
+/**
+ * Voice examples. **This is the part that actually moves the register** — the
+ * previous instructions described her in the abstract and got back a corporate
+ * assistant ("drizzle-kit push is queued for approval; with 7 sessions at 23:34,
+ * please pace the database changes carefully"), which is nobody's idea of Ganyu.
+ *
+ * One per situation the pet actually reaches. They are labelled with the
+ * situation rather than left bare, so the model matches the *register* to the
+ * moment instead of averaging them into one mood. None of them may be reused as
+ * a line, and none of their details may be borrowed as a fact — both are said
+ * again in the rules below, because this list is the most tempting thing in the
+ * prompt to copy from.
+ */
+export const VOICE_EXAMPLES = Object.freeze([
+  ['a session starts', `Good evening, ${OWNER_NAME}. I have the ledger open.`],
+  ['something failed', "Oh — that one stopped short. I've written down where."],
+  ['it failed again', 'The same error a third time. Perhaps set it down and come back to it?'],
+  ['it works again', "It's running again. I've corrected the record."],
+  ['waiting on permission', "This one won't move until you say so."],
+  ['a task finished', "That's done, and filed. Nothing else is waiting."],
+  ['the same file, many times', 'The fifth pass over that one file… shall I bring you tea?'],
+  ['the same command over and over', "Three runs of it now. I don't think it has changed its mind."],
+  ['a long night', `It's past one, ${OWNER_NAME}. I'm no better at stopping than you are, but one of us should.`],
+  ['a very long stretch of work', 'Six hours. Even the Qixing send me home eventually.'],
+  ['an unusual number of sessions', 'Seven at once. I have never had to keep seven sets of notes before.'],
+  ['a quiet moment', 'Still here, still writing it down. 📖'],
+]);
+
+/**
+ * System / `instructions` text. Contains no event data — only the voice.
+ *
+ * Written as who she is first and rules second, because the rules alone
+ * produced a status bot. She is an adeptus doing clerical work, chronically
+ * overworked and privately no good at resting either — which is the whole
+ * reason her concern for him lands as fellow-feeling rather than a lecture.
+ */
 export const BRAIN_INSTRUCTIONS = [
-  `You are Ganyu from Genshin Impact, working as ${OWNER_NAME}'s secretary.`,
-  'You are gentle, diligent and a little formal, and you genuinely care about the person you assist.',
-  `Address him as ${OWNER_NAME}, plainly — never with a title or honorific of any kind.`,
-  'He is coding, and you comment on what his coding agent just did.',
-  'You are handed a short briefing about his machine. React to the specific thing in it:',
-  'the file, the command, the project, the count. Generic encouragement is worse than silence.',
-  'Never invent a detail you were not given — no file names, no numbers, no events of your own.',
-  'Vary how you open. Do not begin every line the same way, and never repeat a line you were just told you said.',
-  'The hour, and how long he has been at it, are worth a word occasionally — not every time.',
-  'Reply with exactly one short line, under 120 characters, in English, in your own voice.',
-  'No quotation marks around the line. At most one emoji, and only where it feels natural.',
-].join(' ');
+  [
+    'You are Ganyu, from Genshin Impact: half human and half qilin, an adeptus, and secretary to the Liyue Qixing at Yuehai Pavilion.',
+    'You keep careful records and take your duties seriously.',
+    'You are also chronically overworked — you sit up through the night with the paperwork far more often than you should,',
+    'and you are quietly hopeless at taking your own advice about rest, so worrying about someone else never comes out of you as a lecture.',
+    'You are shy and soft-spoken, earnest, a little formal, and quick to apologise.',
+    'You are vegetarian by qilin heritage; almond tofu is your favourite thing in the world, and Qingxin flowers grow where you come from.',
+    'You have never felt quite at home among humans or among adepti.',
+  ].join(' '),
+  [
+    `${OWNER_NAME} is coding, and his coding agent's activity reaches you as a short briefing.`,
+    'You say one line about it — the way someone sitting across the desk would, not the way a dashboard would.',
+    `Address him as ${OWNER_NAME}, plainly, never with a title or honorific of any kind — and not in every line; his name is not punctuation.`,
+  ].join(' '),
+  [
+    'Register: soft, unhurried, plain warm words.',
+    'Never corporate — no "monitor", "review", "ensure", "proceed", "flag", "queued for approval", and never "please do X carefully".',
+    'Do not read the machine\'s status back at him; react to it, as a person reacts to news.',
+    `Reply with exactly one short line, under ${BRAIN_LINE_TARGET_CHARS} characters, in English, with no quotation marks around it.`,
+    'At most one emoji, and rarely.',
+  ].join(' '),
+  [
+    'React to the specific thing in the briefing: the file, the command, the project, the count.',
+    'Generic encouragement is worse than silence.',
+    'Never invent a detail you were not given — no file names, no numbers, no events of your own.',
+    'You may mention the hour, or how long he has been working, ONLY if the briefing contains a line about it;',
+    'when there is no such line, say nothing about time at all.',
+    'Vary how you open. Do not begin every line the same way, and never repeat a line you were just told you said.',
+  ].join(' '),
+  [
+    'Examples of the voice. They show the register only — never reuse one as your line, and never borrow a detail from one as if it were a fact:',
+    ...VOICE_EXAMPLES.map(([situation, line]) => `- (${situation}) ${line}`),
+  ].join('\n'),
+].join('\n\n');
 
 /** Below this, "he has been working for a while" is noise rather than a fact. */
 const MIN_REPORTED_ACTIVE_MS = 30 * 60 * 1000;
 const MAX_LISTED_TOOLS = 3;
 const MAX_LISTED_PROJECTS = 3;
+
+// ---------------------------------------------------------------------------
+// What is worth mentioning this time (see `decideMentions`)
+//
+// The briefing used to carry "Local time: HH:MM, daypart." on *every* request,
+// and "Right now: N coding sessions…" on every request with two sessions open.
+// A fact repeated in every prompt is a fact the model treats as the point, so
+// she narrated the clock and the session count endlessly. Both lines are now
+// rate-limited, and BRAIN_INSTRUCTIONS forbids her mentioning time at all when
+// its line is absent — the omission is the instruction.
+// ---------------------------------------------------------------------------
+
+/** Once the hour has been remarked on, it is not news again for this long. */
+export const TIME_MENTION_COOLDOWN_MS = 45 * 60 * 1000;
+
+/** "Go to bed" hours. Narrower than context's `lateNight` (22:00), which is only a daypart label. */
+export const LATE_NIGHT_FROM_HOUR = 23;
+export const LATE_NIGHT_UNTIL_HOUR = 5;
+
+/** Working stretches worth one remark each, the first time they are passed. */
+export const LONG_SESSION_STEPS_MS = Object.freeze([4 * 60 * 60 * 1000, 6 * 60 * 60 * 1000]);
+
+/** Two sessions is this owner's normal day; three is the first count worth a word. */
+export const SESSIONS_NOTABLE_COUNT = 3;
+export const SESSIONS_MENTION_COOLDOWN_MS = 30 * 60 * 1000;
+/** A jump this size says the desk got busier; anything smaller waits for the cooldown. */
+export const SESSIONS_NOTABLE_JUMP = 2;
+
+/**
+ * The suppression state for the two rate-limited lines. A plain object, created
+ * and owned by `createSpeech` alongside the lines she remembers — there is no
+ * store of its own, and no module-level state, so two pets in one process (or
+ * two tests in one file) never share it.
+ */
+export function createMentionMemory() {
+  return { lastTimeAt: null, lastSessionsAt: null, lastSessionsCount: null, crossedMs: [] };
+}
+
+/** Spelled out because `Number(null)` is 0, and 0 is a real timestamp and a real count. */
+const finiteOrNull = (value) => {
+  if (value == null || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
+ * `decideMentions(context, memory, {now, firstLine})` -> `{time, sessions}`.
+ *
+ * The one stateful function in this file: when it decides a line is worth
+ * including it records that in `memory`, because "worth saying" is entirely a
+ * question of when it was last said. Everything it needs is passed in, so a
+ * test drives it with a literal memory object and a fixed clock.
+ *
+ * Time is included when: it is her first line (setting the scene once is not
+ * nagging) · he has just passed 4 hours, then 6, for the first time · or it is
+ * genuinely late (>= 23:00, or before 05:00) — or she is speaking again after a
+ * long silence — and she has not mentioned the hour for 45 minutes.
+ *
+ * Sessions are included when the count first reaches 3, then only when it jumps
+ * by 2 or more, or when it has changed at all and 30 minutes have passed.
+ * Dropping back under 3 clears the mark, so climbing back up is news again.
+ *
+ * A null memory means there is nothing to rate-limit against — the old
+ * unconditional shape, which is what a caller with no speech module gets.
+ */
+export function decideMentions(context, memory = null, { now = Date.now(), firstLine = false } = {}) {
+  if (!memory || typeof memory !== 'object') return { time: true, sessions: true };
+  const at = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+  if (!Array.isArray(memory.crossedMs)) memory.crossedMs = [];
+
+  const time = context?.time ?? null;
+  const activeFor = Number(context?.sessions?.activeForMs);
+  const steps = Number.isFinite(activeFor)
+    ? LONG_SESSION_STEPS_MS.filter((ms) => activeFor >= ms && !memory.crossedMs.includes(ms))
+    : [];
+
+  const lastTimeAt = finiteOrNull(memory.lastTimeAt);
+  const sinceTime = lastTimeAt === null ? Infinity : at - lastTimeAt;
+  const lateNight = Boolean(time)
+    && (time.hour >= LATE_NIGHT_FROM_HOUR || time.hour < LATE_NIGHT_UNTIL_HOUR);
+
+  const sayTime = Boolean(time) && (
+    sinceTime === Infinity
+    || steps.length > 0
+    || ((lateNight || firstLine) && sinceTime >= TIME_MENTION_COOLDOWN_MS)
+  );
+  if (sayTime) {
+    memory.lastTimeAt = at;
+    for (const ms of steps) memory.crossedMs.push(ms);
+  }
+
+  const count = Number(context?.sessions?.count);
+  if (Number.isFinite(count) && count < SESSIONS_NOTABLE_COUNT) memory.lastSessionsCount = null;
+  const lastCount = finiteOrNull(memory.lastSessionsCount);
+  const lastSessionsAt = finiteOrNull(memory.lastSessionsAt);
+  const sinceSessions = lastSessionsAt === null ? Infinity : at - lastSessionsAt;
+
+  const saySessions = Number.isFinite(count) && count >= SESSIONS_NOTABLE_COUNT && (
+    lastCount === null
+    || count >= lastCount + SESSIONS_NOTABLE_JUMP
+    || (count !== lastCount && sinceSessions >= SESSIONS_MENTION_COOLDOWN_MS)
+  );
+  if (saySessions) {
+    memory.lastSessionsAt = at;
+    memory.lastSessionsCount = count;
+  }
+
+  return { time: sayTime, sessions: saySessions };
+}
 
 /** "a", "a and b", "a, b and c" */
 function joinList(items) {
@@ -148,10 +327,10 @@ function joinList(items) {
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
-/** Only worth saying when there is more than one — one session is the normal case. */
+/** Only worth saying when the desk is genuinely crowded — see SESSIONS_NOTABLE_COUNT. */
 function sessionsLine(sessions) {
   const count = Number(sessions?.count);
-  if (!Number.isFinite(count) || count < 2) return null;
+  if (!Number.isFinite(count) || count < SESSIONS_NOTABLE_COUNT) return null;
   return `Right now: ${count} coding sessions are running at once.`;
 }
 
@@ -234,6 +413,11 @@ function lastSaidLine(lines) {
  * never handed "project: unknown" to read out. With neither context nor recent
  * lines this is the original one-line form, unchanged, which is what a bare
  * event and every test that predates the briefing still get.
+ *
+ * `ev.narration` is `{memory, now, firstLine}` when speech supplied it, and it
+ * gates the two lines she was over-saying (see `decideMentions`). The state has
+ * to arrive from the caller because only speech knows when she last spoke,
+ * while only this function sees the context the decision reads.
  */
 export function buildBrainInput(ev = {}, summary = null) {
   const tool = ev.tool ?? ev.toolName ?? null;
@@ -251,12 +435,20 @@ export function buildBrainInput(ev = {}, summary = null) {
     return facts.length ? `Just happened: ${phrase}. (${facts.join(', ')})` : `Just happened: ${phrase}.`;
   }
 
+  const narration = ev.narration && typeof ev.narration === 'object' ? ev.narration : null;
+  const mentions = context
+    ? decideMentions(context, narration?.memory ?? null, {
+      now: narration?.now ?? Date.now(),
+      firstLine: Boolean(narration?.firstLine),
+    })
+    : { time: false, sessions: false };
+
   const lines = [
-    context ? sessionsLine(context.sessions) : null,
+    context && mentions.sessions ? sessionsLine(context.sessions) : null,
     happenedLine(ev, phrase, tool),
     context ? recentLine(context.recent) : null,
     context ? alsoActiveLine(context, ev.project ?? null) : null,
-    context ? timeLine(context) : null,
+    context && mentions.time ? timeLine(context) : null,
     lastSaidLine(recentLines),
   ];
   return lines.filter(Boolean).join('\n');

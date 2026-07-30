@@ -25,6 +25,14 @@
   <div id="stage">
     <div id="bubble" role="status" aria-live="polite" hidden></div>
     <canvas id="pet" width="192" height="208" aria-label="Ganyu"></canvas>
+    <!-- Chat strip. Absolutely positioned over the sprite's feet, NOT below it:
+         the window is pinned at 256x320 DIP and a size guard in main resets any
+         drift, so nothing here may make the layout ask for more room. -->
+    <div id="chat" hidden>
+      <input id="chat-input" type="text" maxlength="500" autocomplete="off"
+             autocapitalize="off" spellcheck="false"
+             placeholder="Say something…" aria-label="Message Ganyu" />
+    </div>
     <div id="menu" role="menu" hidden>
       <button type="button" id="menu-mute" role="menuitem" data-action="toggle-mute">Mute</button>
       <button type="button" id="menu-pin" role="menuitem" data-action="toggle-pin">Pin</button>

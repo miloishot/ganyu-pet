@@ -62,16 +62,38 @@ const ACTION_PATTERNS = [
 const TEST_COMMAND_RE = /(^|[\s;&|(])(npm (run )?test|yarn test|pnpm test|bun test|node --test|vitest|jest|pytest|go test|cargo test|dotnet test)\b/i;
 
 /**
- * Tokens that look like credentials, redacted before any command is quoted.
- * Over-redaction is the safe direction here: a mangled command reads oddly, a
- * leaked key does not read at all until it is too late.
+ * Tokens that look like credentials, redacted before any command is quoted, as
+ * [pattern, replacement] pairs so a rule that recognises a credential by its
+ * *name* can keep the name and drop only the value.
+ *
+ * Over-redaction was the stated safe direction, and it went too far: `/` used to
+ * be in the base64 class, so the perfectly ordinary path
+ * `C:/Users/kw11l/AppData/Local/Temp/claude/C` — long, mixed case, a digit in
+ * `kw11l` — matched the blob rule and she read out
+ * `LOG="C:/<redacted>--Users-kw11l-…`. A path she cannot say is a fact lost on
+ * every line that mentions one, so the rules below are anchored to things a path
+ * never is: a vendor prefix, a solid hex run, a credential's own name, or a
+ * blob with no separators in it at all.
  */
 const SECRET_PATTERNS = [
-  /\bsk-[A-Za-z0-9_-]{8,}/g,
-  /\b(?:gh[pousr]_|xox[abposr]-)[A-Za-z0-9_-]{10,}/g,
-  /\b[0-9a-fA-F]{32,}\b/g,
-  // base64-ish: long, and mixed case + digits, which a word or a path segment is not.
-  /\b(?=[A-Za-z0-9+/]*[A-Z])(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[0-9])[A-Za-z0-9+/]{32,}={0,2}/g,
+  // Vendor-prefixed keys. Nothing else looks like these, so they need no context.
+  [/\bsk-[A-Za-z0-9_-]{16,}/g, '<redacted>'],
+  [/\b(?:gh[pousr]_|xox[abposr]-)[A-Za-z0-9_-]{10,}/g, '<redacted>'],
+  // 32+ hex digits in one unbroken token: a digest or a key. Path segments are
+  // words, and a dashed path breaks at every `-`, so neither can reach 32.
+  [/\b[0-9a-fA-F]{32,}\b/g, '<redacted>'],
+  // `TOKEN=…`, `--api-key …`, `password: …` — the name says what the value is,
+  // so the value goes whatever shape it has. The name stays: it is the readable
+  // half, and it is what makes the redacted command still recognisable.
+  [
+    /([A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?token|auth[_-]?token|apikey|token|secret|password|passwd)["']?\s*[=:]\s*)(["']?)[^\s"'`;&|]{12,}\2/gi,
+    '$1$2<redacted>$2',
+  ],
+  [/\b(bearer\s+)[A-Za-z0-9._~+/-]{16,}=*/gi, '$1<redacted>'],
+  // A bare base64 blob: long, and mixed case + digits, which a word is not.
+  // `/` and `-` are deliberately NOT in the class — that is the whole fix. A
+  // real blob is one solid run; a path is short runs joined by separators.
+  [/\b(?=[A-Za-z0-9+]*[A-Z])(?=[A-Za-z0-9+]*[a-z])(?=[A-Za-z0-9+]*[0-9])[A-Za-z0-9+]{32,}={0,2}/g, '<redacted>'],
 ];
 
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -106,7 +128,7 @@ function clampText(text, max) {
 /** Credential-looking tokens replaced. Applied to every command before it is quoted. */
 export function redactSecrets(text) {
   let out = String(text ?? '');
-  for (const re of SECRET_PATTERNS) out = out.replace(re, '<redacted>');
+  for (const [re, replacement] of SECRET_PATTERNS) out = out.replace(re, replacement);
   return out;
 }
 

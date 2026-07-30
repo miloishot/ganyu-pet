@@ -11,19 +11,26 @@ import assert from 'node:assert/strict';
 
 import {
   INTERRUPT_KINDS,
+  NOTABLE_INTERVAL_MS,
+  QUIET_STRETCH_MS,
+  QUIET_THROTTLE_MS,
   RECENT_LINES,
   THROTTLE_MS,
   createSpeech,
   modeForEvent,
   projectName,
+  salienceOf,
   toolClass,
   toolNameOf,
 } from '../src/main/speech.mjs';
 import { createState } from '../src/main/state.mjs';
 import { toSpeechDetail } from '../src/main/window.mjs';
 import {
+  BRAIN_INSTRUCTIONS,
+  BRAIN_LINE_TARGET_CHARS,
   MAX_LINE_CHARS,
   MESSAGES,
+  VOICE_EXAMPLES,
   buildSummary,
   messageFor,
   sourceLabel,
@@ -165,11 +172,11 @@ test('the emitted line carries kind, mode, source and the summary', () => {
 
 // ---------------------------------------------------------------- throttle
 
-test('throttle is 6s: 5.999s is refused, 6s speaks', () => {
+test('the non-urgent throttle is 90s: 89.999s is refused, 90s speaks', () => {
   const h = harness();
   assert.equal(h.speech.notify(sessionStart).spoken, true);
 
-  h.advance(THROTTLE_MS - 1);
+  h.advance(QUIET_THROTTLE_MS - 1);
   const blocked = h.speech.notify(stop);
   assert.equal(blocked.spoken, false);
   assert.equal(blocked.reason, 'throttled');
@@ -179,6 +186,19 @@ test('throttle is 6s: 5.999s is refused, 6s speaks', () => {
   h.advance(1);
   assert.equal(h.speech.notify(stop).spoken, true);
   assert.equal(h.lines.length, 2);
+});
+
+test('two sessions hitting the same wall together is one bubble, not two', () => {
+  const h = harness();
+  h.speech.notify(permission);
+  // Same kind, same second, different session: one piece of news.
+  const second = h.speech.notify({ ...permission, sessionId: 's9' });
+  assert.equal(second.spoken, false);
+  assert.equal(second.reason, 'throttled');
+  assert.equal(second.retryInMs, THROTTLE_MS);
+
+  h.advance(THROTTLE_MS);
+  assert.equal(h.speech.notify({ ...permission, sessionId: 's9' }).spoken, true);
 });
 
 test('waiting and failed bypass the throttle and always speak', () => {
@@ -192,25 +212,128 @@ test('waiting and failed bypass the throttle and always speak', () => {
   assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'waiting', 'failed']);
 });
 
-test('a throttled busy line is dropped, not queued', () => {
+test('a throttled line is dropped, not queued', () => {
   const h = harness();
   h.speech.notify(sessionStart); // speaks
-  h.speech.notify(editPre); // first class of the session, no line
-  assert.equal(h.speech.notify(bashPre).reason, 'throttled');
+  h.advance(1000);
+  assert.equal(h.speech.notify(stop).reason, 'throttled');
 
   h.advance(60 * 60 * 1000); // an hour later: there was never anything held
   assert.deepEqual(h.lines.map((l) => l.kind), ['greeting']);
   // A stale status is worse than none, so there is no queue and no timer to flush.
-  assert.deepEqual(Object.keys(h.speech.stats()).sort(), ['lastMode', 'lastSpokeAt']);
+  assert.deepEqual(Object.keys(h.speech.stats()).sort(), [
+    'failStreak', 'lastKind', 'lastMode', 'lastNotableAt', 'lastSpokeAt',
+  ]);
 });
 
 test('a spoken interrupt still restarts the throttle for ordinary kinds', () => {
   const h = harness();
   h.speech.notify(permission); // interrupt speaks with no history
-  h.advance(THROTTLE_MS - 1);
+  h.advance(QUIET_THROTTLE_MS - 1);
   assert.equal(h.speech.notify(stop).reason, 'throttled');
   h.advance(1);
   assert.equal(h.speech.notify(stop).spoken, true);
+});
+
+// ---------------------------------------------------------------- salience
+//
+// The throttle decides how *often* she may speak; salience decides whether this
+// event is worth a line at all. Without it, several agents emitting
+// PreToolUse/PostToolUse continuously meant she narrated whichever Read or Grep
+// happened to clear the throttle — "she keeps telling me the most random
+// things". Silence is what makes the remaining lines mean anything.
+
+test('salienceOf ranks the moments worth interrupting him for', () => {
+  const routine = (over = {}) => salienceOf({ kind: 'busy', quietForMs: 0, ...over });
+
+  assert.equal(salienceOf({ kind: null }).level, null);
+  assert.equal(salienceOf({ kind: 'waiting' }).level, 'urgent');
+  for (const kind of ['greeting', 'celebrate', 'recovered']) {
+    assert.equal(routine({ kind }).level, 'always', kind);
+  }
+
+  assert.equal(routine().level, null, 'routine tool traffic on its own is silence');
+  assert.equal(routine().reason, 'routine');
+  assert.equal(routine({ quietForMs: QUIET_STRETCH_MS }).level, 'always', 'unless she has said nothing for ten minutes');
+  assert.equal(routine({ patterns: ['repeat-file'] }).level, 'notable');
+  assert.equal(
+    routine({ patterns: ['repeat-file'], sinceNotableMs: NOTABLE_INTERVAL_MS - 1 }).level,
+    null,
+    'one pattern remark per ten minutes, not one per matching event',
+  );
+});
+
+test('failures speak on the first, third and fifth — not on every retry', () => {
+  const level = (n) => salienceOf({ kind: 'failed', failStreak: n }).level;
+  assert.deepEqual([1, 2, 3, 4, 5, 6, 7, 10].map(level), [
+    'urgent', null, 'urgent', null, 'urgent', null, null, 'urgent',
+  ]);
+  assert.equal(salienceOf({ kind: 'failed', failStreak: 2 }).reason, 'repeat-failure');
+  assert.equal(salienceOf({ kind: 'failed', failStreak: 3 }).reason, 'failure-streak-3');
+});
+
+test('a minute of ordinary Reads and Bashes produces no commentary at all', () => {
+  const h = harness();
+  h.speech.notify(sessionStart); // her first line, out of the way
+
+  let last = null;
+  for (let i = 0; i < 20; i += 1) {
+    h.advance(2000);
+    last = h.speech.notify(i % 2 ? bashPre : { ...editPre, toolName: 'Read' });
+    assert.equal(last.spoken, false, `spoke on routine event ${i}`);
+  }
+  assert.equal(last.reason, 'not-salient');
+  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting']);
+});
+
+test('the first line after ten quiet minutes lands, then she goes quiet again', () => {
+  const h = harness();
+  h.speech.notify(sessionStart);
+  h.speech.notify(editPre); // establishes the session's tool class; says nothing
+
+  h.advance(QUIET_STRETCH_MS);
+  const first = h.speech.notify(bashPre);
+  assert.equal(first.spoken, true, 'ten minutes of silence earns one line');
+  assert.equal(first.kind, 'busy');
+
+  h.advance(60_000);
+  const next = h.speech.notify({ ...editPre, toolName: 'Read' });
+  assert.equal(next.spoken, false);
+  assert.equal(next.reason, 'not-salient');
+});
+
+test('the same file five times over is worth one remark, and only one', () => {
+  const h = harness();
+  h.speech.notify(sessionStart);
+
+  let spoken = 0;
+  for (let i = 0; i < 12; i += 1) {
+    h.advance(30_000);
+    const res = h.speech.notify({
+      source: 'claude',
+      event: 'PreToolUse',
+      sessionId: 's1',
+      cwd: CWD,
+      toolName: i % 2 ? 'Read' : 'Edit',
+      toolInput: { file_path: `${CWD}\\src\\main\\persona.mjs` },
+    });
+    if (res.spoken) spoken += 1;
+  }
+  assert.equal(spoken, 1, 'twelve passes over one file is one remark, not eight');
+});
+
+test('a recovery after a failure is always worth a line', () => {
+  const h = harness();
+  assert.equal(h.speech.notify(failure).kind, 'failed');
+  assert.equal(h.speech.stats().failStreak, 1);
+
+  h.advance(QUIET_THROTTLE_MS);
+  const back = h.speech.notify({
+    source: 'claude', event: 'PostToolUse', sessionId: 's2', toolName: 'Bash', mode: 'busy',
+  });
+  assert.equal(back.kind, 'recovered');
+  assert.equal(back.spoken, true);
+  assert.equal(h.speech.stats().failStreak, 0, 'the thing that worked clears the streak');
 });
 
 // ---------------------------------------------------------------- mute
@@ -230,9 +353,11 @@ test('muted: no lines at all, and unmuting resumes', () => {
 
 // ---------------------------------------------------------------- messages & slots
 
-test('MESSAGES: five kinds, 3-5 variants, <= 70 chars, one emoji, no honorific', () => {
+test('MESSAGES: six kinds, 3-5 variants, <= 70 chars, one emoji, no honorific', () => {
   assert.equal(MAX_LINE_CHARS, 70);
-  assert.deepEqual(Object.keys(MESSAGES).sort(), ['busy', 'celebrate', 'failed', 'greeting', 'waiting']);
+  assert.deepEqual(Object.keys(MESSAGES).sort(), [
+    'busy', 'celebrate', 'failed', 'greeting', 'recovered', 'waiting',
+  ]);
 
   for (const [kind, table] of Object.entries(MESSAGES)) {
     assert.ok(Array.isArray(table), `${kind} table missing`);
@@ -265,7 +390,7 @@ test('an event with no tool and no project still gets a natural line', () => {
   const greeting = h.speech.notify({ source: 'codex', event: 'SessionStart', sessionId: 's1' });
   assert.equal(greeting.text, "Reporting in. I'll keep the records.");
 
-  h.advance(THROTTLE_MS);
+  h.advance(QUIET_THROTTLE_MS);
   const idle = h.speech.notify({ source: 'codex', event: 'SessionEnd', sessionId: 's1' });
   assert.equal(idle.kind, 'celebrate');
   assert.equal(idle.text, 'Task complete. I\'ll file the report.');
@@ -291,6 +416,7 @@ test('messageFor is deterministic with an injected random and avoids repeats', (
 test('consecutive lines of the same kind do not repeat the previous one', () => {
   const h = harness();
   h.speech.notify(permission);
+  h.advance(THROTTLE_MS);
   h.speech.notify({ ...permission, sessionId: 's5' });
   assert.equal(h.lines.length, 2);
   assert.notEqual(h.lines[0].text, h.lines[1].text);
@@ -379,14 +505,15 @@ test('toolNameOf accepts the string and object spellings', () => {
 // triggers. This drives the real seam: raw hook payload -> state.ingest ->
 // state.onEvent -> toSpeechDetail -> speech.onEvent.
 
-test('all five triggers fire through the real B -> A -> D seam', () => {
+test('every salient trigger fires through the real B -> A -> D seam', () => {
   const h = harness();
   const state = createState({ clock: { now: () => h.now() } });
   state.onEvent((event, aggregate) => h.speech.onEvent(toSpeechDetail(event, aggregate), aggregate));
 
   state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'SessionStart' });
 
-  h.advance(THROTTLE_MS);
+  // A tool-class change on its own is exactly the traffic she used to narrate.
+  h.advance(QUIET_THROTTLE_MS);
   state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PreToolUse', tool_name: 'Edit' });
   state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PreToolUse', tool_name: 'Bash' });
 
@@ -397,17 +524,71 @@ test('all five triggers fire through the real B -> A -> D seam', () => {
     tool_response: { is_error: true },
   });
 
-  h.advance(THROTTLE_MS);
+  // The next step that works is the recovery.
+  h.advance(QUIET_THROTTLE_MS);
+  state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'PreToolUse', tool_name: 'Read' });
+
+  h.advance(QUIET_THROTTLE_MS);
   state.ingest('claude', { session_id: 's1', cwd: CWD, hook_event_name: 'Stop' });
 
-  assert.deepEqual(h.lines.map((l) => l.kind), ['greeting', 'busy', 'waiting', 'failed', 'celebrate']);
+  assert.deepEqual(h.lines.map((l) => l.kind), [
+    'greeting', 'waiting', 'failed', 'recovered', 'celebrate',
+  ]);
   assert.deepEqual(h.lines.map((l) => l.text), [
     'Session started in ganyu-pet.',
-    'Running Bash…',
     'Bash needs your approval.',
     "Error in Bash. I've noted it.",
+    'Read is working again.',
     'Finished in ganyu-pet.',
   ]);
+});
+
+// ------------------------------------------------- her voice (module D — persona)
+//
+// The owner's verdict on the generated lines was "she doesn't talk like Ganyu".
+// The instructions described her in the abstract, which reliably produces a
+// corporate assistant; these guard the two things that actually fix that — who
+// she is, and worked examples of the register.
+
+test('the voice examples cover the moments she reaches, and obey her own rules', () => {
+  assert.ok(VOICE_EXAMPLES.length >= 8 && VOICE_EXAMPLES.length <= 12, `${VOICE_EXAMPLES.length} examples`);
+  assert.equal(
+    new Set(VOICE_EXAMPLES.map(([, line]) => line)).size,
+    VOICE_EXAMPLES.length,
+    'a duplicated example teaches her to repeat herself',
+  );
+
+  for (const [situation, line] of VOICE_EXAMPLES) {
+    assert.ok(situation.length > 0, 'every example is labelled with its moment');
+    assert.ok(line.length <= BRAIN_LINE_TARGET_CHARS, `too long (${line.length}): ${line}`);
+    assert.ok(!line.includes('\n'), `more than one line: ${line}`);
+    assert.ok(!line.includes('"'), `quoted: ${line}`);
+    assert.ok(!/\b(mr|mrs|ms|miss|sir|madam)\b/i.test(line), `honorific: ${line}`);
+    assert.ok(
+      !/\b(monitor|ensure|proceed|flag|queued for approval)\b/i.test(line),
+      `corporate register: ${line}`,
+    );
+    assert.ok(!/please \w+ carefully/i.test(line), `preachy: ${line}`);
+    assert.ok((line.match(/\p{Extended_Pictographic}/gu) ?? []).length <= 1, `emoji: ${line}`);
+  }
+});
+
+test('the instructions carry who she is, the hard rules, and every example', () => {
+  for (const [, line] of VOICE_EXAMPLES) {
+    assert.ok(BRAIN_INSTRUCTIONS.includes(line), `example missing from the prompt: ${line}`);
+  }
+  for (const fact of [/qilin/i, /Yuehai Pavilion/, /almond tofu/i, /Qingxin/i, /overworked/i]) {
+    assert.match(BRAIN_INSTRUCTIONS, fact);
+  }
+  // The rules that predate this rewrite and must survive it.
+  assert.match(BRAIN_INSTRUCTIONS, /never with a title or honorific of any kind/i);
+  assert.match(BRAIN_INSTRUCTIONS, /Never invent a detail you were not given/i);
+  assert.match(BRAIN_INSTRUCTIONS, /Vary how you open/i);
+  assert.match(BRAIN_INSTRUCTIONS, /never repeat a line you were just told you said/i);
+  // And the two the owner's complaint added.
+  assert.match(BRAIN_INSTRUCTIONS, /Never corporate/i);
+  assert.match(BRAIN_INSTRUCTIONS, /ONLY if the briefing contains a line about it/);
+  assert.match(BRAIN_INSTRUCTIONS, new RegExp(`under ${BRAIN_LINE_TARGET_CHARS} characters`));
 });
 
 // ------------------------------------------------- optional brain (module D)
@@ -450,7 +631,8 @@ test('an urgent kind shows the canned line at once, then the brain line replaces
   assert.equal(h.lines[0].text, 'Bash needs your approval.');
 
   assert.equal(brain.calls.length, 1);
-  assert.deepEqual(brain.calls[0].detail, {
+  const { narration, ...detail } = brain.calls[0].detail;
+  assert.deepEqual(detail, {
     kind: 'waiting',
     event: 'Notification',
     tool: 'Bash',
@@ -463,6 +645,11 @@ test('an urgent kind shows the canned line at once, then the brain line replaces
     // told not to repeat.
     recentLines: ['Bash needs your approval.'],
   });
+  // Snapshotted before the canned line went out, or the urgent path would look
+  // like a continuation of itself and never count as her first line.
+  assert.equal(narration.now, h.now());
+  assert.equal(narration.firstLine, true);
+  assert.equal(typeof narration.memory, 'object');
   assert.equal(brain.calls[0].summary, 'Claude Code is waiting for permission to run Bash');
 
   brain.reply('Kahweng, Bash is waiting on your word.');
@@ -501,7 +688,7 @@ test('a non-urgent kind waits for the brain, and falls back to canned on null', 
     'A new session in ganyu-pet, Kahweng. I have the notes ready.',
   ]);
 
-  h.advance(THROTTLE_MS);
+  h.advance(QUIET_THROTTLE_MS);
   const done = h.speech.notify(stop);
   brain.reply(null);
   const settled = await done.pending;
@@ -559,17 +746,17 @@ test('the brain is told the last three lines she said, canned or generated', asy
   brain.reply(null);
   await first.pending;
 
-  h.advance(THROTTLE_MS);
+  h.advance(QUIET_THROTTLE_MS);
   const greeting = h.speech.notify(sessionStart);
   brain.reply('A new session in ganyu-pet, Kahweng.'); // a generated line counts too
   await greeting.pending;
 
-  h.advance(THROTTLE_MS);
+  h.advance(QUIET_THROTTLE_MS);
   const done = h.speech.notify(stop);
   brain.reply(null); // falls back to the canned celebrate line
   await done.pending;
 
-  h.advance(THROTTLE_MS);
+  h.advance(QUIET_THROTTLE_MS);
   h.speech.notify({ ...failure, sessionId: 's7' });
 
   assert.deepEqual(h.lines.map((l) => l.text), [

@@ -30,7 +30,14 @@ import {
   summarizeRecent,
   trackActiveSince,
 } from '../src/main/context.mjs';
-import { buildBrainInput } from '../src/main/persona.mjs';
+import {
+  LONG_SESSION_STEPS_MS,
+  SESSIONS_MENTION_COOLDOWN_MS,
+  TIME_MENTION_COOLDOWN_MS,
+  buildBrainInput,
+  createMentionMemory,
+  decideMentions,
+} from '../src/main/persona.mjs';
 import { createSpeech } from '../src/main/speech.mjs';
 import { createState } from '../src/main/state.mjs';
 
@@ -204,10 +211,42 @@ test('secret-looking tokens are redacted out of a command before it is quoted', 
   assert.ok(!described.includes(key), described);
   assert.ok(!described.includes('sk-proj'), described);
 
+  // A credential named as one goes whatever shape its value has; the name stays,
+  // because a command she cannot recognise is no more use than no command.
+  assert.equal(
+    redactSecrets('setx GANYU_TOKEN=abcdefghijklmnop'),
+    'setx GANYU_TOKEN=<redacted>',
+  );
+  assert.equal(
+    redactSecrets('curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"'),
+    'curl -H "Authorization: Bearer <redacted>"',
+  );
+
   // Ordinary commands are left alone.
   assert.equal(redactSecrets('npm test -- --watch=false'), 'npm test -- --watch=false');
   assert.equal(shortCommand('  npm   test  '), 'npm test');
   assert.equal(shortCommand('   '), null);
+});
+
+test('an ordinary path is NOT a secret, however long and dashed it is', () => {
+  // The bug this pins: `/` used to be in the base64 class, so the run
+  // `Users/kw11l/AppData/Local/Temp/claude/C` — long, mixed case, a digit in
+  // `kw11l` — was redacted and she read out `LOG="C:/<redacted>--Users-…`.
+  const paths = [
+    'C:/Users/kw11l/AppData/Local/Temp/claude/C--Users-kw11l-orca-workspaces-salesbridge/out.log',
+    'C:\\Users\\kw11l\\orca\\workspaces\\GolfCRM\\bay-daily-codes\\src\\domain\\index.ts',
+    '/home/kw11l/Desktop/ganyu-pet/src/main/persona.mjs',
+    'C--Users-kw11l-Desktop-ganyu-pet-1bdc5c89-14ee-4b01-b616-fbb5e63b1dbb',
+  ];
+  for (const p of paths) {
+    assert.equal(redactSecrets(`LOG="${p}"`), `LOG="${p}"`, p);
+    assert.ok(!redactSecrets(p).includes('<redacted>'), p);
+  }
+
+  assert.equal(
+    describeAction(entry({ tool: 'Bash', input: { command: 'node scripts/run.mjs --out C:/Temp/claude/x.log' } })),
+    'running `node scripts/run.mjs --out C:/Temp/claude/x.log`',
+  );
 });
 
 // ---------------------------------------------------------------- summarizeRecent
@@ -464,6 +503,117 @@ test('the recent-lines hint carries up to three lines, newest first', () => {
     'You last said: "Running Bash…" (before that: "Session started in ganyu-pet.", "Finished in ganyu-pet.", "dropped") — do not repeat yourself.',
   );
   assert.ok(!buildBrainInput({ kind: 'busy', recentLines: ['', '   '] }).includes('You last said'));
+});
+
+// ---------------------------------------------------------------- what is worth mentioning
+//
+// "She keeps mentioning the time." She did: the briefing carried
+// `Local time: HH:MM, daypart.` on *every* request and `Right now: N coding
+// sessions…` on every request with two open, and a fact repeated in every prompt
+// is read as the point of the prompt. Both are now rate-limited here, and the
+// instructions forbid her mentioning the hour at all when its line is absent —
+// so the omission is what does the work.
+
+/** A context with only the fields the two gated lines read. */
+function contextAt(hour, { activeForMs = 0, count = 1 } = {}) {
+  return {
+    time: localTimePhrase(new Date(2026, 6, 30, hour, 15).getTime()),
+    recent: summarizeRecent([], { now: NOW }),
+    sessions: { count, projects: [], activeSince: null, activeForMs },
+  };
+}
+
+test('the hour is worth one remark, not one per event', () => {
+  const memory = createMentionMemory();
+  const evening = contextAt(20);
+
+  assert.equal(decideMentions(evening, memory, { now: NOW }).time, true, 'her first line sets the scene');
+  assert.equal(decideMentions(evening, memory, { now: NOW + MIN }).time, false);
+  assert.equal(
+    decideMentions(evening, memory, { now: NOW + TIME_MENTION_COOLDOWN_MS - MIN }).time,
+    false,
+    'still inside the 45-minute cooldown',
+  );
+  assert.equal(
+    decideMentions(evening, memory, { now: NOW + TIME_MENTION_COOLDOWN_MS + MIN }).time,
+    false,
+    '20:15 is not an hour worth raising on its own, cooldown or no cooldown',
+  );
+
+  // 23:15 is, and so is coming back after a long silence.
+  const late = contextAt(23);
+  assert.equal(decideMentions(late, memory, { now: NOW + 3 * 60 * MIN }).time, true);
+  assert.equal(decideMentions(late, memory, { now: NOW + 3 * 60 * MIN + MIN }).time, false);
+  assert.equal(
+    decideMentions(evening, memory, { now: NOW + 5 * 60 * MIN, firstLine: true }).time,
+    true,
+    'her first line after a long quiet stretch may set the scene again',
+  );
+});
+
+test('passing four hours, and then six, each earn one remark', () => {
+  const memory = createMentionMemory();
+  const [fourHours, sixHours] = LONG_SESSION_STEPS_MS;
+  const at = (activeForMs, minutes) => decideMentions(
+    contextAt(14, { activeForMs }), memory, { now: NOW + minutes * MIN },
+  ).time;
+
+  assert.equal(at(0, 0), true, 'her first line');
+  assert.equal(at(fourHours - MIN, 1), false);
+  assert.equal(at(fourHours, 2), true, 'four hours');
+  assert.equal(at(fourHours + 30 * MIN, 3), false, 'not again for a mark already passed');
+  assert.equal(at(sixHours, 4), true, 'six hours');
+  assert.equal(at(sixHours + 60 * MIN, 5), false, 'and there is no eight-hour mark to nag about');
+});
+
+test('the session count is mentioned when the desk first gets crowded', () => {
+  const memory = createMentionMemory();
+  const at = (count, minutes) => decideMentions(
+    contextAt(14, { count }), memory, { now: NOW + minutes * MIN },
+  ).sessions;
+
+  assert.equal(at(2, 0), false, 'two at once is an ordinary day here');
+  assert.equal(at(3, 1), true, 'three is the first count worth a word');
+  assert.equal(at(3, 2), false);
+  assert.equal(at(4, 3), false, 'one more is not news');
+  assert.equal(at(5, 4), true, 'a jump of two is');
+  assert.equal(at(6, 4 + SESSIONS_MENTION_COOLDOWN_MS / MIN + 1), true, 'or any change, half an hour later');
+  assert.equal(at(1, 100), false);
+  assert.equal(at(3, 101), true, 'dropping back to quiet makes the next crowd news again');
+});
+
+test('a briefing she has nothing new to say about carries neither line', () => {
+  const memory = createMentionMemory();
+  const context = eveningContext(); // 22:15, four hours in, five sessions
+  const brief = (now, firstLine = false) => buildBrainInput({
+    kind: 'busy',
+    tool: 'Edit',
+    project: 'GolfCRM/bay-daily-codes',
+    source: 'claude',
+    event: 'PreToolUse',
+    context,
+    narration: { memory, now, firstLine },
+  });
+
+  const first = brief(NOW, true);
+  assert.match(first, /^Right now: 5 coding sessions/m);
+  assert.match(first, /^Local time: 22:15/m);
+
+  const second = brief(NOW + MIN);
+  assert.ok(!second.includes('Local time'), second);
+  assert.ok(!second.includes('Right now'), second);
+  // The facts she can actually act on are untouched — this is a rate limit on
+  // two lines, not a smaller briefing.
+  assert.match(second, /^Just happened: /m);
+  assert.match(second, /^Recent activity: /m);
+  assert.match(second, /^Also active: /m);
+});
+
+test('with no memory to rate-limit against, the briefing keeps its old shape', () => {
+  const context = eveningContext();
+  const input = buildBrainInput({ kind: 'busy', tool: 'Edit', source: 'claude', context });
+  assert.match(input, /^Local time: 22:15/m);
+  assert.match(input, /^Right now: 5 coding sessions/m);
 });
 
 // ---------------------------------------------------------------- privacy

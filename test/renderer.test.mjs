@@ -26,9 +26,16 @@ import {
   createInteractivity,
   clampMenu,
   menuLabels,
+  CHAT_PENDING_LINE,
+  CHAT_FAILED_LINE,
   boot,
 } from '../src/renderer/pet.mjs';
-import { createBubbles, BUBBLE_TTL_MS, BUBBLE_FADE_MS } from '../src/renderer/bubbles.mjs';
+import {
+  createBubbles,
+  BUBBLE_TTL_MS,
+  BUBBLE_FADE_MS,
+  BUBBLE_PRIORITY,
+} from '../src/renderer/bubbles.mjs';
 
 // ---------------------------------------------------------------------------
 // fake DOM
@@ -106,6 +113,18 @@ function makeCanvas() {
   return makeEl('pet', { width: FRAME_W, height: FRAME_H, ctx, getContext: () => ctx });
 }
 
+function makeInput(id) {
+  const input = makeEl(id, { value: '' });
+  input.focused = false;
+  input.focus = () => {
+    input.focused = true;
+  };
+  input.blur = () => {
+    input.focused = false;
+  };
+  return input;
+}
+
 function makeDom() {
   const canvas = makeCanvas();
   const bubble = makeEl('bubble');
@@ -113,19 +132,28 @@ function makeDom() {
   const menu = makeEl('menu');
   menu.hidden = true;
   menu.children = [makeButton('toggle-mute'), makeButton('toggle-pin'), makeButton('quit')];
+  const chatInput = makeInput('chat-input');
+  const chat = makeEl('chat');
+  chat.hidden = true;
+  chat.children = [chatInput];
   const documentElement = makeEl('html', { clientWidth: 256, clientHeight: 320 });
-  const byId = { pet: canvas, bubble, menu };
+  const byId = { pet: canvas, bubble, menu, chat, 'chat-input': chatInput };
   const doc = makeEl('#document', {
     documentElement,
     readyState: 'complete',
     getElementById: (id) => byId[id] || null,
   });
   const win = makeEl('#window', { devicePixelRatio: 1 });
-  return { canvas, bubble, menu, documentElement, doc, win };
+  return { canvas, bubble, menu, chat, chatInput, documentElement, doc, win };
 }
 
-function makeGanyu(flagsPromise) {
-  const calls = { setInteractive: [], menuAction: [], getFlags: 0 };
+/**
+ * @param {() => Promise} flagsPromise
+ * @param {{reply?: any}} [opts] `reply` is what sendChat resolves to; a function
+ *   is called with the text so a test can gate or fail a single exchange.
+ */
+function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
+  const calls = { setInteractive: [], menuAction: [], getFlags: 0, sendChat: [], setFocused: [] };
   let stateCb = null;
   let speakCb = null;
   return {
@@ -159,6 +187,13 @@ function makeGanyu(flagsPromise) {
         calls.getFlags += 1;
         return flagsPromise();
       },
+      sendChat(text) {
+        calls.sendChat.push(text);
+        return typeof reply === 'function' ? reply(text) : Promise.resolve(reply);
+      },
+      setFocused(v) {
+        calls.setFocused.push(v);
+      },
     },
   };
 }
@@ -182,6 +217,15 @@ class FakeImage {
 }
 
 const flush = () => new Promise((r) => setImmediate(r));
+
+/** A reply the test holds open, so the pending bubble can be inspected. */
+function deferred() {
+  let resolve;
+  const promise = new Promise((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 // ---------------------------------------------------------------------------
 // grid + row map
@@ -583,7 +627,10 @@ test('createBubbles requires an element', () => {
 // boot() integration
 // ---------------------------------------------------------------------------
 
-async function bootHarness({ flags = { muted: false, pinned: false, spritePath: 'file:///sheet.webp' } } = {}) {
+async function bootHarness({
+  flags = { muted: false, pinned: false, spritePath: 'file:///sheet.webp' },
+  reply = 'Of course.',
+} = {}) {
   const dom = makeDom();
   let resolveFlags;
   const pending = new Promise((r) => {
@@ -596,7 +643,7 @@ async function bootHarness({ flags = { muted: false, pinned: false, spritePath: 
       return pending;
     }
     return Promise.resolve(flags);
-  });
+  }, { reply });
 
   let t = 0;
   let pendingRaf = null;
@@ -820,6 +867,353 @@ test('boot no-ops without a DOM or without the preload bridge', async () => {
   const bare = makeEl('#document', { getElementById: () => null });
   const g = makeGanyu(() => Promise.resolve({}));
   assert.equal(await boot({ win: dom.win, doc: bare, ganyu: g.api }), null);
+});
+
+// ---------------------------------------------------------------------------
+// chat — interactivity latch
+// ---------------------------------------------------------------------------
+
+test('interactivity latches chatOpen exactly like menuOpen', () => {
+  const calls = [];
+  const i = createInteractivity({ setInteractive: (v) => calls.push(v) });
+  i.sync();
+  assert.deepEqual(calls, [false], 'baseline is click-through');
+
+  i.setChatOpen(true);
+  i.setChatOpen(true);
+  assert.deepEqual(calls, [false, true], 'no duplicate calls');
+  assert.equal(i.interactive, true);
+
+  // He is looking at the keyboard: the pointer coming and going over the sprite
+  // must not drop interactivity out from under an open input.
+  i.setOverPet(true);
+  i.setOverPet(false);
+  assert.deepEqual(calls, [false, true], 'chat latch holds through hover changes');
+  assert.equal(i.interactive, true);
+
+  i.setChatOpen(false);
+  assert.deepEqual(calls, [false, true, false], 'reverts when the input closes');
+
+  i.setChatOpen(true);
+  i.releaseAll();
+  assert.equal(i.interactive, false, 'releaseAll drops the chat latch too');
+});
+
+// ---------------------------------------------------------------------------
+// chat — bubble precedence
+// ---------------------------------------------------------------------------
+
+test('a chat line takes the bubble; an ambient line is dropped while it shows', () => {
+  const el = makeEl('bubble');
+  el.hidden = true;
+  const timers = [];
+  const b = createBubbles({
+    el,
+    schedule: (fn, ms) => {
+      timers.push({ fn, ms });
+      return timers.length;
+    },
+    cancel: (h) => {
+      timers[h - 1] = null;
+    },
+  });
+
+  // Ambient is the default, and holds nothing.
+  assert.equal(b.show('Running npm test…'), true);
+  assert.equal(b.priority, BUBBLE_PRIORITY.ambient);
+
+  // A reply wins over an ambient line already on screen.
+  assert.equal(b.show('I am here.', { priority: BUBBLE_PRIORITY.chat }), true);
+  assert.equal(el.textContent, 'I am here.');
+  assert.equal(b.priority, BUBBLE_PRIORITY.chat);
+
+  // ...and the ambient line cannot take it back while he is reading.
+  assert.equal(b.show('Edit finished.'), false, 'ambient refused');
+  assert.equal(el.textContent, 'I am here.');
+
+  // Chat never blocks chat: this is how the pending line is replaced.
+  assert.equal(b.show('One more thing.', { priority: BUBBLE_PRIORITY.chat }), true);
+  assert.equal(el.textContent, 'One more thing.');
+
+  // The hold is the line's own TTL — once it starts fading, ambient is welcome.
+  timers.filter(Boolean).at(-1).fn();
+  assert.equal(b.visible, false);
+  assert.equal(b.priority, BUBBLE_PRIORITY.ambient, 'hold released with the line');
+  assert.equal(b.show('Edit finished.'), true);
+  assert.equal(el.textContent, 'Edit finished.');
+
+  b.hide();
+  assert.equal(b.priority, BUBBLE_PRIORITY.ambient, 'hide clears the hold');
+});
+
+// ---------------------------------------------------------------------------
+// chat — open / close / focus
+// ---------------------------------------------------------------------------
+
+test('left-click opens the input, focuses it, and holds the overlay interactive', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, chat, chatInput } = h.dom;
+  h.g.calls.setInteractive.length = 0;
+
+  assert.equal(chat.hidden, true, 'starts closed');
+  canvas.dispatch('click', { clientX: 120, clientY: 260 });
+
+  assert.equal(chat.hidden, false);
+  assert.equal(chatInput.focused, true, 'caret is in the field');
+  assert.deepEqual(h.g.calls.setInteractive, [true], 'window is interactive while open');
+  assert.deepEqual(h.g.calls.setFocused, [true], 'main asked to make the window focusable');
+  assert.equal(app.chat.isOpen, true);
+  app.dispose();
+});
+
+test('Escape closes and clears the input, and restores click-through', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, chat, chatInput, doc } = h.dom;
+
+  canvas.dispatch('click', {});
+  chatInput.value = 'half a thought';
+  chatInput.dispatch('keydown', { key: 'Escape' });
+
+  assert.equal(chat.hidden, true);
+  assert.equal(chatInput.value, '', 'cleared, not left for next time');
+  assert.equal(chatInput.focused, false);
+  assert.equal(h.g.calls.setInteractive.at(-1), false, 'click-through restored');
+  assert.deepEqual(h.g.calls.setFocused, [true, false], 'focusability handed back');
+
+  // The document-level handler closes it too, for when focus is elsewhere.
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, false);
+  doc.dispatch('keydown', { key: 'Escape' });
+  assert.equal(chat.hidden, true);
+  assert.equal(app.chat.isOpen, false);
+  app.dispose();
+});
+
+test('clicking outside closes the input; clicking the sprite toggles it', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, chat, chatInput, doc, menu } = h.dom;
+
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, false);
+
+  // A mousedown inside the strip keeps it open — that is how he clicks the field.
+  doc.dispatch('mousedown', { target: chatInput });
+  assert.equal(chat.hidden, false);
+
+  doc.dispatch('mousedown', { target: menu });
+  assert.equal(chat.hidden, true, 'outside mousedown closes it');
+
+  // Second click on the sprite closes it, rather than reopening it forever.
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, false);
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, true);
+
+  // mousedown precedes click, so the sprite is exempt from the outside rule —
+  // otherwise the mousedown would close what the click is about to reopen.
+  canvas.dispatch('click', {});
+  chatInput.value = 'still typing';
+  doc.dispatch('mousedown', { target: canvas });
+  assert.equal(chat.hidden, false, 'sprite mousedown does not close it');
+  assert.equal(chatInput.value, 'still typing', 'and does not clear it');
+  app.dispose();
+});
+
+test('the pointer leaving the window does not release interactivity while typing', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, documentElement } = h.dom;
+
+  canvas.dispatch('click', {});
+  h.g.calls.setInteractive.length = 0;
+
+  documentElement.dispatch('mouseleave');
+  assert.deepEqual(h.g.calls.setInteractive, [], 'latch survives the pointer leaving');
+  assert.equal(app.interactivity.interactive, true);
+
+  // Once the input is closed the watchdog behaves exactly as before.
+  documentElement.dispatch('mouseleave');
+  canvas.dispatch('click', {}); // toggles closed
+  assert.deepEqual(h.g.calls.setInteractive, [false]);
+  app.dispose();
+});
+
+test('window blur closes the input and gives focusability back', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  h.dom.win.dispatch('blur');
+  assert.equal(h.dom.chat.hidden, true);
+  assert.deepEqual(h.g.calls.setFocused, [true, false]);
+  assert.equal(h.g.calls.setInteractive.at(-1), false);
+  app.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// chat — sending
+// ---------------------------------------------------------------------------
+
+test('Enter sends, shows a temporary line, then replaces it with the reply', async () => {
+  const gate = deferred();
+  const h = await bootHarness({ reply: () => gate.promise });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, chatInput, bubble } = h.dom;
+
+  canvas.dispatch('click', {});
+  chatInput.value = '  how is it going?  ';
+  chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+
+  assert.deepEqual(h.g.calls.sendChat, ['  how is it going?  '], 'the raw text goes to main');
+  assert.equal(chatInput.value, '', 'field cleared on send');
+  assert.equal(bubble.textContent, CHAT_PENDING_LINE, 'a clearly temporary line while she thinks');
+  assert.equal(h.dom.chat.hidden, false, 'the input stays open for the next message');
+
+  gate.resolve('It goes well, thank you.');
+  await flush();
+  assert.equal(bubble.textContent, 'It goes well, thank you.', 'pending line replaced');
+  app.dispose();
+});
+
+test('a failed reply replaces the pending line rather than leaving it hanging', async () => {
+  for (const reply of [null, '   ', () => Promise.reject(new Error('down'))]) {
+    const h = await bootHarness({ reply });
+    await flush();
+    h.resolveFlags();
+    const app = await h.booting;
+
+    h.dom.canvas.dispatch('click', {});
+    h.dom.chatInput.value = 'are you there?';
+    h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+    await flush();
+    await flush();
+
+    assert.equal(h.dom.bubble.textContent, CHAT_FAILED_LINE, `reply=${String(reply)}`);
+    assert.notEqual(h.dom.bubble.textContent, CHAT_PENDING_LINE);
+    app.dispose();
+  }
+});
+
+test('blank input is not sent, and a second Enter while pending is ignored', async () => {
+  const gate = deferred();
+  const h = await bootHarness({ reply: () => gate.promise });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, chatInput } = h.dom;
+
+  canvas.dispatch('click', {});
+  for (const blank of ['', '   ']) {
+    chatInput.value = blank;
+    chatInput.dispatch('keydown', { key: 'Enter' });
+    await flush();
+  }
+  assert.deepEqual(h.g.calls.sendChat, [], 'nothing sent');
+  assert.equal(h.dom.bubble.hidden, true, 'and no pending bubble');
+
+  chatInput.value = 'first';
+  chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+  chatInput.value = 'second';
+  chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+  assert.deepEqual(h.g.calls.sendChat, ['first'], 'single-flight: the second Enter is dropped');
+
+  gate.resolve('Yes?');
+  await flush();
+  chatInput.value = 'third';
+  chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+  assert.deepEqual(h.g.calls.sendChat, ['first', 'third'], 'the latch releases with the reply');
+  app.dispose();
+});
+
+test('a chat reply outranks an ambient line arriving at the same moment', async () => {
+  const gate = deferred();
+  const h = await bootHarness({ reply: () => gate.promise });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  h.dom.chatInput.value = 'are you free?';
+  h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+
+  // A hook fires while she is thinking. It must not take the bubble.
+  h.g.speakCb({ text: 'Running npm test…' });
+  assert.equal(h.dom.bubble.textContent, CHAT_PENDING_LINE, 'ambient blocked mid-exchange');
+
+  gate.resolve('For you, always.');
+  await flush();
+  assert.equal(h.dom.bubble.textContent, 'For you, always.', 'the answer wins');
+  app.dispose();
+});
+
+test('an ambient line does not stomp a reply he is still reading', async () => {
+  const h = await bootHarness({ reply: 'The build is clean.' });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  h.dom.chatInput.value = 'how did the build go?';
+  h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+  assert.equal(h.dom.bubble.textContent, 'The build is clean.');
+
+  h.g.speakCb({ text: 'Edit finished in ganyu-pet.' });
+  assert.equal(h.dom.bubble.textContent, 'The build is clean.', 'the reply holds the bubble');
+  app.dispose();
+});
+
+test('dispose closes an open chat and hands focusability back', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  assert.equal(h.dom.chat.hidden, false);
+  app.dispose();
+  assert.equal(h.dom.chat.hidden, true);
+  assert.equal(h.dom.chatInput.listenerCount('keydown'), 0);
+  assert.equal(h.dom.canvas.listenerCount('click'), 0);
+  assert.deepEqual(h.g.calls.setFocused, [true, false]);
+  assert.equal(h.g.calls.setInteractive.at(-1), false);
+});
+
+test('boot no-ops when the chat elements are missing from the page', async () => {
+  const dom = makeDom();
+  const byId = {
+    pet: dom.canvas,
+    bubble: dom.bubble,
+    menu: dom.menu,
+    chat: dom.chat, // no #chat-input
+  };
+  const doc = makeEl('#document', {
+    documentElement: dom.documentElement,
+    readyState: 'complete',
+    getElementById: (id) => byId[id] || null,
+  });
+  const g = makeGanyu(() => Promise.resolve({}));
+  assert.equal(await boot({ win: dom.win, doc, ganyu: g.api }), null);
 });
 
 test('dispose detaches every listener and restores click-through', async () => {

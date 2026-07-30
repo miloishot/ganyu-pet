@@ -7,7 +7,7 @@
 // Everything with a side effect is injectable so this file imports cleanly in
 // plain node (no Electron, no DOM) for unit checks.
 
-import { createBubbles } from './bubbles.mjs';
+import { createBubbles, BUBBLE_PRIORITY } from './bubbles.mjs';
 
 export const FRAME_W = 192;
 export const FRAME_H = 208;
@@ -211,10 +211,11 @@ export function createInteractivity({ setInteractive }) {
   let overPet = false;
   let overMenu = false;
   let menuOpen = false;
+  let chatOpen = false;
   let current = null;
 
   function sync() {
-    const want = overPet || overMenu || menuOpen;
+    const want = overPet || overMenu || menuOpen || chatOpen;
     if (want === current) return current;
     current = want;
     setInteractive(want);
@@ -234,11 +235,21 @@ export function createInteractivity({ setInteractive }) {
       menuOpen = Boolean(v);
       return sync();
     },
+    /**
+     * Chat latch. Same shape as menuOpen, and load-bearing for a different
+     * reason: an open input has to survive the pointer wandering off the
+     * window entirely, because he is looking at the keyboard, not the pet.
+     */
+    setChatOpen(v) {
+      chatOpen = Boolean(v);
+      return sync();
+    },
     /** Pointer left the window entirely — drop every hover latch at once. */
     releaseAll() {
       overPet = false;
       overMenu = false;
       menuOpen = false;
+      chatOpen = false;
       return sync();
     },
     sync,
@@ -268,6 +279,18 @@ export function menuLabels({ muted = false, pinned = false } = {}) {
   };
 }
 
+/**
+ * Held while a reply is in flight (~3s). Deliberately unfinished-sounding: the
+ * owner has to be able to tell at a glance that this is not the answer.
+ */
+export const CHAT_PENDING_LINE = 'Let me think for a moment…';
+
+/**
+ * The reply never came. Something must always take the pending line back down,
+ * so a dead brain reads as a distracted secretary rather than a frozen one.
+ */
+export const CHAT_FAILED_LINE = 'Forgive me — my thoughts went quiet just then.';
+
 function loadImage({ src, ImageCtor }) {
   return new Promise((resolve, reject) => {
     const img = new ImageCtor();
@@ -296,7 +319,9 @@ export async function boot({
   const canvas = doc.getElementById('pet');
   const bubbleEl = doc.getElementById('bubble');
   const menuEl = doc.getElementById('menu');
-  if (!canvas || !bubbleEl || !menuEl) return null;
+  const chatEl = doc.getElementById('chat');
+  const chatInput = doc.getElementById('chat-input');
+  if (!canvas || !bubbleEl || !menuEl || !chatEl || !chatInput) return null;
 
   const bubbles = createBubbles({ el: bubbleEl });
   const animator = createAnimator({ now });
@@ -314,7 +339,8 @@ export async function boot({
     animator.setState(state || {}, now());
   });
   ganyu.onSpeak((payload) => {
-    bubbles.show(payload && payload.text);
+    // Ambient priority: a hook line yields to a reply he is still reading.
+    bubbles.show(payload && payload.text, { priority: BUBBLE_PRIORITY.ambient });
   });
 
   const flags = (await ganyu.getFlags()) || {};
@@ -376,6 +402,73 @@ export async function boot({
 
   paintMenu();
 
+  // ---- chat ----------------------------------------------------------------
+  // The input strip is absolutely positioned inside the existing 256x320
+  // window (styles.css #chat) — the window must not grow, so the strip lies
+  // over the sprite's feet rather than beside it.
+
+  let chatPending = false;
+
+  const bridge = (name, ...args) =>
+    (typeof ganyu[name] === 'function' ? ganyu[name](...args) : undefined);
+
+  function chatIsOpen() {
+    return chatEl.hidden !== true;
+  }
+
+  function openChat() {
+    if (chatIsOpen()) {
+      if (typeof chatInput.focus === 'function') chatInput.focus();
+      return;
+    }
+    chatEl.hidden = false;
+    interactivity.setChatOpen(true);
+    // The overlay is constructed focusable:false so it never steals focus from
+    // the editor, which also means it cannot receive a keystroke. Main has to
+    // make it focusable and focus it before the caret is real.
+    bridge('setFocused', true);
+    if (typeof chatInput.focus === 'function') chatInput.focus();
+  }
+
+  function closeChat() {
+    if (!chatIsOpen()) return;
+    chatEl.hidden = true;
+    chatInput.value = '';
+    if (typeof chatInput.blur === 'function') chatInput.blur();
+    interactivity.setChatOpen(false);
+    // Hand focus back and make the window unfocusable again — an always-on-top
+    // overlay that keeps focus is an overlay that swallows the next keystroke
+    // meant for the editor.
+    bridge('setFocused', false);
+  }
+
+  async function submitChat() {
+    // Single-flight matches chat.mjs: a second send while one is pending would
+    // resolve null there anyway, and would replace this pending bubble with a
+    // failure line for a message that is still perfectly in flight.
+    if (chatPending) return false;
+    const typed = typeof chatInput.value === 'string' ? chatInput.value : '';
+    if (typed.trim() === '') return false;
+
+    chatInput.value = '';
+    chatPending = true;
+    bubbles.show(CHAT_PENDING_LINE, { priority: BUBBLE_PRIORITY.chat });
+
+    let reply = null;
+    try {
+      reply = await bridge('sendChat', typed);
+    } catch {
+      reply = null;
+    } finally {
+      chatPending = false;
+    }
+
+    // Whatever happened, the pending line is not allowed to be her last word.
+    const line = typeof reply === 'string' && reply.trim() !== '' ? reply : CHAT_FAILED_LINE;
+    bubbles.show(line, { priority: BUBBLE_PRIORITY.chat });
+    return true;
+  }
+
   // ---- listeners -----------------------------------------------------------
 
   const off = [];
@@ -395,7 +488,31 @@ export async function boot({
   const root = doc.documentElement;
   on(root, 'mouseleave', () => {
     if (!menuEl.hidden) return; // keep an open menu usable
+    // Same for an open input, and it matters more: he is typing, so the pointer
+    // has no reason to stay on a 256px window. Releasing here would make the
+    // window click-through mid-sentence and drop the rest of what he types.
+    if (chatIsOpen()) return;
     interactivity.releaseAll();
+  });
+
+  // Left-click toggles the chat strip; right-click still opens the menu below.
+  on(canvas, 'click', (ev) => {
+    if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+    closeMenu();
+    if (chatIsOpen()) closeChat();
+    else openChat();
+  });
+
+  on(chatInput, 'keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      if (typeof ev.preventDefault === 'function') ev.preventDefault();
+      submitChat();
+      return;
+    }
+    if (ev.key === 'Escape') {
+      if (typeof ev.preventDefault === 'function') ev.preventDefault();
+      closeChat();
+    }
   });
 
   on(canvas, 'contextmenu', (ev) => {
@@ -419,14 +536,23 @@ export async function boot({
   });
 
   on(doc, 'mousedown', (ev) => {
-    if (menuEl.hidden) return;
-    if (menuEl.contains && menuEl.contains(ev.target)) return;
-    closeMenu();
+    const target = ev && ev.target;
+    const inside = (el) => Boolean(el.contains && el.contains(target));
+    if (!menuEl.hidden && !inside(menuEl)) closeMenu();
+    // The sprite is exempt: mousedown precedes click, so closing here would let
+    // the click that follows reopen an input he had just typed into.
+    if (chatIsOpen() && target !== canvas && !inside(chatEl)) closeChat();
   });
   on(doc, 'keydown', (ev) => {
-    if (ev.key === 'Escape') closeMenu();
+    if (ev.key !== 'Escape') return;
+    closeMenu();
+    closeChat();
   });
-  on(win, 'blur', () => closeMenu());
+  on(win, 'blur', () => {
+    closeMenu();
+    // He clicked into the editor. Close, and give up focusability with it.
+    closeChat();
+  });
 
   // ---- sprite --------------------------------------------------------------
 
@@ -465,6 +591,7 @@ export async function boot({
     bubbles,
     interactivity,
     renderer,
+    chat: { open: openChat, close: closeChat, submit: submitChat, get isOpen() { return chatIsOpen(); } },
     flags: { get muted() { return muted; }, get pinned() { return pinned; }, spritePath },
     dispose() {
       running = false;
@@ -473,6 +600,7 @@ export async function boot({
       for (const undo of off.splice(0)) undo();
       bubbles.hide();
       closeMenu();
+      closeChat();
       interactivity.releaseAll();
     },
   };
