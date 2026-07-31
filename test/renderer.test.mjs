@@ -26,7 +26,6 @@ import {
   createInteractivity,
   clampMenu,
   menuLabels,
-  CHAT_PENDING_LINE,
   CHAT_FAILED_LINE,
   boot,
 } from '../src/renderer/pet.mjs';
@@ -35,6 +34,8 @@ import {
   BUBBLE_TTL_MS,
   BUBBLE_FADE_MS,
   BUBBLE_PRIORITY,
+  THINKING_CLASS,
+  THINKING_MARK,
 } from '../src/renderer/bubbles.mjs';
 
 // ---------------------------------------------------------------------------
@@ -646,6 +647,94 @@ test('createBubbles requires an element', () => {
   assert.throws(() => createBubbles({}), TypeError);
 });
 
+test('thinking() raises the wordless pending state at chat priority', () => {
+  const el = makeEl('bubble');
+  el.hidden = true;
+  const b = createBubbles({ el, schedule: () => 1, cancel: () => {} });
+
+  assert.equal(b.thinking(), true);
+  assert.equal(el.textContent, THINKING_MARK, 'dots, not words');
+  assert.equal(el.hidden, false, 'he can see something is happening');
+  assert.equal(el.classList.contains(THINKING_CLASS), true);
+  assert.equal(b.isThinking, true);
+  assert.equal(b.priority, BUBBLE_PRIORITY.chat, 'holds the bubble like the old sentence did');
+
+  // Which is the point of chat priority: a hook line cannot interrupt her.
+  assert.equal(b.show('Running npm test…'), false, 'ambient refused mid-thought');
+  assert.equal(el.textContent, THINKING_MARK);
+  assert.equal(b.isThinking, true);
+});
+
+test('anything the bubble shows next takes the dots down', () => {
+  // The guarantee lives here rather than at the call sites: the reply, the
+  // failure line, teardown and a later ambient line all clear it without anyone
+  // having to remember to, so nothing can leave the bubble pulsing at a finished
+  // answer.
+  const make = () => {
+    const el = makeEl('bubble');
+    const timers = [];
+    const b = createBubbles({
+      el,
+      schedule: (fn, ms) => {
+        timers.push({ fn, ms });
+        return timers.length;
+      },
+      cancel: (handle) => {
+        timers[handle - 1] = null;
+      },
+    });
+    return { el, b, timers };
+  };
+
+  const answered = make();
+  answered.b.thinking();
+  answered.b.show('Of course.', { priority: BUBBLE_PRIORITY.chat });
+  assert.equal(answered.b.isThinking, false, 'a reply clears the pulse');
+  assert.equal(answered.el.textContent, 'Of course.');
+
+  const torn = make();
+  torn.b.thinking();
+  torn.b.hide();
+  assert.equal(torn.b.isThinking, false, 'teardown clears it');
+
+  // The case no call site would have remembered: the reply took longer than the
+  // bubble's own 8s, so the hold lapsed and a hook line got the bubble first.
+  const ambient = make();
+  ambient.b.thinking();
+  ambient.timers[0].fn();
+  assert.equal(ambient.b.show('Running npm test…'), true, 'ambient gets in once the hold ends');
+  assert.equal(ambient.b.isThinking, false, 'and it clears the pulse too');
+  assert.equal(ambient.el.textContent, 'Running npm test…');
+});
+
+test('the fade timer clears the pending class along with the text', () => {
+  const el = makeEl('bubble');
+  const timers = [];
+  const b = createBubbles({
+    el,
+    schedule: (fn, ms) => {
+      timers.push({ fn, ms });
+      return timers.length;
+    },
+    cancel: (h) => {
+      timers[h - 1] = null;
+    },
+  });
+
+  b.thinking();
+  assert.equal(b.isThinking, true);
+
+  timers[0].fn(); // 8s: a reply slower than the bubble's own lifetime
+  assert.equal(b.visible, false, 'the bubble starts to fade');
+  timers[timers.length - 1].fn(); // fade done
+  assert.equal(el.textContent, '');
+  assert.equal(b.isThinking, false, 'a faded bubble is not left holding the class');
+
+  // And the reply that finally arrives shows as an ordinary line.
+  b.show('Sorry — that took a while.', { priority: BUBBLE_PRIORITY.chat });
+  assert.equal(el.classList.contains(THINKING_CLASS), false);
+});
+
 // ---------------------------------------------------------------------------
 // boot() integration
 // ---------------------------------------------------------------------------
@@ -1105,16 +1194,19 @@ test('Enter sends, shows a temporary line, then replaces it with the reply', asy
 
   assert.deepEqual(h.g.calls.sendChat, ['  how is it going?  '], 'the raw text goes to main');
   assert.equal(chatInput.value, '', 'field cleared on send');
-  assert.equal(bubble.textContent, CHAT_PENDING_LINE, 'a clearly temporary line while she thinks');
+  assert.equal(bubble.textContent, THINKING_MARK, 'dots while she thinks, not a sentence');
+  assert.equal(bubble.classList.contains(THINKING_CLASS), true, 'and the class CSS pulses');
+  assert.equal(bubble.hidden, false, 'he can see that she heard him');
   assert.equal(h.dom.chat.hidden, false, 'the input stays open for the next message');
 
   gate.resolve('It goes well, thank you.');
   await flush();
-  assert.equal(bubble.textContent, 'It goes well, thank you.', 'pending line replaced');
+  assert.equal(bubble.textContent, 'It goes well, thank you.', 'pending state replaced');
+  assert.equal(bubble.classList.contains(THINKING_CLASS), false, 'and the pulse stopped with it');
   app.dispose();
 });
 
-test('a failed reply replaces the pending line rather than leaving it hanging', async () => {
+test('a failed reply replaces the pending dots rather than leaving them hanging', async () => {
   for (const reply of [null, '   ', () => Promise.reject(new Error('down'))]) {
     const h = await bootHarness({ reply });
     await flush();
@@ -1128,9 +1220,24 @@ test('a failed reply replaces the pending line rather than leaving it hanging', 
     await flush();
 
     assert.equal(h.dom.bubble.textContent, CHAT_FAILED_LINE, `reply=${String(reply)}`);
-    assert.notEqual(h.dom.bubble.textContent, CHAT_PENDING_LINE);
+    assert.notEqual(h.dom.bubble.textContent, THINKING_MARK);
+    assert.equal(
+      h.dom.bubble.classList.contains(THINKING_CLASS),
+      false,
+      `reply=${String(reply)}: nothing may leave the dots pulsing forever`,
+    );
     app.dispose();
   }
+});
+
+test('the pending state is wordless, and the failure line is not', () => {
+  // The distinction the owner asked for: dots are what she shows before every
+  // single answer, so they must not be words. The failure line is rare and has
+  // something to say, so it stays a sentence.
+  assert.equal(/[a-z]/i.test(THINKING_MARK), false, 'not a word, not a sentence');
+  assert.equal(THINKING_MARK.trim(), THINKING_MARK, 'and survives the bubble trim');
+  assert.ok(THINKING_MARK.length > 0);
+  assert.ok(/[a-z]/i.test(CHAT_FAILED_LINE), 'the failure line is still a real message');
 });
 
 test('blank input is not sent, and a second Enter while pending is ignored', async () => {
@@ -1179,9 +1286,11 @@ test('a chat reply outranks an ambient line arriving at the same moment', async 
   h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
   await flush();
 
-  // A hook fires while she is thinking. It must not take the bubble.
+  // A hook fires while she is thinking. It must not take the bubble — the dots
+  // hold it at chat priority exactly as the old pending sentence did.
   h.g.speakCb({ text: 'Running npm test…' });
-  assert.equal(h.dom.bubble.textContent, CHAT_PENDING_LINE, 'ambient blocked mid-exchange');
+  assert.equal(h.dom.bubble.textContent, THINKING_MARK, 'ambient blocked mid-exchange');
+  assert.equal(h.dom.bubble.classList.contains(THINKING_CLASS), true, 'still pulsing');
 
   gate.resolve('For you, always.');
   await flush();

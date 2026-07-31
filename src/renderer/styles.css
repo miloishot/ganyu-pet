@@ -98,6 +98,28 @@ body {
   transform: translateY(0);
 }
 
+/* Pending state: three dots instead of a sentence (bubbles.mjs THINKING_MARK).
+   The pulse is on `color`, not `opacity` — fading the element would fade the
+   panel, the border and the shadow with it, and a breathing speech bubble reads
+   as a rendering fault rather than as thought. Nothing here needs a timer: the
+   renderer's frame loop is for the sprite, and this is the compositor's job. */
+
+#bubble.is-thinking {
+  letter-spacing: 3px;
+  font-size: 14px;
+  animation: ganyu-thinking 1.4s ease-in-out infinite;
+}
+
+@keyframes ganyu-thinking {
+  0%,
+  100% {
+    color: rgba(238, 244, 255, 0.4);
+  }
+  50% {
+    color: rgba(238, 244, 255, 1);
+  }
+}
+
 #bubble::after {
   content: "";
   position: absolute;
@@ -220,5 +242,12 @@ body {
 
   #bubble.is-visible {
     transform: none;
+  }
+
+  /* Still dots, just still: the state is carried by what is in the bubble, so
+     dropping the animation costs nothing but the movement. */
+  #bubble.is-thinking {
+    animation: none;
+    color: var(--ganyu-ink);
   }
 }

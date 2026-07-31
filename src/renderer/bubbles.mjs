@@ -19,10 +19,31 @@ export const BUBBLE_FADE_MS = 400; // must be >= the CSS transition duration
  * The hold is the existing TTL, not a second timer: an ambient line is refused
  * only while the chat line is *visible*, so the bubble opens back up to ambient
  * lines the moment the chat line starts to fade. Chat lines never block each
- * other — equal priority replaces, which is how the pending "thinking" line is
+ * other — equal priority replaces, which is how the pending "thinking" state is
  * taken back down by the real reply.
  */
 export const BUBBLE_PRIORITY = Object.freeze({ ambient: 0, chat: 1 });
+
+/**
+ * The wordless pending state: `thinking()` puts these three dots in the bubble
+ * and lets `styles.css` pulse them.
+ *
+ * It used to be a sentence — "Let me think for a moment…" — and the trouble with
+ * a sentence is that it is the *same* sentence on every turn. Said once it is in
+ * character; said before every answer she ever gives, it is filler, and it makes
+ * her look like she is stalling rather than thinking. Dots say the one thing
+ * that actually needs saying, which is that she heard him and something is
+ * happening.
+ *
+ * Deliberately still text in the same bubble rather than a second element: the
+ * priority arbitration above then needs no changes at all. A pending exchange
+ * holds the bubble against ambient lines exactly as the sentence did, and the
+ * reply replaces it simply by being the newer chat line.
+ */
+export const THINKING_MARK = '•••';
+
+/** Set while the dots are up; the only thing `styles.css` animates. */
+export const THINKING_CLASS = 'is-thinking';
 
 /**
  * @param {object} opts
@@ -58,8 +79,39 @@ export function createBubbles({
     visible = false;
     priority = BUBBLE_PRIORITY.ambient;
     el.classList.remove('is-visible');
+    el.classList.remove(THINKING_CLASS);
     el.hidden = true;
     el.textContent = '';
+  }
+
+  function put(line, want) {
+    if (visible && want < priority) return false;
+    priority = want;
+    clearTimers();
+    // Whatever put the dots up, showing anything at all takes them down: the
+    // reply, the failure line, or a later ambient line. Keeping that here rather
+    // than beside the caller is what makes it a guarantee instead of something
+    // three call sites have to remember.
+    el.classList.remove(THINKING_CLASS);
+    // textContent, never innerHTML: this string comes from an LLM.
+    el.textContent = line;
+    el.hidden = false;
+    el.classList.add('is-visible');
+    visible = true;
+    fadeTimer = schedule(() => {
+      fadeTimer = null;
+      visible = false;
+      // The hold ends with the line: a fading reply no longer blocks ambient.
+      priority = BUBBLE_PRIORITY.ambient;
+      el.classList.remove('is-visible');
+      clearTimer = schedule(() => {
+        clearTimer = null;
+        el.hidden = true;
+        el.classList.remove(THINKING_CLASS);
+        el.textContent = '';
+      }, fadeMs);
+    }, ttlMs);
+    return true;
   }
 
   return {
@@ -71,27 +123,18 @@ export function createBubbles({
     show(text, { priority: want = BUBBLE_PRIORITY.ambient } = {}) {
       const line = typeof text === 'string' ? text.trim() : '';
       if (!line) return false;
-      if (visible && want < priority) return false;
-      priority = want;
-      clearTimers();
-      // textContent, never innerHTML: this string comes from an LLM.
-      el.textContent = line;
-      el.hidden = false;
-      el.classList.add('is-visible');
-      visible = true;
-      fadeTimer = schedule(() => {
-        fadeTimer = null;
-        visible = false;
-        // The hold ends with the line: a fading reply no longer blocks ambient.
-        priority = BUBBLE_PRIORITY.ambient;
-        el.classList.remove('is-visible');
-        clearTimer = schedule(() => {
-          clearTimer = null;
-          el.hidden = true;
-          el.textContent = '';
-        }, fadeMs);
-      }, ttlMs);
-      return true;
+      return put(line, want);
+    },
+
+    /**
+     * Raise the wordless pending state (see THINKING_MARK). Chat priority, so it
+     * holds the bubble against ambient lines for as long as a sentence did, and
+     * so the reply — also chat priority — replaces it rather than being refused.
+     */
+    thinking() {
+      const shown = put(THINKING_MARK, BUBBLE_PRIORITY.chat);
+      if (shown) el.classList.add(THINKING_CLASS);
+      return shown;
     },
 
     /** Immediate teardown (no fade). */
@@ -104,6 +147,11 @@ export function createBubbles({
     /** Priority of the line currently holding the bubble. */
     get priority() {
       return priority;
+    },
+
+    /** True while the dots are up rather than words. */
+    get isThinking() {
+      return el.classList.contains(THINKING_CLASS);
     },
 
     get text() {

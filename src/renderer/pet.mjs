@@ -305,14 +305,12 @@ export function menuLabels({ muted = false, pinned = false } = {}) {
 }
 
 /**
- * Held while a reply is in flight (~3s). Deliberately unfinished-sounding: the
- * owner has to be able to tell at a glance that this is not the answer.
- */
-export const CHAT_PENDING_LINE = 'Let me think for a moment…';
-
-/**
- * The reply never came. Something must always take the pending line back down,
+ * The reply never came. Something must always take the pending dots back down,
  * so a dead brain reads as a distracted secretary rather than a frozen one.
+ *
+ * This one stays a sentence while the pending state no longer is (see
+ * `THINKING_MARK` in bubbles.mjs): it is a real message, and the difference
+ * between the two is that this one is said rarely and has something to say.
  */
 export const CHAT_FAILED_LINE = 'Forgive me — my thoughts went quiet just then.';
 
@@ -520,7 +518,9 @@ export async function boot({
 
     chatInput.value = '';
     chatPending = true;
-    bubbles.show(CHAT_PENDING_LINE, { priority: BUBBLE_PRIORITY.chat });
+    // Dots, not a sentence — she heard him and something is happening, without
+    // her saying the same words before every answer she ever gives.
+    bubbles.thinking();
 
     let reply = null;
     try {
@@ -531,7 +531,7 @@ export async function boot({
       chatPending = false;
     }
 
-    // Whatever happened, the pending line is not allowed to be her last word.
+    // Whatever happened, the dots are not allowed to be her last word.
     const line = typeof reply === 'string' && reply.trim() !== '' ? reply : CHAT_FAILED_LINE;
     bubbles.show(line, { priority: BUBBLE_PRIORITY.chat });
     return true;
