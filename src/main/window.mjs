@@ -141,6 +141,15 @@ export const CHANNELS = Object.freeze({
   menu: 'ganyu:menu',
   getFlags: 'ganyu:get-flags',
   drag: 'ganyu:drag',
+  /**
+   * Main -> renderer, carrying `{mime, base64}` for one line she has just said.
+   * Push-only, like `state` and `speak`, so `registerIpc` has nothing to
+   * register for it. The audio is synthesized in main because that is where the
+   * network and the `.env.local` config already live, and it rides its own
+   * channel rather than `speak` because it arrives a second or so later — the
+   * bubble must never wait for a synthesizer.
+   */
+  audio: 'ganyu:audio',
 });
 
 /**
@@ -606,6 +615,7 @@ export function registerIpc({
   onInteractive = null,
   onDrag = null,
   getChat = null,
+  onReply = null,
 }) {
   const handleSetInteractive = (_event, interactive) => {
     if (onInteractive) {
@@ -625,7 +635,16 @@ export function registerIpc({
     if (onDrag && DRAG_PHASES.includes(phase)) onDrag(phase);
   };
 
-  /** Owner -> Ganyu. Always a string or null; never a rejection, never a hang. */
+  /**
+   * Owner -> Ganyu. Always a string or null; never a rejection, never a hang.
+   *
+   * `onReply` is where a reply is *spoken*. It hangs here rather than in the
+   * renderer because the synthesizer, its config and its socket all live in
+   * main, and it is called after the reply is settled rather than instead of
+   * returning it: the strip must show his answer at chat latency whatever the
+   * voice is doing. It is fire-and-forget for the same reason — a synthesizer
+   * that hangs must not hang the reply.
+   */
   const handleChat = async (_event, text) => {
     let chat = null;
     try {
@@ -636,7 +655,15 @@ export function registerIpc({
     if (!chat || typeof chat.send !== 'function') return null;
     try {
       const reply = await chat.send(String(text ?? ''));
-      return typeof reply === 'string' && reply.trim() !== '' ? reply : null;
+      const line = typeof reply === 'string' && reply.trim() !== '' ? reply : null;
+      if (line && onReply) {
+        try {
+          onReply(line);
+        } catch {
+          /* an unsayable reply is still a reply */
+        }
+      }
+      return line;
     } catch {
       return null;
     }

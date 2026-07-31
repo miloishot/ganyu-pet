@@ -16,6 +16,13 @@ const subscribe = (channel, cb) => {
 contextBridge.exposeInMainWorld('ganyu', {
   onState: (cb) => subscribe('ganyu:state', cb),
   onSpeak: (cb) => subscribe('ganyu:speak', cb),
+  /**
+   * Her voice: `{mime, base64}` for a line already on `ganyu:speak`. A separate
+   * channel because it arrives a second or so later — synthesis is not allowed
+   * to delay the bubble — and main sends it only for lines that passed the same
+   * mute and salience gates the bubble did.
+   */
+  onAudio: (cb) => subscribe('ganyu:audio', cb),
   setInteractive: (interactive) => ipcRenderer.send('ganyu:set-interactive', Boolean(interactive)),
   menuAction: (action) => ipcRenderer.send('ganyu:menu', String(action)),
   /**

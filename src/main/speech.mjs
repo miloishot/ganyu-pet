@@ -178,6 +178,10 @@ export const projectName = projectFromCwd;
  *            mid-evening, having already mentioned the hour.
  * ledger   — optional {record(entry)} (ledger.createLedger). Absent is the
  *            original behaviour: she reacts and forgets.
+ * voice    — optional {speak(text, {kind})} -> Promise<audio|null> (voice.mjs).
+ *            Absent is the original behaviour: she is read, not heard.
+ * onAudio  — where that audio goes (module A sends it to the renderer). Called
+ *            with {mime, base64, kind, text} some seconds after `onLine`.
  */
 export function createSpeech({
   clock = { now: () => Date.now() },
@@ -187,12 +191,15 @@ export function createSpeech({
   brain = null,
   mentionMemory = createMentionMemory(),
   ledger = null,
+  voice = null,
+  onAudio = () => {},
 } = {}) {
   const now = () => (typeof clock === 'function' ? clock() : clock.now());
   const muted = () => (typeof isMuted === 'function' ? Boolean(isMuted()) : Boolean(isMuted));
 
   const askBrain = typeof brain?.requestLine === 'function' ? brain : null;
   const diary = typeof ledger?.record === 'function' ? ledger : null;
+  const talker = typeof voice?.speak === 'function' ? voice : null;
 
   let lastSpokeAt = null;
   let lastKind = null;
@@ -343,6 +350,38 @@ export function createSpeech({
   }
 
   /**
+   * Say it out loud. Deliberately hung off `show()` and nowhere else: whatever
+   * the salience gate, the mute check and the throttle let into the bubble is
+   * exactly what she says, so giving her a voice cannot make her talk *more*.
+   *
+   * Fire-and-forget. Nothing waits on it, nothing is retried, and a synthesizer
+   * that is down costs her the sound and not the line — `voice.speak` already
+   * promises never to reject, and the catch here is the belt to that brace.
+   *
+   * Two things are re-checked when the audio arrives rather than when it was
+   * asked for, for the same reason `awaitBrain` re-checks them: synthesis takes
+   * a second or so, and in that time he may have muted her, or a newer line may
+   * have taken the bubble — in which case this one is about old news and playing
+   * it would put her voice out of step with what he is reading.
+   */
+  function speakAloud(kind, text, seq) {
+    if (!talker) return;
+    Promise.resolve()
+      .then(() => talker.speak(text, { kind }))
+      .then((audio) => {
+        if (!audio || shownCount !== seq || muted()) return;
+        try {
+          onAudio({ ...audio, kind, text });
+        } catch {
+          /* the same promise the line listener gets */
+        }
+      })
+      .catch(() => {
+        /* speak() is contracted not to reject; a pet who cannot speak still writes */
+      });
+  }
+
+  /**
    * The single gate every line passes through, canned or generated. Mute and the
    * throttle are checked here rather than at the trigger, because a brain reply
    * is shown some seconds after its event: by then the owner may have muted her,
@@ -373,6 +412,7 @@ export function createSpeech({
     lastKind = kind;
     shownCount += 1;
     emit({ text, kind, mode: ev.mode ?? null, source: ev.source, summary });
+    speakAloud(kind, text, shownCount);
     return { spoken: true, reason: 'spoken', kind, text, summary };
   }
 

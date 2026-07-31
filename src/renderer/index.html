@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy"
-        content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file: data:; connect-src 'none';" />
+        content="default-src 'none'; script-src 'self' file:; style-src 'self' file:; img-src 'self' file: data:; media-src data:; connect-src 'none';" />
   <title>Ganyu</title>
   <link rel="stylesheet" href="./styles.css" />
   <!-- INTEGRATION NOTE (module C -> module A): Chromium refuses EXTERNAL module
@@ -33,6 +33,12 @@
              autocapitalize="off" spellcheck="false"
              placeholder="Say something…" aria-label="Message Ganyu" />
     </div>
+    <!-- Her voice. Main synthesizes the line and sends it over `ganyu:audio` as
+         a base64 data URL, which is why the CSP above allows `media-src data:`
+         and nothing else — this element must never be able to reach the network.
+         Never `controls`: it is invisible, it is not a player, and the pet is a
+         256x320 sprite with no room for one. -->
+    <audio id="voice" preload="none"></audio>
     <div id="menu" role="menu" hidden>
       <button type="button" id="menu-mute" role="menuitem" data-action="toggle-mute">Mute</button>
       <button type="button" id="menu-pin" role="menuitem" data-action="toggle-pin">Pin</button>

@@ -3,6 +3,7 @@
 // production dependencies injected.
 
 import { app, BrowserWindow, ipcMain, screen } from 'electron';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -104,6 +105,7 @@ let spriteUrl = null;
 let state = null;
 let server = null;
 let chat = null;
+let voice = null;
 let walk = null;
 let statePoll = null;
 let hoverPoll = null;
@@ -301,6 +303,37 @@ function pushState(force = false) {
   if (!force && key === lastPushed) return;
   lastPushed = key;
   send(CHANNELS.state, payload);
+}
+
+/**
+ * Push one line's audio to the renderer. `mime` and `base64` only — the rest of
+ * what voice.mjs returns (byte count, latency, which synthesizer) is for the log
+ * and for `stats()`, and there is no reason to ship it across the bridge.
+ */
+function sendAudio(audio) {
+  if (!audio || typeof audio.base64 !== 'string' || audio.base64 === '') return;
+  if (process.env.GANYU_DEBUG === '1') {
+    console.log(`[ganyu][voice] ${audio.source} ${audio.bytes}B in ${audio.ms}ms`);
+  }
+  send(CHANNELS.audio, { mime: audio.mime, base64: audio.base64 });
+}
+
+/**
+ * Say a chat reply out loud. The ambient path does not come through here — it
+ * hangs off speech.mjs's `show()` gate, which is the only thing allowed to
+ * decide that a line is worth making a sound about. A reply needs no such gate:
+ * he asked, so it is wanted by construction. Mute is checked twice, before and
+ * after synthesis, for the same reason speech.mjs checks it late — a second
+ * passes in between and he may have reached for the menu.
+ */
+async function speakReply(text) {
+  if (!voice || flags.muted) return;
+  try {
+    const audio = await voice.speak(text, { kind: 'chat' });
+    if (audio && !flags.muted) sendAudio(audio);
+  } catch (err) {
+    console.warn('[ganyu] voice failed:', err?.message);
+  }
 }
 
 function sendSpeak(line) {
@@ -621,6 +654,36 @@ async function composeRuntime() {
       : '[ganyu] conversation: not saved — she will not remember this past a restart',
   );
 
+  // Her voice. Optional in the same way the brain is, and for stronger reasons:
+  // it needs no key, so the only thing that turns it off is asking. Not built
+  // under GANYU_SMOKE — the smoke check must not open a socket to Microsoft.
+  let ambientVoice = null;
+  const voiceMod = await tryImport('./voice.mjs');
+  if (voiceMod?.createVoice && !SMOKE) {
+    const voiceConfig = voiceMod.loadVoiceConfig({ envPath: ENV_FILE, fs });
+    if (voiceConfig.enabled) {
+      voice = voiceMod.createVoice({
+        voice: voiceConfig.voice,
+        mode: voiceConfig.mode,
+        log: console,
+        // Ships with the feature, not after it. On this machine (Windows 11
+        // 21H2 / build 22000) the natural voices cannot be installed at all, so
+        // this is the 2005-era SAPI voice — dated, and far better than silence
+        // on a train with no wifi. See the header of voice.mjs.
+        fallback: voiceMod.createLocalVoice({ execFile, fs, tmpDir: os.tmpdir() }),
+      });
+      ambientVoice = voiceConfig.ambient ? voice : null;
+      // ~900ms of socket setup, spent now rather than in front of her first line.
+      voice.warm();
+      console.log(
+        `[ganyu] voice: ${voiceConfig.mode} (${voiceConfig.voice})` +
+          `${voiceConfig.ambient ? '' : ' — replies only, ambient lines stay silent'}`,
+      );
+    } else {
+      console.log(`[ganyu] voice: off (${voiceConfig.reason}) — she is read, not heard`);
+    }
+  }
+
   const speechMod = await tryImport('./speech.mjs');
   if (speechMod?.createSpeech) {
     const speech = speechMod.createSpeech({
@@ -630,6 +693,10 @@ async function composeRuntime() {
       isMuted: () => flags.muted || SMOKE,
       brain,
       ledger,
+      // Hung off speech's own `show()` gate, so mute, salience and the throttle
+      // decide what she says aloud exactly as they decide what she shows.
+      voice: ambientVoice,
+      onAudio: sendAudio,
     });
     speechSink = requireMethod('speech', speech, ['onEvent', 'handleEvent', 'notify', 'trigger', 'onState', 'ingest', 'speak']);
   }
@@ -873,6 +940,11 @@ async function main() {
     // Read per message, not captured: composeRuntime builds `chat` below, after
     // this runs. Anything he types before then answers null instead of rejecting.
     getChat: () => chat,
+    // And her half of it, said out loud. Fire-and-forget: the reply is already
+    // on its way back to the strip before this starts.
+    onReply: (line) => {
+      speakReply(line);
+    },
   });
 
   try {
@@ -926,6 +998,13 @@ function cleanup() {
   }
   if (disposeIpc) disposeIpc();
   disposeIpc = null;
+  if (voice) {
+    try {
+      voice.close(); // closes the warm socket and settles any line mid-synthesis
+    } catch {
+      /* shutting down */
+    }
+  }
   if (wanderStop) {
     try {
       wanderStop.call();

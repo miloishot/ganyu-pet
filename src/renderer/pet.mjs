@@ -314,6 +314,74 @@ export function menuLabels({ muted = false, pinned = false } = {}) {
  */
 export const CHAT_FAILED_LINE = 'Forgive me — my thoughts went quiet just then.';
 
+/**
+ * The only two formats main ever sends: Edge's MP3 and the local SAPI
+ * fallback's WAV. Anything else is refused rather than pasted into a `src`.
+ */
+export const AUDIO_MIMES = Object.freeze(['audio/mpeg', 'audio/wav']);
+
+/**
+ * Her voice, played through one `<audio>` element.
+ *
+ * **A new line interrupts the one being spoken; it never queues.** Two reasons,
+ * and they are the same two the bubble already answers to. A status line is only
+ * worth hearing while it is still true, so a queue would have her narrating
+ * something he has already watched finish (this is why speech.mjs drops a
+ * throttled line rather than holding it). And the bubble shows the newest line
+ * immediately — a queue would leave her voice describing the previous one while
+ * he reads this one, which is worse than either on its own.
+ *
+ * In practice they rarely collide at all: the non-urgent throttle is 90s, and
+ * even an urgent interruption clears a 6s floor against the same kind.
+ *
+ * `el` may be null — an overlay with no audio element is a silent pet, not a
+ * broken one.
+ */
+export function createVoicePlayer({ el } = {}) {
+  let playing = false;
+
+  function stop() {
+    if (!el) return false;
+    try {
+      el.pause?.();
+      el.removeAttribute?.('src');
+      // Without this the element keeps the old buffer and a later play() can
+      // resume it instead of the line it was just given.
+      el.load?.();
+    } catch {
+      /* an element that will not stop is not worth an exception */
+    }
+    playing = false;
+    return true;
+  }
+
+  return {
+    /** Play `{mime, base64}`. Returns false when there was nothing playable. */
+    play(payload) {
+      if (!el || !payload) return false;
+      const { mime, base64 } = payload;
+      if (!AUDIO_MIMES.includes(mime) || typeof base64 !== 'string' || base64 === '') return false;
+      try {
+        el.pause?.();
+        el.src = `data:${mime};base64,${base64}`;
+        const started = el.play?.();
+        // Autoplay is allowed in Electron (`autoplayPolicy` defaults to
+        // no-user-gesture-required), but a rejected promise here would be an
+        // unhandled rejection in a window with no console open.
+        if (started && typeof started.catch === 'function') started.catch(() => {});
+        playing = true;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    stop,
+    get playing() {
+      return playing;
+    },
+  };
+}
+
 function loadImage({ src, ImageCtor }) {
   return new Promise((resolve, reject) => {
     const img = new ImageCtor();
@@ -345,8 +413,12 @@ export async function boot({
   const chatEl = doc.getElementById('chat');
   const chatInput = doc.getElementById('chat-input');
   if (!canvas || !bubbleEl || !menuEl || !chatEl || !chatInput) return null;
+  // Deliberately not in the guard above: a missing <audio> costs her the sound,
+  // and taking the whole overlay down over it would cost him the pet.
+  const voiceEl = doc.getElementById('voice');
 
   const bubbles = createBubbles({ el: bubbleEl });
+  const voice = createVoicePlayer({ el: voiceEl });
   const animator = createAnimator({ now });
   const interactivity = createInteractivity({
     setInteractive: (v) => ganyu.setInteractive(v),
@@ -408,6 +480,10 @@ export async function boot({
     // Ambient priority: a hook line yields to a reply he is still reading.
     bubbles.show(payload && payload.text, { priority: BUBBLE_PRIORITY.ambient });
   });
+  // The audio for a line already shown. Main sends this only for lines that
+  // passed the mute and salience gates, so there is nothing left to decide here
+  // beyond interrupting whatever she was mid-sentence on.
+  if (typeof ganyu.onAudio === 'function') ganyu.onAudio((payload) => voice.play(payload));
 
   const flags = (await ganyu.getFlags()) || {};
   let muted = Boolean(flags.muted);
@@ -685,6 +761,7 @@ export async function boot({
   return {
     animator,
     bubbles,
+    voice,
     interactivity,
     renderer,
     chat: { open: openChat, close: closeChat, submit: submitChat, get isOpen() { return chatIsOpen(); } },
@@ -697,6 +774,7 @@ export async function boot({
       endPress(); // tell main before the listeners go, or the drag outlives us
       for (const undo of off.splice(0)) undo();
       bubbles.hide();
+      voice.stop(); // a bubble torn down while she is still speaking is a ghost
       closeMenu();
       closeChat();
       interactivity.releaseAll();
