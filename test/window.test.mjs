@@ -9,22 +9,31 @@ import assert from 'node:assert/strict';
 import { CHAT_CHANNELS, createChat } from '../src/main/chat.mjs';
 import {
   CHANNELS,
+  DRAG_HOLD_MS,
+  DRAG_MAX_MS,
+  DRAG_PHASES,
+  DRAG_THRESHOLD_PX,
   HOVER_POLL_MS,
   MENU_ACTIONS,
   SIZE_DRIFT_TOLERANCE,
   SPRITE_SIZE,
+  THROW_SAMPLE_WINDOW_MS,
   WINDOW_SIZE,
   computeInitialBounds,
+  createDragTracker,
   createHoverWatch,
   createPetWindow,
   enforceWindowSize,
   moveWindowPinned,
   pointInBox,
   registerIpc,
+  shouldPromoteDrag,
   sizeWithinTolerance,
   smokeFlags,
   spriteBox,
+  throwVelocity,
   toSpeechDetail,
+  toStatePayload,
 } from '../src/main/window.mjs';
 
 // ---------------------------------------------------------------- geometry
@@ -336,7 +345,8 @@ test('registerIpc registers the chat pair alongside the original three, and disp
   const h = ipcHarness();
   assert.ok(h.handlers.has(CHAT_CHANNELS.chat), 'ganyu:chat');
   assert.ok(h.handlers.has(CHAT_CHANNELS.setFocus), 'ganyu:set-focus');
-  assert.equal(h.handlers.size, 5, 'the three renderer->main channels plus the chat pair');
+  assert.ok(h.handlers.has(CHANNELS.drag), 'ganyu:drag');
+  assert.equal(h.handlers.size, 6, 'the four renderer->main channels plus the chat pair');
 
   // chat.mjs is the single home of these two strings; CHANNELS must not grow a
   // second copy of either, which is the only way the two tables could drift.
@@ -457,4 +467,282 @@ test('toSpeechDetail keeps the event mode and falls back to the aggregate', () =
   assert.equal(toSpeechDetail({ source: 'codex', event: 'Odd' }, { mode: 'waiting' }).mode, 'waiting');
   assert.equal(toSpeechDetail({ source: 'codex' }, null).mode, 'idle');
   assert.equal(toSpeechDetail(event, { mode: 'failed' }).tool, 'Bash');
+});
+
+test('toStatePayload carries the two motion flags, defaulting both to false', () => {
+  assert.deepEqual(toStatePayload({ mode: 'busy', sessionCount: 2 }, { dir: 'left' }), {
+    mode: 'busy',
+    sessionCount: 2,
+    celebrate: false,
+    walk: { dir: 'left' },
+    dragging: false,
+    airborne: false,
+  });
+  const held = toStatePayload({ mode: 'idle' }, null, { dragging: true, airborne: true });
+  assert.equal(held.dragging, true);
+  assert.equal(held.airborne, true);
+  // Mid-throw: nobody is holding her any more, but she is still off the ground.
+  assert.deepEqual(
+    toStatePayload({ mode: 'idle' }, null, { airborne: true }),
+    { mode: 'idle', sessionCount: 0, celebrate: false, walk: null, dragging: false, airborne: true },
+  );
+});
+
+// ------------------------------------------------------------- pick her up
+//
+// The renderer reports the button and nothing else; whether a press was a click
+// or a pick-up is decided here, from the real cursor. See createDragTracker for
+// why: forwarded mousemove is unreliable on this overlay, and even where it
+// arrives, a renderer-side drag reads its own output back as input because the
+// window chases the cursor.
+
+test('throw velocity is measured over a short window, and stale samples are dropped', () => {
+  const now = 1_000;
+  // 100px right and 50px up over the last 50ms = 2000/-1000 px/s.
+  const fresh = [
+    { x: 0, y: 100, t: now - 50 },
+    { x: 50, y: 75, t: now - 25 },
+    { x: 100, y: 50, t: now },
+  ];
+  assert.deepEqual(throwVelocity(fresh, now), { vx: 2000, vy: -1000 });
+
+  // The gesture that made this rule: a hard drag across the screen, then a pause
+  // before letting go. Only the pause is fresh, so she is set down, not thrown.
+  const paused = [
+    { x: 0, y: 0, t: now - 800 },
+    { x: 600, y: 0, t: now - 500 },
+    { x: 604, y: 0, t: now - 40 },
+    { x: 604, y: 0, t: now },
+  ];
+  const v = throwVelocity(paused, now);
+  assert.equal(v.vx, 0, 'the 600px of travel is outside the window and does not count');
+  assert.equal(v.vy, 0);
+
+  // One fresh sample is not a measurement, and neither is a zero-length window.
+  assert.deepEqual(throwVelocity([{ x: 0, y: 0, t: now - 400 }, { x: 9, y: 9, t: now }], now), { vx: 0, vy: 0 });
+  assert.deepEqual(throwVelocity([{ x: 0, y: 0, t: now }, { x: 9, y: 9, t: now }], now), { vx: 0, vy: 0 });
+  assert.deepEqual(throwVelocity([], now), { vx: 0, vy: 0 });
+  assert.deepEqual(throwVelocity(null, now), { vx: 0, vy: 0 });
+  assert.deepEqual(throwVelocity([{ x: NaN, y: 0, t: now }, { x: 1, y: 1, t: now - 10 }], now), { vx: 0, vy: 0 });
+
+  assert.equal(THROW_SAMPLE_WINDOW_MS, 100, 'the documented window');
+});
+
+test('click vs drag: the threshold decides, in both directions, at the boundary', () => {
+  const from = { x: 100, y: 100 };
+  const under = { x: 100 + DRAG_THRESHOLD_PX, y: 100 };
+  const over = { x: 100 + DRAG_THRESHOLD_PX + 1, y: 100 };
+
+  assert.equal(shouldPromoteDrag({ from, to: under, elapsedMs: 0 }), false, 'exactly at the threshold is a click');
+  assert.equal(shouldPromoteDrag({ from, to: over, elapsedMs: 0 }), true, 'one pixel further is a drag');
+
+  // Diagonal jitter counts as distance, not as two independent axes.
+  assert.equal(shouldPromoteDrag({ from, to: { x: 103, y: 103 }, elapsedMs: 0 }), true, 'hypotenuse 4.24');
+  assert.equal(shouldPromoteDrag({ from, to: { x: 102, y: 102 }, elapsedMs: 0 }), false, 'hypotenuse 2.83');
+
+  // The hold clock is the other half, and the half that carries this machine:
+  // it needs no mouse events at all.
+  assert.equal(shouldPromoteDrag({ from, to: from, elapsedMs: DRAG_HOLD_MS - 1 }), false, 'still a click');
+  assert.equal(shouldPromoteDrag({ from, to: from, elapsedMs: DRAG_HOLD_MS }), true, 'held long enough');
+
+  assert.equal(shouldPromoteDrag({ from: null, to: over, elapsedMs: 0 }), false, 'no press point, no distance');
+  assert.equal(shouldPromoteDrag({ from, to: null, elapsedMs: 0 }), false);
+});
+
+/**
+ * Drives the tracker with a scripted cursor. `wander` records what module E would
+ * have been asked to do, so the test asserts on the API boundary rather than on
+ * a window it does not have.
+ */
+function dragHarness({ at = { x: 500, y: 700 } } = {}) {
+  let t = 0;
+  let cursor = { x: 520, y: 780 };
+  const wander = { grabs: 0, moves: [], releases: [] };
+  const dragStates = [];
+
+  const tracker = createDragTracker({
+    now: () => t,
+    getCursorPoint: () => (cursor ? { ...cursor } : null),
+    getPosition: () => ({ ...at }),
+    grab: () => {
+      wander.grabs += 1;
+    },
+    moveTo: (x, y) => wander.moves.push({ x, y }),
+    release: (velocity) => wander.releases.push(velocity),
+    onDragging: (v) => dragStates.push(v),
+  });
+
+  return {
+    tracker,
+    wander,
+    dragStates,
+    /** Move the cursor and let `ms` pass, then take one poll sample. */
+    step(dx, dy, ms = 16) {
+      t += ms;
+      cursor = { x: cursor.x + dx, y: cursor.y + dy };
+      return tracker.poll();
+    },
+    wait(ms) {
+      t += ms;
+      return tracker.poll();
+    },
+    lose: () => {
+      cursor = null;
+    },
+    now: () => t,
+  };
+}
+
+test('a press that never moves and is let go quickly is a click: nothing is grabbed', () => {
+  const h = dragHarness();
+  h.tracker.press();
+  h.step(1, 0, 40);
+  h.step(-1, 1, 40); // 2px of hand jitter, well inside DRAG_THRESHOLD_PX
+
+  assert.equal(h.tracker.dragging, false);
+  assert.equal(h.wander.grabs, 0, 'module E was never touched');
+  assert.deepEqual(h.dragStates, [], 'and the renderer was never told to latch');
+
+  assert.equal(h.tracker.release(), null, 'no throw velocity, because there was no throw');
+  assert.deepEqual(h.wander.releases, [], 'and module E is not asked to release what it never held');
+  assert.equal(h.tracker.pressed, false);
+});
+
+test('a press held still long enough is a pick-up even with no mousemove at all', () => {
+  // This is the path that matters on this machine: a click-through overlay does
+  // not reliably deliver mousemove, so a rule that needs one would fail silently.
+  const h = dragHarness();
+  h.tracker.press();
+  h.wait(DRAG_HOLD_MS - 1);
+  assert.equal(h.tracker.dragging, false, 'not yet');
+
+  h.wait(1);
+  assert.equal(h.tracker.dragging, true, 'picked up on the hold clock alone');
+  assert.equal(h.wander.grabs, 1);
+  assert.deepEqual(h.dragStates, [true]);
+});
+
+test('a press that moves past the threshold carries her, offset from the press point', () => {
+  // Window at 500,700 and the press at 520,780: she must stay 20/80 px under the
+  // cursor for the whole drag, or she jumps into the pointer on the first move.
+  const h = dragHarness({ at: { x: 500, y: 700 } });
+  h.tracker.press();
+  h.step(40, -30);
+
+  assert.equal(h.tracker.dragging, true);
+  assert.deepEqual(h.wander.moves.at(-1), { x: 540, y: 670 }, 'moved by the gesture, not to the cursor');
+
+  h.step(60, -20);
+  assert.deepEqual(h.wander.moves.at(-1), { x: 600, y: 650 });
+  assert.equal(h.wander.grabs, 1, 'grabbed once, not once per sample');
+});
+
+test('the release hands the cursor velocity to the physics, and the renderer is unlatched', () => {
+  const h = dragHarness();
+  h.tracker.press();
+  // Four even samples: 32px right and 16px up every 16ms, which is 2000 px/s
+  // right and 1000 px/s up. The first one is also what promotes the press.
+  for (let i = 0; i < 4; i += 1) h.step(32, -16);
+
+  const velocity = h.tracker.release();
+  assert.equal(velocity.vx, 2000);
+  assert.equal(velocity.vy, -1000);
+  assert.deepEqual(h.wander.releases, [velocity], 'handed to module E exactly once');
+  assert.deepEqual(h.dragStates, [true, false]);
+  assert.equal(h.tracker.dragging, false);
+  assert.equal(h.tracker.pressed, false);
+
+  // And the poll goes quiet: a stale interval must not keep moving her.
+  const carried = h.wander.moves.length;
+  h.step(50, 50);
+  assert.equal(h.wander.moves.length, carried);
+});
+
+test('a drag that stops before the release sets her down instead of launching her', () => {
+  const h = dragHarness();
+  h.tracker.press();
+  for (let i = 0; i < 6; i += 1) h.step(40, 0); // hard drag right
+  for (let i = 0; i < 10; i += 1) h.step(0, 0); // then a pause, 160ms of it
+
+  const velocity = h.tracker.release();
+  assert.deepEqual(velocity, { vx: 0, vy: 0 }, 'the earlier speed is stale and does not count');
+});
+
+test('a lost mouseup does not leave her stuck to the cursor', () => {
+  const h = dragHarness();
+  h.tracker.press();
+  h.step(40, 0);
+  assert.equal(h.tracker.dragging, true);
+
+  h.wait(DRAG_MAX_MS);
+  assert.equal(h.tracker.dragging, false, 'the backstop let go');
+  assert.equal(h.wander.releases.length, 1);
+  assert.deepEqual(h.dragStates, [true, false], 'and the renderer was told, so its latch drops');
+});
+
+test('a cursor the tracker cannot read is not a drag', () => {
+  const h = dragHarness();
+  h.lose();
+  assert.equal(h.tracker.press(), false, 'no press point, no press');
+  h.wait(DRAG_HOLD_MS * 2);
+  assert.equal(h.tracker.dragging, false);
+  assert.equal(h.wander.grabs, 0);
+});
+
+test('cancel() puts her down where she is rather than throwing her at teardown', () => {
+  const h = dragHarness();
+  h.tracker.press();
+  for (let i = 0; i < 4; i += 1) h.step(40, 0);
+  assert.equal(h.tracker.dragging, true);
+
+  assert.equal(h.tracker.cancel(), true);
+  assert.deepEqual(h.wander.releases, [{ vx: 0, vy: 0 }], 'no parting throw on the way out');
+  assert.deepEqual(h.dragStates, [true, false]);
+  assert.equal(h.tracker.cancel(), false, 'idempotent');
+});
+
+test('ganyu:drag accepts the two phases and drops everything else', () => {
+  const seen = [];
+  const handlers = new Map();
+  const ipcMain = {
+    on: (channel, fn) => handlers.set(channel, fn),
+    handle: (channel, fn) => handlers.set(channel, fn),
+    removeListener: (channel) => handlers.delete(channel),
+    removeHandler: (channel) => handlers.delete(channel),
+  };
+  const dispose = registerIpc({
+    ipcMain,
+    getWindow: () => null,
+    getFlags: () => ({ muted: false, pinned: false, spritePath: null }),
+    onMenuAction: () => {},
+    onDrag: (phase) => seen.push(phase),
+  });
+
+  const drag = handlers.get(CHANNELS.drag);
+  for (const phase of DRAG_PHASES) drag(null, phase);
+  assert.deepEqual(seen, ['press', 'release']);
+
+  for (const bogus of ['PRESS', 'move', '', null, undefined, { phase: 'press' }]) drag(null, bogus);
+  assert.deepEqual(seen, ['press', 'release'], 'filtered exactly like the menu action');
+
+  dispose();
+  assert.equal(handlers.size, 0);
+});
+
+test('registerIpc without onDrag still registers the channel and swallows the message', () => {
+  // Module A wires onDrag, but the tracker behind it only exists after
+  // composeRuntime — a press before then has to be a no-op, not a crash.
+  const handlers = new Map();
+  registerIpc({
+    ipcMain: {
+      on: (channel, fn) => handlers.set(channel, fn),
+      handle: (channel, fn) => handlers.set(channel, fn),
+      removeListener: () => {},
+      removeHandler: () => {},
+    },
+    getWindow: () => null,
+    getFlags: () => ({}),
+    onMenuAction: () => {},
+  });
+  assert.doesNotThrow(() => handlers.get(CHANNELS.drag)(null, 'press'));
 });

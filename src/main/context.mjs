@@ -20,6 +20,16 @@
 //   2. A truncated ring entry ({truncated, bytes, preview}) is treated as having
 //      no payload at all. `preview` is a raw prefix of the event JSON and can
 //      contain a diff, so it is never read — such an entry simply yields less.
+//
+// The one exception to "metadata only", added 2026-07-31 at the owner's explicit
+// request: `recentPrompts` reads the **top-level** `prompt` of a
+// `UserPromptSubmit` payload, so she can react to what he asked for and not only
+// to what his tools did. It is not a hole in the allowlist above — that governs
+// `tool_input`, where `prompt` is a subagent brief and stays refused. It is a
+// different key on a different event, bounded to one prompt of MAX_PROMPT_CHARS,
+// redacted through `redactSecrets`, and switchable off at the network boundary
+// (GANYU_SEE_PROMPTS, read in brain.mjs). It is the highest-risk field here and
+// is commented as such at `recentPrompts`.
 
 /** How far back `summarizeRecent` looks. Long enough to see a pattern, short enough to still be "now". */
 export const RECENT_WINDOW_MS = 20 * 60 * 1000;
@@ -29,6 +39,18 @@ export const ACTIVITY_GAP_MS = 30 * 60 * 1000;
 
 /** Commands are quoted back to her; this is all she needs to recognise one. */
 export const MAX_COMMAND_CHARS = 60;
+
+/**
+ * What he typed, not what his tools did — see `recentPrompts`.
+ *
+ * `MAX_PROMPTS` is 1 on purpose. This is the highest-risk field in the system:
+ * every other thing that leaves the machine is metadata the app chose, and this
+ * one is free text he may have pasted anything into. One prompt answers "what is
+ * he trying to do" completely; a second only adds surface. **Raising it to 2 is
+ * this one number** — `recentPrompts` and the briefing already handle a list.
+ */
+export const MAX_PROMPT_CHARS = 200;
+export const MAX_PROMPTS = 1;
 
 /** The only `tool_input` keys that may ever be read. See the privacy note above. */
 export const ALLOWED_TOOL_INPUT_KEYS = Object.freeze([
@@ -76,6 +98,26 @@ const TEST_COMMAND_RE = /(^|[\s;&|(])(npm (run )?test|yarn test|pnpm test|bun te
  * blob with no separators in it at all.
  */
 const SECRET_PATTERNS = [
+  // ---- Shapes a pasted credential has and a command line rarely does. ----
+  // These lead because several of them are invisible to the rules below: a JWT
+  // and a connection string are built out of the very characters the base64 blob
+  // rule excludes, so without these they would travel intact.
+  //
+  // A whole armoured private key. Prompt text is collapsed to one line before it
+  // reaches here, so by then the block is a single token.
+  [/-----BEGIN[^-]*PRIVATE KEY-----[\s\S]*?(?:-----END[^-]*-----|$)/g, '<redacted key>'],
+  // A JWT: three base64url segments. The blob rule cannot see one — it excludes
+  // `.`, `-` and `_`, which is most of what a JWT is made of. At best it would
+  // redact the header and leave the payload and signature standing.
+  [/\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/g, '<redacted>'],
+  // A connection string's credentials: `postgres://user:pass@host:5432/db`. The
+  // scheme and host stay, because "he pasted a database URL" is the readable
+  // half and the password is the part that must not travel.
+  [/\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1<redacted>@'],
+  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '<redacted>'],
+  [/\bAIza[A-Za-z0-9_-]{20,}/g, '<redacted>'],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}/g, '<redacted>'],
+  [/\bhooks\.slack\.com\/services\/[A-Za-z0-9/_-]{10,}/g, 'hooks.slack.com/services/<redacted>'],
   // Vendor-prefixed keys. Nothing else looks like these, so they need no context.
   [/\bsk-[A-Za-z0-9_-]{16,}/g, '<redacted>'],
   [/\b(?:gh[pousr]_|xox[abposr]-)[A-Za-z0-9_-]{10,}/g, '<redacted>'],
@@ -90,6 +132,17 @@ const SECRET_PATTERNS = [
     '$1$2<redacted>$2',
   ],
   [/\b(bearer\s+)[A-Za-z0-9._~+/-]{16,}=*/gi, '$1<redacted>'],
+  // The same idea as the rule above, for the way a person *writes* it rather
+  // than the way a shell parses it: "the password is hunter2please", "api key
+  // sk_live_…". Free text is the only place this shape occurs, and prompt text
+  // is free text — but it also catches `--password hunter2please` on a command
+  // line, which the `=`/`:` rule never could. Deliberately requires the name and
+  // the value to be adjacent, so "token limit", "secret sauce" and "the password
+  // is wrong" are all left alone.
+  [
+    /\b((?:api[ _-]?keys?|access[ _-]?tokens?|auth[ _-]?tokens?|tokens?|secrets?|passwords?|passphrases?|passwd)\s+(?:is\s+|=\s*|:\s*)?)(["']?)[^\s"'`]{8,}\2/gi,
+    '$1$2<redacted>$2',
+  ],
   // A bare base64 blob: long, and mixed case + digits, which a word is not.
   // `/` and `-` are deliberately NOT in the class — that is the whole fix. A
   // real blob is one solid run; a path is short runs joined by separators.
@@ -346,6 +399,53 @@ export function summarizeRecent(ring, { now = Date.now(), windowMs = RECENT_WIND
   };
 }
 
+/** `PreToolUse`, `pre_tool_use`, `pre-tool-use` all collapse to one spelling. */
+const canonEvent = (value) => String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/**
+ * `recentPrompts(ring, {now, windowMs})` — what the owner most recently *asked
+ * for*, as opposed to what his tools then did.
+ *
+ * Until this existed she could see only tool metadata, so she could react to a
+ * failing `npm test` but never to the fact that he had asked for the timezone
+ * bug to be fixed. The owner approved sending prompt text on 2026-07-31.
+ *
+ * Three things bound it, and all three matter:
+ *
+ *   1. **Only a `UserPromptSubmit` payload's top-level `prompt`.** Not any field
+ *      called `prompt` anywhere: `tool_input.prompt` is a *subagent brief* the
+ *      allowlist deliberately refuses (see `ALLOWED_TOOL_INPUT_KEYS`), and it
+ *      stays refused — this reads a different key on a different event, and a
+ *      truncated ring entry still yields nothing at all.
+ *   2. **Redacted, through the same `redactSecrets` the commands go through**,
+ *      which grew several rules for this: pasted keys, JWTs, connection strings
+ *      and armoured private keys are shapes a command line rarely carries and a
+ *      pasted prompt very much does.
+ *   3. **Bounded** — `MAX_PROMPTS` of them, `MAX_PROMPT_CHARS` each, collapsed
+ *      to one line, and inside the same recency window as everything else, so a
+ *      prompt from this morning is not offered as what he just asked for.
+ *
+ * Oldest first, so a reader can say "he asked X, then Y" in order.
+ */
+export function recentPrompts(ring, { now = Date.now(), windowMs = RECENT_WINDOW_MS } = {}) {
+  const cutoff = Number(now) - Number(windowMs);
+  const out = [];
+  const entries = Array.isArray(ring) ? ring : [];
+  for (let i = entries.length - 1; i >= 0 && out.length < MAX_PROMPTS; i -= 1) {
+    const entry = entries[i];
+    const at = finiteMs(entry?.at);
+    if (at === null || at < cutoff) continue;
+    const payload = payloadOf(entry);
+    if (!payload) continue;
+    const event = payload.hook_event_name ?? payload.event ?? payload.type ?? null;
+    if (canonEvent(event) !== 'userpromptsubmit') continue;
+    if (typeof payload.prompt !== 'string') continue;
+    const line = clampText(redactSecrets(payload.prompt), MAX_PROMPT_CHARS);
+    if (line !== '') out.push(line);
+  }
+  return out.reverse();
+}
+
 /** Module B's aggregate, however it was handed to us. Never throws. */
 function aggregateOf(state) {
   if (!state) return null;
@@ -492,6 +592,11 @@ export function buildContext({
       time: localTimePhrase(now),
       recent: summarizeRecent(entries, { now, windowMs }),
       sessions: sessionSnapshot(state, { now, ring: entries, activeSinceMs }),
+      // Extracted unconditionally; whether it is *sent* is brain.mjs's call, at
+      // the network boundary, where GANYU_SEE_PROMPTS is read. Deciding it here
+      // would put the switch behind a pure function with no access to config,
+      // and leave two places able to reach the field.
+      prompts: recentPrompts(entries, { now, windowMs }),
     };
   } catch {
     return null;

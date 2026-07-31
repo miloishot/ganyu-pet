@@ -64,11 +64,18 @@ export function framesForRow(row) {
 }
 
 /**
- * The row a state resolves to ignoring the celebrate pulse: a walk direction
- * wins over the mode, otherwise mode -> row. The precedence matters now that
- * the pet also strolls while busy — walking legs beat the standing busy pose.
+ * The row a state resolves to ignoring the celebrate pulse: off the ground beats
+ * everything, then a walk direction, then mode -> row. The precedence matters now
+ * that the pet also strolls while busy — walking legs beat the standing busy
+ * pose, and a pet held in the air or mid-throw beats both, because whatever the
+ * machine is doing she is plainly not standing on anything.
+ *
+ * Airborne draws the jump row: 5 real frames of her off the ground, which is the
+ * only pose on the sheet that is not a stance. It covers being held and being
+ * thrown alike — from the sprite's point of view they are the same situation.
  */
 export function baseRowFor(state) {
+  if (state && state.airborne) return ROW.JUMP;
   const dir = state && state.walk && state.walk.dir;
   if (dir && Object.prototype.hasOwnProperty.call(WALK_ROW, dir)) return WALK_ROW[dir];
   const mode = state && state.mode;
@@ -212,10 +219,11 @@ export function createInteractivity({ setInteractive }) {
   let overMenu = false;
   let menuOpen = false;
   let chatOpen = false;
+  let dragging = false;
   let current = null;
 
   function sync() {
-    const want = overPet || overMenu || menuOpen || chatOpen;
+    const want = overPet || overMenu || menuOpen || chatOpen || dragging;
     if (want === current) return current;
     current = want;
     setInteractive(want);
@@ -244,12 +252,24 @@ export function createInteractivity({ setInteractive }) {
       chatOpen = Boolean(v);
       return sync();
     },
+    /**
+     * Drag latch. The reason it exists rather than leaning on `overPet`: the
+     * window chases the cursor, so on a fast drag it lags behind and the pointer
+     * spends most of the gesture off the sprite. Without this the overlay would
+     * go click-through mid-throw and the mouseup that ends the drag would land
+     * on the desktop instead.
+     */
+    setDragging(v) {
+      dragging = Boolean(v);
+      return sync();
+    },
     /** Pointer left the window entirely — drop every hover latch at once. */
     releaseAll() {
       overPet = false;
       overMenu = false;
       menuOpen = false;
       chatOpen = false;
+      dragging = false;
       return sync();
     },
     sync,
@@ -275,6 +295,11 @@ export function menuLabels({ muted = false, pinned = false } = {}) {
   return {
     'toggle-mute': muted ? 'Unmute' : 'Mute',
     'toggle-pin': pinned ? 'Unpin' : 'Pin',
+    // The recall action. Phrased as the owner asking rather than as a command to
+    // a window manager — every other label here is a switch, this one is a
+    // request to a person. An action with no label renders a blank button, so
+    // this entry is what makes `home` reachable at all.
+    home: 'Come here',
     quit: 'Quit',
   };
 }
@@ -330,6 +355,48 @@ export async function boot({
   });
   interactivity.sync(); // establish the known-false baseline
 
+  // ---- drag ----------------------------------------------------------------
+  // The renderer's whole share of picking her up is the button: down on the
+  // sprite, and up anywhere. Main watches the real cursor from there and decides
+  // whether that was a click or a pick-up (see createDragTracker in window.mjs),
+  // then says so as `dragging` on `ganyu:state`. Deciding it here would need a
+  // mousemove that a click-through overlay does not reliably get on this machine.
+  //
+  // Declared above the state subscription, not beside its listeners: module A
+  // force-pushes `ganyu:state` on did-finish-load, which can land while boot() is
+  // still awaiting getFlags(), and a `let` read before its declaration throws.
+
+  let pressing = false; // left button is down on the sprite
+  let dragging = false; // ...and main promoted it to a drag
+  /**
+   * A drag ends in a `mouseup` on the sprite, which is also the second half of a
+   * `click` — so without this, letting go of her would open the chat strip every
+   * single time. Set locally on mouseup rather than waiting for main to confirm
+   * the drag ended: `click` fires immediately after `mouseup`, long before an IPC
+   * round trip could come back.
+   */
+  let suppressClick = false;
+
+  function setDragging(value) {
+    if (value === dragging) return;
+    dragging = value;
+    interactivity.setDragging(value);
+    // Nothing to aim at while she is in the air, and the menu would be left
+    // hanging where she used to be.
+    if (value) closeMenu();
+  }
+
+  function endPress() {
+    if (!pressing) return false;
+    pressing = false;
+    if (dragging) {
+      suppressClick = true;
+      setDragging(false);
+    }
+    bridge('drag', 'release');
+    return true;
+  }
+
   // ---- state + speech feeds ------------------------------------------------
   // Subscribed BEFORE any await: module A force-pushes ganyu:state on
   // did-finish-load and then only pushes on change, so a listener registered
@@ -337,6 +404,7 @@ export async function boot({
 
   ganyu.onState((state) => {
     animator.setState(state || {}, now());
+    setDragging(Boolean(state && state.dragging));
   });
   ganyu.onSpeak((payload) => {
     // Ambient priority: a hook line yields to a reply he is still reading.
@@ -492,12 +560,37 @@ export async function boot({
     // has no reason to stay on a 256px window. Releasing here would make the
     // window click-through mid-sentence and drop the rest of what he types.
     if (chatIsOpen()) return;
+    // And the same again mid-drag, where the pointer leaving is not a signal at
+    // all — she is being carried, and the window is behind the cursor.
+    if (pressing || dragging) return;
     interactivity.releaseAll();
+  });
+
+  // Left button down on the sprite starts a *press*, which becomes either a drag
+  // or a click. Right-click is the menu and never a pick-up.
+  on(canvas, 'mousedown', (ev) => {
+    if (ev && ev.button !== undefined && ev.button !== 0) return;
+    if (pressing) return;
+    pressing = true;
+    suppressClick = false;
+    bridge('drag', 'press');
+  });
+
+  // On the document, not the canvas: a fast drag leaves the window trailing the
+  // cursor, so the button can easily come up somewhere else on the overlay.
+  on(doc, 'mouseup', (ev) => {
+    if (ev && ev.button !== undefined && ev.button !== 0) return;
+    endPress();
   });
 
   // Left-click toggles the chat strip; right-click still opens the menu below.
   on(canvas, 'click', (ev) => {
     if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+    // She was just put down. That is not a request to talk.
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
     closeMenu();
     if (chatIsOpen()) closeChat();
     else openChat();
@@ -552,6 +645,9 @@ export async function boot({
     closeMenu();
     // He clicked into the editor. Close, and give up focusability with it.
     closeChat();
+    // A press the window will never see the end of. Put her down rather than
+    // leaving her stuck to a cursor that has gone somewhere else.
+    endPress();
   });
 
   // ---- sprite --------------------------------------------------------------
@@ -592,11 +688,13 @@ export async function boot({
     interactivity,
     renderer,
     chat: { open: openChat, close: closeChat, submit: submitChat, get isOpen() { return chatIsOpen(); } },
+    drag: { get pressing() { return pressing; }, get dragging() { return dragging; } },
     flags: { get muted() { return muted; }, get pinned() { return pinned; }, spritePath },
     dispose() {
       running = false;
       if (handle !== null && cancelRaf) cancelRaf(handle);
       handle = null;
+      endPress(); // tell main before the listeners go, or the drag outlives us
       for (const undo of off.splice(0)) undo();
       bubbles.hide();
       closeMenu();

@@ -18,10 +18,12 @@
 // PRIVACY — this is the owner's private writing, and the digest is sent to a
 // third-party endpoint, so the extraction is deliberately narrow: **the note
 // title, its date, and the `Left open` bullets. Nothing else.** Not the body,
-// not the decisions, not the other sections, never the file. Two things enforce
-// that: `noteDigest` builds its result out of three named pieces and never
-// carries the source text forward, and `EXCLUDED_PROJECTS` removes one project
-// from the feature entirely (see the comment there — it is a policy decision).
+// not the decisions, not the other sections, never the file. `noteDigest`
+// enforces that by building its result out of three named pieces and never
+// carrying the source text forward, so a section it does not know about cannot
+// reach the caller. `EXCLUDED_PROJECTS` can remove a whole project on top of
+// that; it is empty today (see the comment there — that is a policy decision,
+// and so is putting a name back).
 //
 // No Electron import; `fs`, both paths and the clock are injected, so the tests
 // drive a fake and never read the real vault.
@@ -32,15 +34,25 @@ import { projectFromCwd } from './context.mjs';
  * Projects that are never read, whatever the map says and whatever directory
  * he happens to be in.
  *
- * **This is a deliberate policy choice, not an oversight, and not a stub to be
- * tidied away.** Invoco notes carry the owner's business material — pricing,
- * unit economics, customer names, grant applications — and the digest built
- * here leaves the machine for a third-party endpoint. He has not been asked
- * whether that is acceptable, and until he is, the answer is no. Taking a name
- * off this list is his decision to make, not a refactor: it changes what leaves
- * his machine.
+ * **Empty since 2026-07-31, and empty is a decision rather than a stub to be
+ * tidied away.** It held `'Invoco'` from the start, because Invoco notes carry
+ * the owner's business material — pricing, unit economics, customer names, grant
+ * applications — the digest built here leaves the machine for a third-party
+ * endpoint, and he had not been asked whether that was acceptable. He was asked,
+ * and on **2026-07-31 he approved Invoco specifically**, so the name came off.
+ *
+ * The mechanism stays because the question will come back, and this list is the
+ * place to answer it: **one entry re-blocks a project**, spelled as it appears
+ * under `03 Projects/` and matched case-, space- and punctuation-insensitively.
+ * The check runs after resolution, so blocking `Invoco` also catches the mapped
+ * `Invoco-POS`. Adding or removing a name changes what leaves his machine, so it
+ * is his decision to make and not a refactor.
+ *
+ * Named third-party *customer* material is held back separately and by folder —
+ * see `EXCLUDED_FOLDERS` in topics.mjs, which is still populated. His approval
+ * covered his own notes, not other people's commercial information.
  */
-export const EXCLUDED_PROJECTS = Object.freeze(['Invoco']);
+export const EXCLUDED_PROJECTS = Object.freeze([]);
 
 /**
  * How long a reading stays fresh. The vault changes when he writes a note,
@@ -170,11 +182,18 @@ export function resolveProject({ cwd = null, map = null, projectDirs = [] } = {}
   return null;
 }
 
-/** Whether this project's notes may be read at all. See EXCLUDED_PROJECTS. */
-export function isExcluded(project) {
+/**
+ * Whether this project's notes may be read at all. See EXCLUDED_PROJECTS.
+ *
+ * `list` defaults to that constant and is a parameter only so the rule itself
+ * stays testable now that the constant is empty: the mechanism is the thing that
+ * has to keep working, and a test that could only exercise it through a real
+ * blocked project would have died with the last one.
+ */
+export function isExcluded(project, list = EXCLUDED_PROJECTS) {
   const key = normalizeName(project);
   if (key === '') return false;
-  return EXCLUDED_PROJECTS.some((name) => normalizeName(name) === key);
+  return (Array.isArray(list) ? list : []).some((name) => normalizeName(name) === key);
 }
 
 /**
@@ -320,6 +339,9 @@ export function formatVaultDigest(project, digest) {
  *               from (always this repo, which has no vault folder at all).
  * now         — () => ms, injected so the TTL is testable.
  * ttlMs       — how long a reading is reused.
+ * excludedProjects — defaults to EXCLUDED_PROJECTS, which is empty. A parameter
+ *               so the block-before-read ordering stays testable without a real
+ *               blocked project to test it with; production passes nothing.
  *
  * Returns `{enabled, digest(), stats()}`. `digest()` is lazy — nothing is read
  * until something asks — and **every** failure resolves to null: no fs, no
@@ -334,6 +356,7 @@ export function createVault({
   cwd = null,
   now = Date.now,
   ttlMs = VAULT_TTL_MS,
+  excludedProjects = EXCLUDED_PROJECTS,
 } = {}) {
   const clock = () => {
     const t = Number(typeof now === 'function' ? now() : now);
@@ -389,9 +412,11 @@ export function createVault({
       projectDirs: listDir(projectsDir),
     });
     if (!project) return empty();
-    // Checked after resolution, not before: `Invoco-POS` becomes `Invoco` only
-    // once the map has been read, and it is the vault project that is excluded.
-    if (isExcluded(project)) return empty(project);
+    // Checked after resolution, not before: a repo directory becomes a vault
+    // project only once the map has been read (`Invoco-POS` → `Invoco`), and it
+    // is the vault project that a block names. Checked before the note is
+    // opened, so a blocked project's file is never read at all.
+    if (isExcluded(project, excludedProjects)) return empty(project);
 
     const dir = join(projectsDir, project);
     const newest = pickNewestNote(listDir(dir));

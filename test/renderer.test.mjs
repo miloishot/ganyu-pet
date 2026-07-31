@@ -131,7 +131,13 @@ function makeDom() {
   bubble.hidden = true;
   const menu = makeEl('menu');
   menu.hidden = true;
-  menu.children = [makeButton('toggle-mute'), makeButton('toggle-pin'), makeButton('quit')];
+  // Same order as index.html: Mute / Pin / Come here / Quit.
+  menu.children = [
+    makeButton('toggle-mute'),
+    makeButton('toggle-pin'),
+    makeButton('home'),
+    makeButton('quit'),
+  ];
   const chatInput = makeInput('chat-input');
   const chat = makeEl('chat');
   chat.hidden = true;
@@ -153,7 +159,7 @@ function makeDom() {
  *   is called with the text so a test can gate or fail a single exchange.
  */
 function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
-  const calls = { setInteractive: [], menuAction: [], getFlags: 0, sendChat: [], setFocused: [] };
+  const calls = { setInteractive: [], menuAction: [], getFlags: 0, sendChat: [], setFocused: [], drag: [] };
   let stateCb = null;
   let speakCb = null;
   return {
@@ -182,6 +188,9 @@ function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
       },
       menuAction(a) {
         calls.menuAction.push(a);
+      },
+      drag(phase) {
+        calls.drag.push(phase);
       },
       getFlags() {
         calls.getFlags += 1;
@@ -553,14 +562,28 @@ test('menu labels reflect the current flags', () => {
   assert.deepEqual(menuLabels({ muted: false, pinned: false }), {
     'toggle-mute': 'Mute',
     'toggle-pin': 'Pin',
+    home: 'Come here',
     quit: 'Quit',
   });
   assert.deepEqual(menuLabels({ muted: true, pinned: true }), {
     'toggle-mute': 'Unmute',
     'toggle-pin': 'Unpin',
+    home: 'Come here',
     quit: 'Quit',
   });
   assert.equal(menuLabels()['toggle-mute'], 'Mute');
+});
+
+test('every MENU_ACTIONS entry has a label, or its button renders blank', () => {
+  // The recall action was reachable over IPC and unlabelled for two modules'
+  // worth of work: main filtered `home` through, and the renderer drew nothing.
+  // paintMenu only writes a label it finds, so a missing one is a blank button
+  // rather than a crash — which is exactly why it went unnoticed.
+  const labels = menuLabels();
+  for (const action of ['toggle-mute', 'toggle-pin', 'home', 'quit']) {
+    assert.equal(typeof labels[action], 'string', `${action} has a label`);
+    assert.ok(labels[action].trim() !== '', `${action}'s label is not blank`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -752,7 +775,7 @@ test('right-click opens a clamped menu whose labels come from getFlags', async (
   assert.equal(menu.style.visibility, '', 'revealed after measuring');
   assert.deepEqual(
     menu.children.map((b) => b.textContent),
-    ['Unmute', 'Pin', 'Quit'],
+    ['Unmute', 'Pin', 'Come here', 'Quit'],
   );
   assert.equal(app.interactivity.interactive, true, 'window is interactive while open');
   app.dispose();
@@ -775,7 +798,7 @@ test('menu clicks forward exactly the contract actions and close the menu', asyn
 
   canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
   await flush();
-  menu.dispatch('click', { target: menu.children[2] });
+  menu.dispatch('click', { target: menu.children[3] });
   assert.deepEqual(h.g.calls.menuAction, ['toggle-mute', 'quit']);
 
   // A click on menu chrome (no data-action) is ignored.
@@ -1231,4 +1254,192 @@ test('dispose detaches every listener and restores click-through', async () => {
   assert.equal(h.dom.documentElement.listenerCount('mouseleave'), 0);
   assert.equal(h.g.calls.setInteractive.at(-1), false, 'window is click-through again');
   assert.equal(h.hasRaf(), false, 'frame loop stopped');
+});
+
+// ---------------------------------------------------------------------------
+// picking her up
+// ---------------------------------------------------------------------------
+
+test('interactivity latches dragging, and the latch outlives the pointer leaving the sprite', () => {
+  // The window chases the cursor, so on a fast drag it trails behind and the
+  // pointer spends most of the gesture off the sprite. Without this latch the
+  // overlay would go click-through mid-throw and the mouseup that ends the drag
+  // would land on the desktop instead.
+  const calls = [];
+  const i = createInteractivity({ setInteractive: (v) => calls.push(v) });
+  i.sync();
+  assert.deepEqual(calls, [false]);
+
+  i.setOverPet(true);
+  i.setDragging(true);
+  assert.deepEqual(calls, [false, true], 'already interactive from the hover');
+
+  i.setOverPet(false);
+  assert.equal(i.interactive, true, 'the drag holds it open');
+  assert.deepEqual(calls, [false, true], 'and does it without a second call');
+
+  i.setDragging(false);
+  assert.deepEqual(calls, [false, true, false], 'released when the drag ends');
+
+  i.setDragging(true);
+  i.releaseAll();
+  assert.equal(i.interactive, false, 'releaseAll drops the drag latch too');
+});
+
+test('airborne draws the jump row, outranking the walk direction and the mode', () => {
+  assert.equal(baseRowFor({ mode: 'idle', airborne: true }), ROW.JUMP);
+  assert.equal(baseRowFor({ mode: 'failed', airborne: true }), ROW.JUMP, 'whatever the machine is doing');
+  assert.equal(
+    baseRowFor({ mode: 'busy', walk: { dir: 'right' }, airborne: true }),
+    ROW.JUMP,
+    'she is plainly not running along anything',
+  );
+  assert.equal(baseRowFor({ mode: 'busy', walk: { dir: 'right' }, airborne: false }), ROW.RUN_RIGHT);
+  assert.equal(framesForRow(ROW.JUMP), 5, 'and it is a real five-frame row, not a blank one');
+});
+
+test('a left press on the sprite is reported to main, and the release with it', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, doc } = h.dom;
+
+  canvas.dispatch('mousedown', { button: 0 });
+  assert.deepEqual(h.g.calls.drag, ['press'], 'the button, and only the button');
+  assert.equal(app.drag.pressing, true);
+  assert.equal(app.drag.dragging, false, 'whether it is a drag is not the renderer\'s call');
+
+  // On the document, not the canvas: a fast drag leaves the window trailing the
+  // cursor, so the button often comes up somewhere else on the overlay.
+  doc.dispatch('mouseup', { button: 0 });
+  assert.deepEqual(h.g.calls.drag, ['press', 'release']);
+  assert.equal(app.drag.pressing, false);
+  app.dispose();
+});
+
+test('right-click is the menu and never a pick-up', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('mousedown', { button: 2 });
+  assert.deepEqual(h.g.calls.drag, [], 'no press at all');
+  h.dom.canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  assert.equal(h.dom.menu.hidden, false, 'the menu still opens');
+  app.dispose();
+});
+
+test('a press that main calls a click still opens the chat strip', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, doc, chat } = h.dom;
+
+  // No `dragging` ever arrives on ganyu:state, so this was a click.
+  canvas.dispatch('mousedown', { button: 0 });
+  doc.dispatch('mouseup', { button: 0 });
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, false, 'the chat path is untouched by the drag plumbing');
+
+  canvas.dispatch('mousedown', { button: 0 });
+  doc.dispatch('mouseup', { button: 0 });
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, true, 'and still toggles');
+  app.dispose();
+});
+
+test('letting go of a dragged pet does not open the chat strip', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, doc, chat, menu } = h.dom;
+
+  canvas.dispatch('mousedown', { button: 0 });
+  h.g.stateCb({ mode: 'idle', dragging: true, airborne: true, walk: null });
+  assert.equal(app.drag.dragging, true, 'main promoted the press');
+  assert.equal(app.interactivity.interactive, true, 'and the latch is holding');
+  assert.equal(menu.hidden, true);
+
+  // mouseup is also the second half of a click, which is the whole problem.
+  doc.dispatch('mouseup', { button: 0 });
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, true, 'she was put down, not spoken to');
+  assert.equal(app.drag.dragging, false);
+  assert.equal(app.interactivity.interactive, false, 'and the latch let go');
+
+  // Exactly one click is swallowed: the next one is a real one.
+  canvas.dispatch('mousedown', { button: 0 });
+  doc.dispatch('mouseup', { button: 0 });
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, false, 'the very next click opens it as usual');
+  app.dispose();
+});
+
+test('a drag closes an open menu, and survives the pointer leaving the window', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, doc, menu, documentElement } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  assert.equal(menu.hidden, false);
+
+  canvas.dispatch('mousedown', { button: 0 });
+  h.g.stateCb({ mode: 'idle', dragging: true, airborne: true, walk: null });
+  assert.equal(menu.hidden, true, 'nothing to aim a menu at while she is in the air');
+
+  // The watchdog that normally re-arms click-through must stand down: the pointer
+  // leaving is not a signal mid-drag, it is the drag.
+  documentElement.dispatch('mouseleave');
+  assert.equal(app.interactivity.interactive, true, 'still interactive');
+
+  doc.dispatch('mouseup', { button: 0 });
+  assert.equal(app.interactivity.interactive, false);
+  app.dispose();
+});
+
+test('a press the window never sees the end of is given back on blur and on dispose', async () => {
+  const blurred = await bootHarness();
+  await flush();
+  blurred.resolveFlags();
+  const first = await blurred.booting;
+  blurred.dom.canvas.dispatch('mousedown', { button: 0 });
+  blurred.dom.win.dispatch('blur');
+  assert.deepEqual(blurred.g.calls.drag, ['press', 'release'], 'not left stuck to a cursor that left');
+  assert.equal(first.drag.pressing, false);
+  first.dispose();
+
+  const torn = await bootHarness();
+  await flush();
+  torn.resolveFlags();
+  const app = await torn.booting;
+  torn.dom.canvas.dispatch('mousedown', { button: 0 });
+  app.dispose();
+  assert.deepEqual(torn.g.calls.drag, ['press', 'release'], 'told before the listeners went');
+});
+
+test('the Come here button is wired to the recall action', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  const home = menu.children.find((b) => b.dataset.action === 'home');
+  assert.ok(home, 'the entry exists');
+  assert.equal(home.textContent, 'Come here');
+
+  menu.dispatch('click', { target: home });
+  assert.deepEqual(h.g.calls.menuAction, ['home'], 'the action main has been filtering for all along');
+  assert.equal(menu.hidden, true, 'and it closes behind itself like every other entry');
+  app.dispose();
 });

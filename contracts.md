@@ -71,17 +71,20 @@ State module exposes `createState({clock})` returning `{ingest(source, payload),
 ### IPC contract (A ↔ C, via preload `window.ganyu`)
 
 Preload exposes exactly:
-- `ganyu.onState(cb)` — cb receives `{mode, sessionCount, celebrate, walk: {dir: 'left'|'right'} | null}`.
+- `ganyu.onState(cb)` — cb receives `{mode, sessionCount, celebrate, walk: {dir: 'left'|'right'} | null, dragging, airborne}`.
 - `ganyu.onSpeak(cb)` — cb receives `{text}`.
 - `ganyu.setInteractive(bool)` — toggles `setIgnoreMouseEvents(!bool, {forward: true})`.
 - `ganyu.menuAction(action)` — `'toggle-mute' | 'toggle-pin' | 'home' | 'quit'`. `home` is the recall action (see §Window); main filters against `MENU_ACTIONS`, so anything else is dropped.
+- `ganyu.drag(phase)` — `'press' | 'release'`: the left button went down on the sprite, or came up. Only the button — whether that press *is* a drag is main's call (see §Drag), and comes back as `dragging` on `ganyu:state`. Filtered against `DRAG_PHASES` exactly as the menu action is.
 - `ganyu.getFlags()` → Promise of `{muted, pinned, spritePath}` (spritePath as `file://` URL for the `<img>`/canvas source).
 - `ganyu.sendChat(text)` → Promise of her reply (string) or `null`. Never rejects — see §Chat.
 - `ganyu.setFocused(bool)` — lifts and restores window focusability so the chat input can take a keystroke (see §Window).
 
-Channels (main side): `ganyu:state`, `ganyu:speak`, `ganyu:set-interactive`, `ganyu:menu`, `ganyu:get-flags`, `ganyu:chat`, `ganyu:set-focus`. Nothing else.
+Channels (main side): `ganyu:state`, `ganyu:speak`, `ganyu:set-interactive`, `ganyu:menu`, `ganyu:drag`, `ganyu:get-flags`, `ganyu:chat`, `ganyu:set-focus`. Nothing else.
 
-The five originals are named in `window.CHANNELS`; the chat pair is named in `chat.CHAT_CHANNELS` and **not** duplicated into `CHANNELS`, because two frozen tables of the same strings is the only way they could drift. `window.registerIpc` registers all seven and disposes all seven. The preload hardcodes every string, as it always has — it is CommonJS and cannot import an ESM module.
+The six originals are named in `window.CHANNELS`; the chat pair is named in `chat.CHAT_CHANNELS` and **not** duplicated into `CHANNELS`, because two frozen tables of the same strings is the only way they could drift. `window.registerIpc` registers all eight and disposes all eight. The preload hardcodes every string, as it always has — it is CommonJS and cannot import an ESM module.
+
+**`dragging` and `airborne` ride `ganyu:state` rather than getting channels of their own.** The renderer wants them for the same reasons it already wants `walk` — to choose a sprite row, and to know whether the pointer is doing something to her — and one deduped push is cheaper than three. `toStatePayload(aggregate, walk, motion)` assembles them; both default to false, so a caller that knows nothing about motion produces the original payload plus two falses. They are **not** the same flag: `dragging` ends at the mouseup, `airborne` stays true through the whole throw until she lands.
 
 ### Window (module A)
 
@@ -96,7 +99,9 @@ So module A captures the size **once, before anything calls `setPosition`**, cac
 
 **Containment.** Module A calls `wander.containNow()` (a) once on startup, right after the window exists — the initial `computeInitialBounds` placement is derived from `WINDOW_SIZE` and is already ~3px outside; (b) from the existing 1s state poll, which is cheap because module E no-ops when she is already inside; and (c) on the `screen` events `display-metrics-changed`, `display-added` and `display-removed`. Listeners are removed in `cleanup()`.
 
-**Recall.** `MENU_ACTIONS` is `['toggle-mute', 'toggle-pin', 'home', 'quit']`. `home` cancels any stroll (or its next tick drags her straight back out), snaps the window to `computeInitialBounds(workArea, measuredSize)`, and calls `containNow()` to resync module E's tracked position. It is the last resort for a pet the owner cannot reach, and works while pinned and while the aggregate mode is stuck non-calm.
+**Recall.** `MENU_ACTIONS` is `['toggle-mute', 'toggle-pin', 'home', 'quit']`, and the menu entry for `home` is labelled **Come here**. It is the last resort for a pet the owner cannot reach, and works while pinned and while the aggregate mode is stuck non-calm.
+
+`home` places her at `computeInitialBounds(workArea, measuredSize)` **through module E's hold API** — `grab()`, `moveTo(x, y)`, `release({vx: 0, vy: 0})` — not by moving the window itself. It used to `cancel()` the stroll and then `moveWindowPinned` directly, which was correct only while falls were rare: `cancel()` deliberately leaves a fall running (§Wander), so once throws existed, a recall mid-flight was undone one tick later by physics still integrating from where she used to be. `grab` drops the stroll *and* the fall, `moveTo` writes the position through the single writer, and `release` hands her back to the ordinary scheduler. The old path survives as the fallback for a module E that has no `grab`.
 
 **Focus, and why the chat input needs it lifted.** The window is constructed **`focusable: false`** — an always-on-top overlay must never take the caret out of the editor — and a window that cannot be focused cannot deliver a keystroke to its own text input either. `ganyu:set-focus` is the lever: `true` → `setFocusable(true)` then `focus()`; `false` → `setFocusable(false)` then `blur()`. The order matters in both directions. Focusing before lifting the flag is a no-op, and dropping the flag without blurring leaves the window holding the focus it already had, so the caret never goes back to what he was typing in. The renderer asks on open and gives it back on close. A missing, destroyed or uncooperative window is swallowed: a chat strip he has to click twice is annoying, and never a reason to take the pet down.
 
@@ -116,9 +121,15 @@ Canvas-based sprite engine. Spritesheet grid — 8 columns × 9 rows, frame 192�
 
 Mode → row: `idle→0`, `busy→8`, `waiting→6`, `failed→5`, `celebrate` pulse → 4 (jump) then 3 (wave) once, `walk.dir right→1 / left→2`. 8 fps default, 6 fps for walk rows.
 
+**`airborne→4` (jump), and it outranks both.** Held in the cursor or mid-throw, she is plainly not standing on anything, so neither the walk rows nor the mode row can be right. Row 4 is the only pose on the sheet that is not a stance, and it covers being carried and being thrown alike — from the sprite's point of view those are the same situation. Its 5 real frames make it the one row whose `ROW_FRAMES` entry has always mattered.
+
 **Row 7 is intentionally unmapped.** It is a run-in-place animation, so playing it while the pet is stationary reads as running on the spot without moving. Stationary `busy` therefore draws row 8 (review), a standing thinking pose; real locomotion already draws rows 1/2 via `walk.dir`, which outranks the mode. The row stays in `ROW`/`ROW_FRAMES` because it still exists on the sheet — it is simply unreachable from any mode. Loop each row's real frame count, never the full 8 — drawing a blank trailing cell blinks the pet out (idle at 8 fps lost 250ms of every second). Chromium decodes `.webp` natively — draw via offscreen `<img>` → `drawImage` crops.
 
-Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteractive(true)`; `mouseleave` → `false`. Right-click on sprite → minimal in-window menu (Mute/Unmute · Pin/Unpin · **Home** · Quit) → `ganyu.menuAction(...)`. `home` is wired end to end in main (§Window) but **module C has not added the menu entry yet**, so the recall action is reachable over IPC and unlabelled in the UI until it does. Speech bubble: styled div above the sprite, fades after 8s, newest replaces current.
+Hover behavior: `mouseenter` on the sprite's bounding box → `ganyu.setInteractive(true)`; `mouseleave` → `false`. Right-click on sprite → minimal in-window menu (Mute/Unmute · Pin/Unpin · **Come here** · Quit) → `ganyu.menuAction(...)`. Speech bubble: styled div above the sprite, fades after 8s, newest replaces current.
+
+**Every `MENU_ACTIONS` entry needs a `menuLabels()` entry.** `paintMenu` writes only labels it finds, so a missing one is a silently blank button rather than a crash — which is exactly how `home` stayed unreachable for two modules' worth of work while main filtered it through faithfully. `test/renderer.test.mjs` walks the action list against the label table for that reason.
+
+**Interactivity latches.** `createInteractivity` ORs five: `overPet`, `overMenu`, `menuOpen`, `chatOpen`, `dragging`. The last exists because the window chases the cursor during a drag, so on a fast throw it trails behind and the pointer spends most of the gesture off the sprite — without the latch the overlay would go click-through mid-throw and the `mouseup` that ends the drag would land on the desktop. `releaseAll()` drops all five.
 
 ### Speech (module D)
 

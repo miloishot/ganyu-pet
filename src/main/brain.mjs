@@ -8,16 +8,20 @@
 // JSON — resolves to `null` and speech falls back to the canned line. It never
 // throws and never rejects.
 //
-// Privacy: only event metadata leaves the machine (event kind, tool name,
-// project name — see persona.buildBrainInput), plus, on the chat path, the
-// message the owner typed himself, her own past replies, and the two memory
-// digests (`getMemory`) — the ledger's, itself built only from the metadata
-// above, and the vault's, which is a note title, a date and the owner's own
-// `Left open` bullets and nothing else. No file contents,
-// no diffs, no agent prompt text, no transcript — the chat briefing is built
-// from the same allowlisted context object as the ambient one, and reaches for
-// nothing the ambient path could not already send. `store: false` asks the
-// endpoint not to retain the exchange, matching the owner's
+// Privacy: event metadata leaves the machine (event kind, tool name, project
+// name — see persona.buildBrainInput), plus, on the chat path, the message the
+// owner typed himself, her own past replies, and the three memory digests
+// (`getMemory`) — the ledger's, itself built only from the metadata above; the
+// session vault's, which is a note title, a date and the owner's own `Left open`
+// bullets; and the topic vaults', which is section and note *names* from a
+// module that never opens a file.
+//
+// One thing here is his own writing rather than his machine's: since 2026-07-31,
+// at his explicit request, the briefing carries the text of his most recent
+// `UserPromptSubmit` — bounded, redacted and switchable (see `readContext` and
+// `GANYU_SEE_PROMPTS`). Everything else is unchanged: no file contents, no
+// diffs, no subagent brief, no transcript. `store: false` asks the endpoint not
+// to retain the exchange, matching the owner's
 // `disable_response_storage` setting. The key is
 // read from disk at runtime, never logged, and never placed in an error message
 // — which is also why failures are reported by error *name* only, since a fetch
@@ -100,6 +104,21 @@ export const REQUIRED_KEYS = Object.freeze([
 export const DEFAULT_REASONING_EFFORT = 'low';
 const NO_REASONING = new Set(['none', 'off', 'default', '']);
 
+/**
+ * `GANYU_SEE_PROMPTS` in `.env.local` — whether the text the owner typed into his
+ * agent may travel with the briefing. **Default on**: he asked for it on
+ * 2026-07-31, and a key he has not written is a key he has not turned off.
+ *
+ * Any of these spellings turns it off; everything else, including a missing key
+ * and an unparseable one, leaves it on. The switch is honoured *here*, at the
+ * last point before the request is built, rather than in context.mjs where the
+ * prompt is extracted: this is the network boundary, so there is exactly one
+ * place to reach for the field and exactly one place that can refuse it.
+ */
+const FALSEY = new Set(['0', 'false', 'no', 'off', 'never', '']);
+export const seePromptsFrom = (value) =>
+  value == null || !FALSEY.has(String(value).trim().toLowerCase());
+
 /** Minimal KEY=VALUE parser: blank lines and `#` comments skipped, values trimmed. */
 export function parseEnvFile(text) {
   const out = {};
@@ -140,6 +159,7 @@ export function loadBrainConfig({ envPath } = {}) {
     model: env.GANYU_OPENAI_MODEL,
     apiKey: env.GANYU_OPENAI_API_KEY,
     reasoningEffort: env.GANYU_OPENAI_REASONING_EFFORT || DEFAULT_REASONING_EFFORT,
+    seePrompts: seePromptsFrom(env.GANYU_SEE_PROMPTS),
   };
 }
 
@@ -185,10 +205,10 @@ export function postProcess(text, max = MAX_BRAIN_LINE_CHARS) {
  * treated as no context at all.
  *
  * `getMemory` is the same shape and the same failure semantics, for recall
- * rather than for the present moment: `{ledger, vault}`, two short digests of
- * what she wrote down and what he left open in his own notes. **It is read on
- * the chat path only** — see persona.buildChatInput for why an ambient remark
- * is worse for having it.
+ * rather than for the present moment: `{ledger, vault, topics}` — what she wrote
+ * down, what he left open in his own session notes, and a map of where things
+ * are documented in his reference vaults. **It is read on the chat path only**
+ * — see persona.buildChatInput for why an ambient remark is worse for having it.
  */
 export function createBrain({
   config,
@@ -203,6 +223,9 @@ export function createBrain({
   const model = String(config?.model ?? '');
   const apiKey = String(config?.apiKey ?? '');
   const effort = String(config?.reasoningEffort ?? DEFAULT_REASONING_EFFORT).trim().toLowerCase();
+  // Absent means on: a brain constructed from a hand-built config in a test, or
+  // from a `.env.local` written before the key existed, behaves as he asked.
+  const seePrompts = config?.seePrompts !== false;
 
   // A brain with nothing to call is born disabled rather than special-cased at
   // every call site: speech treats "returns null forever" identically to absent.
@@ -298,12 +321,22 @@ export function createBrain({
     }
   }
 
-  /** The world around the event, or nothing. Never the reason a line fails to appear. */
+  /**
+   * The world around the event, or nothing. Never the reason a line fails to
+   * appear.
+   *
+   * This is also where `GANYU_SEE_PROMPTS` is honoured. `prompts` is the only
+   * field in the context object that is the owner's own writing rather than his
+   * machine's metadata, so it is the only one with a switch — and stripping it
+   * here means the switch sits on the single path to the network, with nothing
+   * downstream able to route around it.
+   */
   function readContext() {
     if (typeof getContext !== 'function') return null;
     try {
       const context = getContext();
-      return context && typeof context === 'object' ? context : null;
+      if (!context || typeof context !== 'object') return null;
+      return seePrompts ? context : { ...context, prompts: [] };
     } catch (err) {
       say('warn', `brain: context unavailable (${err?.name ?? 'error'})`);
       return null;

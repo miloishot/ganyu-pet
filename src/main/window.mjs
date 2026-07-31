@@ -28,6 +28,42 @@ export const SPRITE_SIZE = Object.freeze({ width: 192, height: 208 });
 export const HOVER_POLL_MS = 120;
 
 /**
+ * Picking her up (see `createDragTracker`). Every one of these is a decision
+ * about *input*, which is why they live beside the hover watch rather than in
+ * module E: module E owns where she ends up, this owns what the owner meant.
+ *
+ * - `DRAG_THRESHOLD_PX` 4 — under this, a press is a click. A left click opens
+ *   the chat strip, so the cost of getting this wrong in one direction is a
+ *   pet that jumps when he meant to talk to her, and in the other an input
+ *   strip that opens when he meant to move her. 4px is comfortably above the
+ *   hand jitter of a deliberate click and far below any intended drag.
+ * - `DRAG_HOLD_MS` 250 — a press that has not moved at all is still a pick-up
+ *   once it is held this long. This is the threshold that matters most on this
+ *   machine: renderer mousemove is unreliable on a click-through overlay
+ *   (see `createHoverWatch`), and a *time* rule needs no mouse events at all.
+ *   250ms is roughly twice a deliberate click and well under a considered one.
+ * - `DRAG_POLL_MS` 16 — the cursor sample rate while a press is live. The hover
+ *   watch can afford 120ms because it answers a yes/no question; a drag draws a
+ *   line, and 8fps of it looks broken.
+ * - `THROW_SAMPLE_WINDOW_MS` 100 — only cursor samples this fresh count toward
+ *   the throw. Without it, a fast drag that pauses before release launches her
+ *   at the speed she was moving a second ago, which is the one throw the owner
+ *   definitely did not ask for.
+ * - `DRAG_MAX_MS` 30s — backstop. The release comes from a renderer `mouseup`
+ *   on a window that is being moved under the cursor 60 times a second; if one
+ *   ever goes missing, she is stuck to the cursor until the app restarts, and
+ *   that is a worse failure than dropping a genuinely long hold.
+ */
+export const DRAG_THRESHOLD_PX = 4;
+export const DRAG_HOLD_MS = 250;
+export const DRAG_POLL_MS = 16;
+export const THROW_SAMPLE_WINDOW_MS = 100;
+export const DRAG_MAX_MS = 30_000;
+
+/** Ring cap on cursor samples — 100ms at 16ms is 7, so this is pure headroom. */
+export const MAX_DRAG_SAMPLES = 24;
+
+/**
  * How far the reported window size may sit from WINDOW_SIZE before the size guard
  * treats it as drift and resets it. Legitimate jitter is +/-1 DIP (the reported
  * outer rect rounds differently at odd coordinates on a fractional scale factor);
@@ -104,7 +140,16 @@ export const CHANNELS = Object.freeze({
   setInteractive: 'ganyu:set-interactive',
   menu: 'ganyu:menu',
   getFlags: 'ganyu:get-flags',
+  drag: 'ganyu:drag',
 });
+
+/**
+ * The only two things the renderer says about a drag. It reports the button, not
+ * the drag: whether a press *became* a drag is decided here, from the real cursor
+ * (`createDragTracker`), because the renderer cannot see a mousemove it was never
+ * sent. The answer travels back on `ganyu:state` as `dragging`.
+ */
+export const DRAG_PHASES = Object.freeze(['press', 'release']);
 
 /**
  * `home` is the recall action: it snaps the pet back to `computeInitialBounds`.
@@ -209,6 +254,194 @@ export function createHoverWatch({ getBounds, getCursorPoint, apply, sprite = SP
     sync,
     get interactive() {
       return applied === true;
+    },
+  };
+}
+
+/**
+ * Cursor velocity over the last `windowMs`, in px/s, from the samples the drag
+ * tracker collected. Pure, and the whole of the throw: the pet follows the cursor
+ * exactly while held, so how fast the cursor was moving at the moment of release
+ * *is* how fast she leaves the hand.
+ *
+ * Samples older than the window are dropped rather than averaged in. A drag that
+ * crosses the screen and then pauses for half a second before letting go has to
+ * read as a set-down, not as a throw at the speed it was travelling earlier —
+ * and averaging over the whole gesture is exactly how it would read as a throw.
+ * Fewer than two fresh samples is no measurement at all, so it is zero.
+ */
+export function throwVelocity(samples, now, windowMs = THROW_SAMPLE_WINDOW_MS) {
+  if (!Array.isArray(samples)) return { vx: 0, vy: 0 };
+  const fresh = samples.filter(
+    (s) => s && Number.isFinite(s.t) && Number.isFinite(s.x) && Number.isFinite(s.y) && now - s.t <= windowMs,
+  );
+  if (fresh.length < 2) return { vx: 0, vy: 0 };
+  const first = fresh[0];
+  const last = fresh[fresh.length - 1];
+  const dt = (last.t - first.t) / 1000;
+  if (!(dt > 0)) return { vx: 0, vy: 0 };
+  return { vx: (last.x - first.x) / dt, vy: (last.y - first.y) / dt };
+}
+
+/** Did this press become a pick-up? Distance first, then the hold clock. */
+export function shouldPromoteDrag({
+  from,
+  to,
+  elapsedMs,
+  thresholdPx = DRAG_THRESHOLD_PX,
+  holdMs = DRAG_HOLD_MS,
+}) {
+  if (Number.isFinite(elapsedMs) && elapsedMs >= holdMs) return true;
+  if (!from || !to) return false;
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return false;
+  return Math.hypot(dx, dy) > thresholdPx;
+}
+
+/**
+ * Pick her up, carry her, throw her.
+ *
+ * Driven from main for the same reason `createHoverWatch` is: on Electron 43.2.0 /
+ * Windows 11 22000 a click-through overlay does not reliably receive forwarded
+ * mousemove, so a drag written in the renderer would work only sometimes. And
+ * even where it does arrive, a renderer drag has a second problem this one does
+ * not: the window chases the cursor, so client coordinates barely change while
+ * she moves, and the drag reads its own output back as input.
+ *
+ * So the renderer reports only the two things it can see reliably — the left
+ * button went down on the sprite, the left button came up — and everything
+ * between them is read from `screen.getCursorScreenPoint()` on the poll.
+ *
+ * Position still belongs to module E: `grab`/`moveTo`/`release` are its API, and
+ * this never touches the window itself. Two writers of the window position is the
+ * bug this shape exists to prevent.
+ */
+export function createDragTracker({
+  now,
+  getCursorPoint,
+  getPosition,
+  grab,
+  moveTo,
+  release,
+  onDragging = () => {},
+  thresholdPx = DRAG_THRESHOLD_PX,
+  holdMs = DRAG_HOLD_MS,
+  sampleWindowMs = THROW_SAMPLE_WINDOW_MS,
+  maxDragMs = DRAG_MAX_MS,
+  maxSamples = MAX_DRAG_SAMPLES,
+}) {
+  let pressed = false;
+  let dragging = false;
+  let pressAt = 0;
+  let pressPoint = null;
+  /** window position minus cursor position, fixed at the moment of the pick-up. */
+  let offset = null;
+  let samples = [];
+
+  function reset() {
+    pressed = false;
+    dragging = false;
+    pressPoint = null;
+    offset = null;
+    samples = [];
+  }
+
+  function sample(point, t) {
+    samples.push({ x: point.x, y: point.y, t });
+    if (samples.length > maxSamples) samples.shift();
+  }
+
+  function promote(point) {
+    grab();
+    const at = getPosition();
+    // Anchored on the *press* point, not on this one, so the pixels she was
+    // carried before the threshold was crossed are not lost — she moves by the
+    // whole gesture. Her position is re-read here rather than at the press
+    // because a stroll may have carried her somewhere else in between.
+    offset = at && Number.isFinite(at.x) && Number.isFinite(at.y)
+      ? { dx: at.x - pressPoint.x, dy: at.y - pressPoint.y }
+      : { dx: 0, dy: 0 };
+    dragging = true;
+    onDragging(true);
+    moveTo(point.x + offset.dx, point.y + offset.dy);
+  }
+
+  /** Left button down on the sprite. Not yet a drag — see shouldPromoteDrag. */
+  function onPress() {
+    const point = getCursorPoint();
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return false;
+    reset();
+    pressed = true;
+    pressAt = now();
+    pressPoint = { x: point.x, y: point.y };
+    sample(pressPoint, pressAt);
+    return true;
+  }
+
+  /**
+   * Left button up (or the renderer gave up on the press). Returns the throw
+   * velocity that was handed to the physics, so a caller can log it, and null
+   * when the press never became a drag — the renderer's click handler owns that
+   * one, and this must not have moved her.
+   */
+  function onRelease() {
+    if (!pressed) return null;
+    if (!dragging) {
+      reset();
+      return null;
+    }
+    const velocity = throwVelocity(samples, now(), sampleWindowMs);
+    reset();
+    release(velocity);
+    onDragging(false);
+    return velocity;
+  }
+
+  /** One cursor sample. Called on an interval only while a press is live. */
+  function onPoll() {
+    if (!pressed) return false;
+    const t = now();
+    const point = getCursorPoint();
+    if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return dragging;
+    sample(point, t);
+
+    if (!dragging) {
+      if (!shouldPromoteDrag({ from: pressPoint, to: point, elapsedMs: t - pressAt, thresholdPx, holdMs })) {
+        return false;
+      }
+      promote(point);
+      return true;
+    }
+
+    moveTo(point.x + offset.dx, point.y + offset.dy);
+    // Backstop: a lost mouseup must not leave her stuck to the cursor.
+    if (t - pressAt >= maxDragMs) onRelease();
+    return dragging;
+  }
+
+  return {
+    press: onPress,
+    poll: onPoll,
+    release: onRelease,
+
+    /** Teardown. Puts her down where she is rather than throwing her. */
+    cancel() {
+      if (!pressed) return false;
+      const wasDragging = dragging;
+      reset();
+      if (wasDragging) {
+        release({ vx: 0, vy: 0 });
+        onDragging(false);
+      }
+      return wasDragging;
+    },
+
+    get dragging() {
+      return dragging;
+    },
+    get pressed() {
+      return pressed;
     },
   };
 }
@@ -371,6 +604,7 @@ export function registerIpc({
   getFlags,
   onMenuAction,
   onInteractive = null,
+  onDrag = null,
   getChat = null,
 }) {
   const handleSetInteractive = (_event, interactive) => {
@@ -386,6 +620,10 @@ export function registerIpc({
     if (MENU_ACTIONS.includes(action)) onMenuAction(action);
   };
   const handleGetFlags = () => getFlags();
+  /** Filtered like the menu action, and for the same reason. */
+  const handleDrag = (_event, phase) => {
+    if (onDrag && DRAG_PHASES.includes(phase)) onDrag(phase);
+  };
 
   /** Owner -> Ganyu. Always a string or null; never a rejection, never a hang. */
   const handleChat = async (_event, text) => {
@@ -433,6 +671,7 @@ export function registerIpc({
 
   ipcMain.on(CHANNELS.setInteractive, handleSetInteractive);
   ipcMain.on(CHANNELS.menu, handleMenu);
+  ipcMain.on(CHANNELS.drag, handleDrag);
   ipcMain.handle(CHANNELS.getFlags, handleGetFlags);
   ipcMain.on(CHAT_CHANNELS.setFocus, handleSetFocus);
   ipcMain.handle(CHAT_CHANNELS.chat, handleChat);
@@ -440,6 +679,7 @@ export function registerIpc({
   return () => {
     ipcMain.removeListener(CHANNELS.setInteractive, handleSetInteractive);
     ipcMain.removeListener(CHANNELS.menu, handleMenu);
+    ipcMain.removeListener(CHANNELS.drag, handleDrag);
     ipcMain.removeListener(CHAT_CHANNELS.setFocus, handleSetFocus);
     if (typeof ipcMain.removeHandler === 'function') {
       ipcMain.removeHandler(CHANNELS.getFlags);
@@ -467,8 +707,16 @@ export function toSpeechDetail(event, aggregate) {
   return { ...event, mode: event?.mode ?? agg?.mode ?? 'idle', aggregate: agg };
 }
 
-/** Aggregate (module B) + walk (module E) -> the `ganyu:state` payload. */
-export function toStatePayload(aggregate, walk) {
+/**
+ * Aggregate (module B) + walk (module E) -> the `ganyu:state` payload.
+ *
+ * `motion` is the third source: `{dragging, airborne}`, from the drag tracker and
+ * module E respectively. Both ride this channel rather than one of their own
+ * because the renderer wants them for the same reason it wants `walk` — to pick a
+ * sprite row and to know whether the pointer is doing something to her — and one
+ * deduped push is cheaper than three.
+ */
+export function toStatePayload(aggregate, walk, motion = null) {
   const agg = aggregate || {};
   const mode = ['idle', 'busy', 'waiting', 'failed'].includes(agg.mode) ? agg.mode : 'idle';
   return {
@@ -476,5 +724,7 @@ export function toStatePayload(aggregate, walk) {
     sessionCount: Number.isFinite(agg.sessionCount) ? agg.sessionCount : 0,
     celebrate: Boolean(agg.celebrate),
     walk: normalizeWalk(walk),
+    dragging: Boolean(motion && motion.dragging),
+    airborne: Boolean(motion && motion.airborne),
   };
 }

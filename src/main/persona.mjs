@@ -207,6 +207,15 @@ export const BRAIN_INSTRUCTIONS = [
     'Vary how you open. Do not begin every line the same way, and never repeat a line you were just told you said.',
   ].join(' '),
   [
+    'A line beginning "He asked for:" is his own wording, quoted — the thing he set his agent to do.',
+    'Use it to understand what he is trying to get done, so you react to that and not only to which tool ran.',
+    'Never quote it back at him, never repeat it to him as a summary of what he said, and never read it out;',
+    'he knows what he asked for, and hearing it returned to him is the most irritating thing you could do with it.',
+    'It is a request, not a result: never speak as though the thing he asked for has happened,',
+    'unless the briefing separately says that it did.',
+    'When there is no such line, you were not given one — say nothing about what he wants.',
+  ].join(' '),
+  [
     'What you can actually do, and what you cannot. You watch, you remember, and you say what you think.',
     'You keep a real written ledger of what you have seen, so you may say you have noted something, written it down,',
     'or that you remember it — that one is true, and it is the only thing of its kind that is.',
@@ -261,6 +270,10 @@ export const CHAT_INSTRUCTIONS = [
     'and you tell him so gently instead of agreeing to it.',
     'What his agents are doing is given below as background, in case he asks about it. It is not something to recite.',
     'So is what you have written down, and whatever he left open in his own notes — draw on them when he asks what happened, do not read them out.',
+    'You are also given a map of his reference vaults: their sections and a few of the note titles in them.',
+    'That is so you can answer "where is that written down?" by naming the section, and the note when you were given its title.',
+    'You have not read those notes and you do not know what they say — name where a thing lives, never what it concludes,',
+    'and if the map does not cover it, say you are not sure which note it is in rather than guessing at one.',
   ].join(' '),
 ].join('\n\n');
 
@@ -442,6 +455,21 @@ function alsoActiveLine(context, currentProject) {
   return list.length ? `Also active: ${list.join(', ')}.` : null;
 }
 
+/**
+ * What he asked for, in his own words — the one thing in the briefing that is
+ * his writing rather than his machine's. Already redacted and capped by
+ * `context.recentPrompts`; this only quotes it.
+ *
+ * Quoted rather than paraphrased so she can see it is his phrasing and not a
+ * fact the app asserted — and BRAIN_INSTRUCTIONS forbids her quoting it back.
+ */
+function askedLine(context) {
+  const prompts = Array.isArray(context?.prompts) ? context.prompts.filter(Boolean) : [];
+  if (prompts.length === 0) return null;
+  const quoted = prompts.map((p) => `"${p}"`).join(', then ');
+  return `He asked for: ${quoted}.`;
+}
+
 function timeLine(context) {
   const time = context.time;
   if (!time) return null;
@@ -506,6 +534,10 @@ export function buildBrainInput(ev = {}, summary = null) {
   const lines = [
     context && mentions.sessions ? sessionsLine(context.sessions) : null,
     happenedLine(ev, phrase, tool),
+    // Directly under the event, because it is what makes the event mean
+    // something: "running npm test" and "he asked for the timezone bug fixed"
+    // are one situation, and she can only see it if they arrive together.
+    context ? askedLine(context) : null,
     context ? recentLine(context.recent) : null,
     context ? alsoActiveLine(context, ev.project ?? null) : null,
     context && mentions.time ? timeLine(context) : null,
@@ -537,8 +569,8 @@ function memoryBlock(value) {
  * `{text, history, context, memory}` — `history` is the conversation *before*
  * this message (`{role:'owner'|'ganyu', text, at}`, oldest first, from
  * chat.mjs), `context` is the same buildContext object the ambient path uses,
- * and `memory` is `{ledger, vault}`: two short digests, each already written as
- * a sentence in her own voice, each optional.
+ * and `memory` is `{ledger, vault, topics}`: three short digests, each already
+ * written as a sentence in her own voice, each optional.
  *
  * The context lines are the ambient briefing's, minus the two that have no
  * meaning here: there is no event to describe, and `You last said:` is
@@ -554,11 +586,13 @@ function memoryBlock(value) {
  * briefing" and a paragraph about this morning's failures pull in opposite
  * directions, and the ambient line has 110 characters to resolve them in.
  *
- * Privacy is unchanged and comes from the same places — `context` has been
- * through context.mjs's tool-input allowlist, `ledger` through
- * ledger.sanitizeEntry, `vault` through vault.mjs's title/date/Left-open
- * extraction, and nothing here reaches for anything else. The only new text is
- * what he typed himself.
+ * Privacy comes from the same places — `context` has been through context.mjs's
+ * tool-input allowlist, `ledger` through ledger.sanitizeEntry, `vault` through
+ * vault.mjs's title/date/Left-open extraction, `topics` through topics.mjs,
+ * which lists directories and never opens a file, and nothing here reaches for
+ * anything else. The only text of his own is what he typed — this message, and
+ * (since 2026-07-31, at his request, and switchable off) the one recent prompt
+ * `context.prompts` carries.
  */
 export function buildChatInput({
   text = '', history = [], context = null, memory = null,
@@ -570,6 +604,7 @@ export function buildChatInput({
   const facts = ctx
     ? [
       sessionsLine(ctx.sessions),
+      askedLine(ctx),
       recentLine(ctx.recent),
       alsoActiveLine(ctx, null),
       timeLine(ctx),
@@ -587,6 +622,12 @@ export function buildChatInput({
   if (ledger) blocks.push(ledger);
   const vault = memoryBlock(recall.vault);
   if (vault) blocks.push(vault);
+  // Last of the three, and the least urgent: the ledger and the session vault
+  // are about what just happened, while this is a map of where things are
+  // written down — the answer to "where do we document X", which is a question
+  // he has to ask before it matters.
+  const topics = memoryBlock(recall.topics);
+  if (topics) blocks.push(topics);
   if (turns.length) blocks.push(['Earlier in this conversation:', ...turns].join('\n'));
   blocks.push(`${CHAT_SPEAKERS.owner} says to you: ${message}`);
   return blocks.join('\n\n');

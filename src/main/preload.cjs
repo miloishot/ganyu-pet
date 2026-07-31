@@ -18,6 +18,13 @@ contextBridge.exposeInMainWorld('ganyu', {
   onSpeak: (cb) => subscribe('ganyu:speak', cb),
   setInteractive: (interactive) => ipcRenderer.send('ganyu:set-interactive', Boolean(interactive)),
   menuAction: (action) => ipcRenderer.send('ganyu:menu', String(action)),
+  /**
+   * The left button went down on the sprite ('press') or came up ('release').
+   * Only the button — whether it became a drag is main's call, because on this
+   * machine a click-through overlay does not reliably see the mousemove that
+   * would answer it. The verdict comes back as `dragging` on `ganyu:state`.
+   */
+  drag: (phase) => ipcRenderer.send('ganyu:drag', String(phase)),
   getFlags: () => ipcRenderer.invoke('ganyu:get-flags'),
   /** Owner -> Ganyu. Resolves to her reply, or null when there isn't one. */
   sendChat: (text) => ipcRenderer.invoke('ganyu:chat', String(text ?? '')),

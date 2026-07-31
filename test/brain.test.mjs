@@ -20,6 +20,7 @@ import {
   ROUTES,
   createBrain,
   loadBrainConfig,
+  seePromptsFrom,
   parseEnvFile,
   postProcess,
 } from '../src/main/brain.mjs';
@@ -132,6 +133,7 @@ test('a full .env.local enables the brain, trimmed and without the trailing slas
     model: 'test-model',
     apiKey: 'sk-test-not-a-real-key',
     reasoningEffort: DEFAULT_REASONING_EFFORT,
+    seePrompts: true,
   });
   assert.equal(DEFAULT_REASONING_EFFORT, 'low');
 
@@ -140,6 +142,22 @@ test('a full .env.local enables the brain, trimmed and without the trailing slas
     envPath: tempEnv(t, `${FULL_ENV}GANYU_OPENAI_REASONING_EFFORT=medium\n`),
   });
   assert.equal(explicit.reasoningEffort, 'medium');
+});
+
+test('GANYU_SEE_PROMPTS defaults on, because he asked for it, and honours a falsey value', (t) => {
+  // A key he has not written is a key he has not turned off.
+  assert.equal(loadBrainConfig({ envPath: tempEnv(t, FULL_ENV) }).seePrompts, true);
+  assert.equal(seePromptsFrom(undefined), true);
+
+  for (const off of ['0', 'false', 'no', 'off', 'FALSE', ' Off ', '']) {
+    assert.equal(seePromptsFrom(off), false, `"${off}" should turn it off`);
+  }
+  for (const on of ['1', 'true', 'yes', 'on', 'anything else']) {
+    assert.equal(seePromptsFrom(on), true, `"${on}" should leave it on`);
+  }
+  const disabled = loadBrainConfig({ envPath: tempEnv(t, `${FULL_ENV}GANYU_SEE_PROMPTS=false\n`) });
+  assert.equal(disabled.seePrompts, false);
+  assert.equal(disabled.enabled, true, 'turning it off does not turn the brain off');
   assert.ok(!REQUIRED_KEYS.includes('GANYU_OPENAI_REASONING_EFFORT'));
 });
 
@@ -388,6 +406,43 @@ test('injected context is folded into the input, and a broken getter is survivab
   assert.equal(line, 'Noted.');
   assert.equal(broken.calls[0].body.input, buildBrainInput(DETAIL, SUMMARY), 'back to the thin input');
   for (const entry of log.lines) assert.ok(!entry.includes('ring unavailable'), entry);
+});
+
+test('GANYU_SEE_PROMPTS off strips his prompt text at the network boundary', async () => {
+  // The switch is honoured here rather than where the prompt is extracted, so
+  // there is exactly one place that can refuse it and nothing downstream can
+  // route around it. Both request kinds go through the same `readContext`.
+  const context = {
+    time: null,
+    recent: null,
+    sessions: { count: 1, projects: [], activeSince: null, activeForMs: null },
+    prompts: ['fix the DST edge case in tee_time.ts'],
+  };
+
+  const on = scriptedFetch(responsesOk('Noted.'));
+  await createBrain({ config: CONFIG, fetchImpl: on, getContext: () => context })
+    .requestLine({ detail: DETAIL, summary: SUMMARY });
+  assert.match(on.calls[0].body.input, /He asked for: "fix the DST edge case in tee_time\.ts"\./);
+
+  const off = scriptedFetch(responsesOk('Noted.'));
+  const brain = createBrain({
+    config: { ...CONFIG, seePrompts: false },
+    fetchImpl: off,
+    getContext: () => context,
+  });
+  await brain.requestLine({ detail: DETAIL, summary: SUMMARY });
+  assert.ok(!off.calls[0].body.input.includes('DST edge case'), off.calls[0].body.input);
+  assert.ok(!off.calls[0].body.input.includes('He asked for'), off.calls[0].body.input);
+  // Everything else about the briefing is untouched — this removes one line.
+  assert.equal(off.calls[0].body.input, buildBrainInput({ ...DETAIL, context: { ...context, prompts: [] } }, SUMMARY));
+
+  // And the chat path, which reads the same context through the same gate.
+  await brain.requestChat({ text: 'how is it going?' });
+  assert.ok(!off.calls[1].body.input.includes('DST edge case'), off.calls[1].body.input);
+
+  // The caller's object is not mutated: `getContext` hands out a live reference
+  // in production, and a switch that emptied it would be a switch that broke it.
+  assert.deepEqual(context.prompts, ['fix the DST edge case in tee_time.ts']);
 });
 
 test('the chat-completions body carries the same prompt as system + user', async () => {
@@ -805,6 +860,9 @@ const MEMORY = Object.freeze({
     + 'Projects: ganyu-pet, GolfCRM.',
   vault: 'Your notes for GolfCRM — "Bay codes — the timezone fix" (2026-07-29).\n'
     + 'Still open there: The DST edge case at 02:00; Rotate the CI secret.',
+  topics: 'Your Invoco engineering notes — 57 notes under Architecture, Backend, '
+    + 'Database, Features, Frontend, Operations and Personas.\n'
+    + 'Notes there include: Architecture/01 - System Topology; Database/Multi-tenancy and RLS.',
 });
 
 test('what she remembers reaches a chat reply', async () => {
@@ -815,6 +873,21 @@ test('what she remembers reaches a chat reply', async () => {
   const input = fetchImpl.calls[0].body.input;
   assert.ok(input.includes(MEMORY.ledger), 'the ledger digest is missing from the briefing');
   assert.ok(input.includes(MEMORY.vault), 'the vault digest is missing from the briefing');
+  assert.ok(input.includes(MEMORY.topics), 'the topic-vault map is missing from the briefing');
+});
+
+test('the topic map lets her name where a thing is written down', async () => {
+  // The question the third digest exists for. She is given section and note
+  // *names* and never a note's contents, so the most she can honestly do is
+  // point — which is what CHAT_INSTRUCTIONS tells her to do with it.
+  const fetchImpl = scriptedFetch(responsesOk('Under Database — Multi-tenancy and RLS.'));
+  const brain = createBrain({ config: CONFIG, fetchImpl, getMemory: () => MEMORY });
+
+  await brain.requestChat({ text: 'where do we document RLS?' });
+  const input = fetchImpl.calls[0].body.input;
+  assert.ok(input.includes('Database/Multi-tenancy and RLS'), input);
+  assert.match(CHAT_INSTRUCTIONS, /where is that written down/i);
+  assert.match(CHAT_INSTRUCTIONS, /You have not read those notes/);
 });
 
 test('and never an ambient one — a status remark is worse for having it', async () => {
@@ -828,6 +901,7 @@ test('and never an ambient one — a status remark is worse for having it', asyn
   const input = fetchImpl.calls[0].body.input;
   assert.ok(!input.includes('You remember'), 'the ledger digest reached the ambient prompt');
   assert.ok(!input.includes('Your notes for'), 'the vault digest reached the ambient prompt');
+  assert.ok(!input.includes('Your Invoco'), 'the topic map reached the ambient prompt');
   assert.ok(!input.includes('Left open'));
 });
 
@@ -843,7 +917,8 @@ test('the briefing puts what is happening first, then what she remembers, then t
     context,
     memory: MEMORY,
   });
-  const order = ['Around him right now:', 'You remember, going back', 'Your notes for GolfCRM', 'Earlier in this conversation:', 'Kahweng says to you:']
+  const order = ['Around him right now:', 'You remember, going back', 'Your notes for GolfCRM',
+    'Your Invoco engineering notes', 'Earlier in this conversation:', 'Kahweng says to you:']
     .map((marker) => input.indexOf(marker));
   assert.ok(order.every((i) => i >= 0), `a block is missing: ${order.join(', ')}`);
   assert.deepEqual([...order].sort((a, b) => a - b), order, 'the blocks are out of order');

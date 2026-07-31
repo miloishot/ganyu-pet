@@ -47,6 +47,7 @@ function harness({ workArea = FULL_HD, randoms = [0.5], pinned = false, startX, 
   const timers = new Map();
   const moves = [];
   const walkStates = [];
+  const airborneStates = [];
 
   const dims = () => winSize ?? { width: WIN_W, height: WIN_H };
 
@@ -87,6 +88,7 @@ function harness({ workArea = FULL_HD, randoms = [0.5], pinned = false, startX, 
     },
     getWorkArea: () => ({ ...area }),
     onWalkState: (walk) => walkStates.push(walk ? { dir: walk.dir, t: now } : null),
+    onAirborne: (value) => airborneStates.push(value),
     isPinned: () => pinnedFlag,
     random: () => randoms[drawIndex++ % randoms.length],
     getPosition: () => ({ x: pos.x, y: pos.y }),
@@ -105,6 +107,7 @@ function harness({ workArea = FULL_HD, randoms = [0.5], pinned = false, startX, 
     advance,
     moves,
     walkStates,
+    airborneStates,
     now: () => now,
     pin: (v) => {
       pinnedFlag = v;
@@ -812,4 +815,281 @@ test('a stroll aimed past the wall turns around instead of stopping dead against
   assert.ok(h.moves.length > turnedAt + 50, 'and kept walking for a long way afterwards');
   assert.ok(h.moves.at(-1).x < wall, 'heading back into the work area, at a fresh target');
   assert.ok(h.moves.at(-1).x > h.minX, 'a fresh target, not just a run to the far wall');
+});
+
+// ------------------------------------------------- picked up, carried, thrown
+//
+// The drag lives here rather than in module A for one reason: two things writing
+// the window position 20 times a second fight, and the loser is whichever wrote
+// first. Module A reads the cursor and aims; every pixel still leaves through
+// this module's `moveWindow`.
+
+test('being picked up suspends the stroll and the countdown, and putting her down resumes both', () => {
+  const h = harness({ randoms: [0, 0.9, 0.5] });
+  h.wander.setMode('idle');
+  h.advance(ARM);
+  h.advance(200); // four ticks of strolling
+  assert.equal(h.wander.isWandering(), true);
+
+  assert.equal(h.wander.grab(), true);
+  assert.equal(h.wander.isHeld(), true);
+  assert.equal(h.wander.isWandering(), false, 'the stroll is abandoned, not paused');
+  assert.equal(h.dirs().at(-1), null, 'and onWalkState reported the stop');
+  assert.equal(h.wander.isArmed(), false, 'no countdown ticking behind the drag either');
+
+  const carried = h.moves.length;
+  h.advance(10 * 60_000);
+  assert.equal(h.moves.length, carried, 'ten minutes in his hand and she never strolls out of it');
+
+  h.wander.release({ vx: 0, vy: 0 });
+  assert.equal(h.wander.isHeld(), false);
+  assert.equal(h.wander.isArmed(), true, 'the gap timer is running again');
+
+  h.advance(WANDER_DEFAULTS.gapMaxMs + ARM);
+  assert.ok(h.moves.length > carried, 'and she strolls again, without needing a state change');
+});
+
+test('a dragged pixel goes out through moveWindow, clamped to the work area', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.grab();
+
+  assert.equal(h.wander.moveTo(400, 200), true);
+  assert.deepEqual(h.moves.at(-1), { x: 400, y: 200, t: 0 });
+
+  // She cannot be dragged off the screen she was lost off in the first place:
+  // containment is not something holding her should switch off.
+  h.wander.moveTo(-500, -500);
+  assert.deepEqual({ x: h.moves.at(-1).x, y: h.moves.at(-1).y }, { x: h.minX, y: h.minY });
+  h.wander.moveTo(99_999, 99_999);
+  assert.deepEqual({ x: h.moves.at(-1).x, y: h.moves.at(-1).y }, { x: h.maxX, y: h.bottomY });
+
+  // A garbage coordinate keeps the axis it cannot replace, rather than moving the
+  // window to NaN.
+  h.wander.moveTo(undefined, h.bottomY);
+  assert.deepEqual({ x: h.moves.at(-1).x, y: h.moves.at(-1).y }, { x: h.maxX, y: h.bottomY });
+
+  h.wander.release({ vx: 0, vy: 0 });
+  const settled = h.moves.length;
+  assert.equal(h.wander.moveTo(100, 100), false, 'moveTo is inert once she is put down');
+  assert.equal(h.moves.length, settled);
+});
+
+test('released with sideways speed she flies, bounces off the wall, and settles on the floor', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.setMode('idle');
+  h.wander.grab();
+  h.wander.moveTo(300, 200); // held well above the floor, over on the left
+  const thrownAt = h.moves.length;
+
+  h.wander.release({ vx: 900, vy: -200 }); // flicked hard to the right, slightly up
+  assert.equal(h.wander.isFalling(), true, 'a throw is the same physics as a fall');
+
+  h.advance(30_000);
+  assert.equal(h.wander.isFalling(), false, 'she settles');
+
+  const flight = h.moves.slice(thrownAt);
+  const xs = flight.map((m) => m.x);
+  const ys = flight.map((m) => m.y);
+
+  assert.ok(ys.some((y) => y < 200), 'the upward part of the flick actually lifted her');
+  assert.equal(Math.max(...xs), h.maxX, 'she reached the right-hand wall');
+  assert.equal(ys.at(-1), h.bottomY, 'and ends up on the floor');
+  assert.ok(xs.at(-1) < h.maxX, 'having bounced back off the wall rather than sticking to it');
+  assert.ok(xs.at(-1) > 300, 'well to the right of where she was thrown from');
+
+  const wallAt = xs.indexOf(h.maxX);
+  const after = xs.slice(wallAt + 1);
+  assert.ok(after.length > 0, 'the wall was not the last thing that happened');
+  assert.ok(
+    after.every((x, i) => i === 0 || x <= after[i - 1]),
+    'every step after the wall goes back the other way',
+  );
+
+  const settled = h.moves.length;
+  h.advance(WANDER_DEFAULTS.gapMinMs - 1);
+  assert.equal(h.moves.length, settled, 'and stays where she landed');
+});
+
+test('a flick along the floor skids to a stop rather than being ignored', () => {
+  // No air time to spend the speed in, so without ground friction this throw
+  // would land on the settle branch and do nothing at all — which reads as the
+  // flick having been dropped rather than as physics.
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.setMode('idle');
+  h.wander.grab();
+  h.wander.moveTo(400, h.bottomY);
+  h.wander.release({ vx: -600, vy: 0 });
+  assert.equal(h.wander.isFalling(), true);
+
+  h.advance(20_000);
+  const end = h.moves.at(-1);
+  assert.equal(end.y, h.bottomY, 'she never left the floor');
+  assert.ok(end.x < 350, `she travelled left, ending at ${end.x}`);
+  assert.ok(end.x > h.minX, 'and friction stopped her short of the wall');
+  assert.equal(h.wander.isFalling(), false);
+});
+
+test('putting her down is not a throw', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.setMode('idle');
+  h.wander.grab();
+  h.wander.moveTo(600, h.bottomY);
+  const down = h.moves.length;
+
+  // On the floor, not moving up, and under the slide threshold: nothing to fly.
+  assert.equal(h.wander.release({ vx: WANDER_DEFAULTS.minSlideVelocity - 1, vy: 0 }), true);
+  assert.equal(h.wander.isFalling(), false);
+  h.advance(1_000);
+  assert.equal(h.moves.length, down, 'not one physics tick spent on standing still');
+  assert.equal(h.wander.isArmed(), true, 'straight back to the ordinary scheduler');
+});
+
+test('she can be caught in mid-air, and nothing keeps falling behind the drag', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.place(800, 100);
+  h.wander.containNow();
+  assert.equal(h.wander.isFalling(), true);
+  h.advance(100);
+
+  h.wander.grab();
+  assert.equal(h.wander.isFalling(), false, 'caught');
+  assert.equal(h.wander.isHeld(), true);
+
+  const caught = h.moves.length;
+  h.advance(10_000);
+  assert.equal(h.moves.length, caught, 'gravity does not tick while she is held');
+
+  h.wander.release({ vx: 0, vy: 0 });
+  h.advance(20_000);
+  assert.equal(h.moves.at(-1).y, h.bottomY, 'and the rest of the fall happens on release');
+});
+
+test('containment stands down while she is held — one writer, not two', () => {
+  // containNow() runs from module A's 1s poll, so it fires several times during
+  // any real drag. It must not clamp, must not report a move, and above all must
+  // not hand her to gravity out of his hand.
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.grab();
+  h.wander.moveTo(400, 100);
+  const carried = h.moves.length;
+
+  assert.equal(h.wander.containNow(), false, 'the poll finds nothing to do');
+  assert.equal(h.moves.length, carried, 'and moves her not at all');
+  assert.equal(h.wander.isFalling(), false, 'nor drops her');
+});
+
+test('onAirborne fires on the edges of being off the ground, and only on the edges', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.grab();
+  assert.deepEqual(h.airborneStates, [true], 'picked up');
+
+  h.wander.moveTo(400, 100);
+  h.wander.moveTo(420, 120);
+  assert.deepEqual(h.airborneStates, [true], 'carrying her is not an edge');
+
+  h.wander.release({ vx: 0, vy: 0 });
+  assert.deepEqual(h.airborneStates, [true], 'still off the ground, now falling');
+
+  h.advance(20_000);
+  assert.deepEqual(h.airborneStates, [true, false], 'and down again on landing');
+
+  // An ordinary fall is the same signal: the renderer draws one row for both.
+  h.place(400, 100);
+  h.wander.containNow();
+  assert.deepEqual(h.airborneStates, [true, false, true]);
+  h.advance(20_000);
+  assert.deepEqual(h.airborneStates, [true, false, true, false]);
+});
+
+test('an absurd release velocity is capped rather than believed', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.grab();
+  h.wander.moveTo(700, 300);
+  h.wander.release({ vx: 999_999, vy: 0 });
+
+  h.advance(WANDER_DEFAULTS.tickMs);
+  const step = h.moves.at(-1).x - 700;
+  const cap = (WANDER_DEFAULTS.maxThrowPxPerSec * WANDER_DEFAULTS.tickMs) / 1000;
+  assert.ok(step > 0 && step <= cap, `one tick moved her ${step}px, capped at ${cap}px`);
+
+  // Garbage is zero, not NaN: a NaN coordinate moves the window nowhere at all.
+  const g = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  g.wander.grab();
+  g.wander.moveTo(700, 300);
+  g.wander.release({ vx: NaN, vy: 'fast' });
+  g.advance(20_000);
+  assert.deepEqual(
+    { x: g.moves.at(-1).x, y: g.moves.at(-1).y },
+    { x: 700, y: g.bottomY },
+    'straight down, and nothing sideways',
+  );
+});
+
+test('pinning and a stuck non-calm mode do not stop him picking her up', () => {
+  for (const mode of ['failed', 'waiting']) {
+    const h = harness({ workArea: REAL_AREA, size: REAL_SIZE, pinned: true });
+    h.wander.setMode(mode);
+
+    h.wander.grab();
+    h.wander.moveTo(500, 300);
+    assert.deepEqual(h.moves.at(-1), { x: 500, y: 300, t: 0 }, `${mode} + pinned: carried anyway`);
+
+    // setMode's non-calm branch cancels the stroll; it must not empty his hand.
+    h.wander.setMode(mode === 'failed' ? 'waiting' : 'failed');
+    assert.equal(h.wander.isHeld(), true, 'a mode change does not take her out of his hand');
+
+    h.wander.release({ vx: 0, vy: 0 });
+    h.advance(20_000);
+    assert.equal(h.moves.at(-1).y, h.bottomY, `${mode} + pinned: gravity still lands her`);
+    assert.equal(h.wander.isWandering(), false, 'and she still never strolls');
+  }
+});
+
+test('stop() is the one thing that ends a drag, and ends it by putting her down', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.grab();
+  h.wander.moveTo(500, 100);
+
+  h.wander.stop();
+  assert.equal(h.wander.isHeld(), false);
+  assert.deepEqual(h.airborneStates, [true, false], 'the renderer is told she is down');
+  assert.equal(h.wander.moveTo(600, 100), false, 'nothing moves after teardown');
+  assert.equal(h.wander.grab(), false);
+  assert.equal(h.wander.release({ vx: 500, vy: 0 }), false);
+});
+
+test('grab + moveTo + release is the recall path, and it ends a fall in progress', () => {
+  // This is what module A's `home` action does now. It has to go through the hold
+  // API rather than move the window itself: `cancel()` deliberately leaves a fall
+  // running, so a bare move would be undone one tick later by physics still
+  // integrating from where she used to be — reachable the moment throws exist.
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.setMode('idle');
+  h.place(300, 100);
+  h.wander.containNow();
+  assert.equal(h.wander.isFalling(), true, 'mid-fall when he asks her to come back');
+
+  h.wander.grab();
+  h.wander.moveTo(h.maxX, h.bottomY);
+  h.wander.release({ vx: 0, vy: 0 });
+
+  assert.equal(h.wander.isFalling(), false, 'the fall is over, not still integrating');
+  assert.deepEqual(
+    { x: h.moves.at(-1).x, y: h.moves.at(-1).y },
+    { x: h.maxX, y: h.bottomY },
+    'and she is in the corner',
+  );
+
+  const home = h.moves.length;
+  h.advance(WANDER_DEFAULTS.gapMinMs - 1);
+  assert.equal(h.moves.length, home, 'nothing drags her back out of it');
+});
+
+test('release without a grab is inert, so a stray mouseup cannot launch her', () => {
+  const h = harness({ workArea: REAL_AREA, size: REAL_SIZE });
+  h.wander.setMode('idle');
+  h.place(800, h.bottomY);
+  assert.equal(h.wander.release({ vx: 900, vy: -600 }), false);
+  assert.equal(h.wander.isFalling(), false);
+  assert.equal(h.moves.length, 0);
 });

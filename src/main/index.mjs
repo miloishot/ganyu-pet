@@ -12,9 +12,11 @@ import { createChat } from './chat.mjs';
 import { buildContext, payloadOf, trackActiveSince } from './context.mjs';
 import {
   CHANNELS,
+  DRAG_POLL_MS,
   HOVER_POLL_MS,
   WINDOW_SIZE,
   computeInitialBounds,
+  createDragTracker,
   createHoverWatch,
   createPetWindow,
   enforceWindowSize,
@@ -75,8 +77,16 @@ let walk = null;
 let statePoll = null;
 let hoverPoll = null;
 let hoverWatch = null;
+let dragTracker = null;
+let dragPoll = null;
 let disposeIpc = null;
 let lastPushed = '';
+/**
+ * The two motion facts the renderer needs and cannot see for itself: whether the
+ * owner is holding her (so the click that ends the drag must not open the chat
+ * strip) and whether she is off the ground (so the sprite draws the jump row).
+ */
+const motion = { dragging: false, airborne: false };
 /**
  * `{since, last}` for the current working stretch, stepped on every hook event.
  * The debug ring holds 50 entries and sessions expire after 10 minutes, so
@@ -154,6 +164,15 @@ function windowPosition() {
   try {
     const [x, y] = win.getPosition();
     return { x, y };
+  } catch {
+    return null;
+  }
+}
+
+/** The real cursor, in screen coordinates. Feeds the hover watch and the drag. */
+function cursorPoint() {
+  try {
+    return screen.getCursorScreenPoint();
   } catch {
     return null;
   }
@@ -246,7 +265,7 @@ function agentCwd() {
  * (celebrate 10s, failed 30s, session sweep 30s).
  */
 function pushState(force = false) {
-  const payload = toStatePayload(currentAggregate(), walk);
+  const payload = toStatePayload(currentAggregate(), walk, motion);
   const key = JSON.stringify(payload);
   if (!force && key === lastPushed) return;
   lastPushed = key;
@@ -297,6 +316,8 @@ let wanderSink = null;
 let wanderStop = null;
 let wanderContain = null;
 let wanderIsActive = null;
+/** `(x, y) => void` — put her down at a spot, through module E. See goHome. */
+let wanderPlace = null;
 let speechTapped = false;
 
 /**
@@ -313,6 +334,39 @@ function containPet() {
   } catch (err) {
     console.warn('[ganyu] contain failed:', err?.message);
   }
+}
+
+/**
+ * The cursor poll that carries her while the left button is down. Deliberately
+ * only alive between a press and its release: 16ms is the right rate for a drag
+ * and the wrong one to leave running all evening.
+ */
+function startDragPoll() {
+  if (dragPoll) return;
+  dragPoll = setInterval(() => {
+    if (dragTracker) dragTracker.poll();
+  }, DRAG_POLL_MS);
+}
+
+function stopDragPoll() {
+  if (dragPoll) clearInterval(dragPoll);
+  dragPoll = null;
+}
+
+/**
+ * `ganyu:drag`. The renderer reports the button; whether the press became a
+ * pick-up is the tracker's call, from the real cursor — see createDragTracker for
+ * why that decision cannot live in the renderer on this machine.
+ */
+function onDragPhase(phase) {
+  if (!dragTracker) return;
+  if (phase === 'press') {
+    dragTracker.press();
+    startDragPoll();
+    return;
+  }
+  dragTracker.release();
+  stopDragPoll();
 }
 
 /**
@@ -547,6 +601,13 @@ async function composeRuntime() {
         if (typeof state?.setWandering === 'function') state.setWandering(next ?? null);
         pushState();
       },
+      // Off the ground: held in the cursor, or mid-throw. The renderer draws the
+      // jump row from it, so it has to arrive on the edge rather than wait for
+      // the 1s poll — a whole throw is over inside a second.
+      onAirborne: (value) => {
+        motion.airborne = Boolean(value);
+        pushState();
+      },
       isPinned: () => flags.pinned,
       random: Math.random,
     });
@@ -556,6 +617,35 @@ async function composeRuntime() {
     // `walk` is null during a mid-stroll breather, so it under-reports wandering
     // on GET /state; the module's own isWandering() spans the whole stroll.
     wanderIsActive = typeof wander.isWandering === 'function' ? () => wander.isWandering() : null;
+
+    // Picking her up. The tracker reads the cursor and decides; module E still
+    // writes every pixel, which is the point of routing the drag through it
+    // rather than moving the window from here behind its back.
+    if (typeof wander.grab === 'function') {
+      // The same three calls are how `home` puts her in the corner — see goHome.
+      wanderPlace = (x, y) => {
+        wander.grab();
+        wander.moveTo(x, y);
+        wander.release({ vx: 0, vy: 0 });
+      };
+      dragTracker = createDragTracker({
+        now: () => Date.now(),
+        getCursorPoint: cursorPoint,
+        getPosition: windowPosition,
+        grab: () => wander.grab(),
+        moveTo: (x, y) => wander.moveTo(x, y),
+        release: (velocity) => wander.release(velocity),
+        onDragging: (value) => {
+          motion.dragging = Boolean(value);
+          // The tracker can end a drag by itself (its lost-mouseup backstop), so
+          // the poll is stopped here as well as in the release handler.
+          if (!value) stopDragPoll();
+          pushState();
+        },
+      });
+    } else {
+      console.warn('[ganyu][wiring] wander has no grab() — the pet cannot be picked up');
+    }
   }
 
   if (typeof state.onChange === 'function') {
@@ -615,7 +705,25 @@ function getFlags() {
 function goHome() {
   if (!win || win.isDestroyed()) return;
   const home = computeInitialBounds(screen.getPrimaryDisplay().workArea, measuredWindowSize());
-  // Drop any stroll first, or its next tick drags her straight back out.
+
+  // Through module E's hold API rather than around it. `cancel()` deliberately
+  // leaves a fall running — pinning is no reason to hang her in mid-air — so with
+  // throws in the mix, moving the window from here would be undone a tick later
+  // by a fall still integrating from its own stale coordinates. grab/moveTo/
+  // release drops the stroll *and* the fall, writes the position through the one
+  // writer there is, and hands her back to the ordinary scheduler.
+  if (wanderPlace) {
+    try {
+      wanderPlace(home.x, home.y);
+      pushState();
+      return;
+    } catch (err) {
+      console.warn('[ganyu] recall through wander failed:', err?.message);
+    }
+  }
+
+  // No module E, or it does not know how to be held: move her directly. Drop any
+  // stroll first, or its next tick drags her straight back out.
   if (wanderStop) {
     try {
       wanderStop.call();
@@ -696,13 +804,7 @@ async function main() {
       const at = windowPosition();
       return at ? { ...at, ...measuredWindowSize() } : null;
     },
-    getCursorPoint: () => {
-      try {
-        return screen.getCursorScreenPoint();
-      } catch {
-        return null;
-      }
-    },
+    getCursorPoint: cursorPoint,
     apply: (interactive) => {
       if (win && !win.isDestroyed()) win.setIgnoreMouseEvents(!interactive, { forward: true });
     },
@@ -715,6 +817,9 @@ async function main() {
     getFlags,
     onMenuAction: handleMenuAction,
     onInteractive: (interactive) => hoverWatch.setRendererWants(interactive),
+    // Read through the module-level tracker, not captured: composeRuntime builds
+    // it below, and a press before then is simply a press with nothing behind it.
+    onDrag: onDragPhase,
     // Read per message, not captured: composeRuntime builds `chat` below, after
     // this runs. Anything he types before then answers null instead of rejecting.
     getChat: () => chat,
@@ -754,6 +859,14 @@ function cleanup() {
   statePoll = null;
   if (hoverPoll) clearInterval(hoverPoll);
   hoverPoll = null;
+  stopDragPoll();
+  if (dragTracker) {
+    try {
+      dragTracker.cancel(); // put her down where she is; never throw on the way out
+    } catch {
+      /* shutting down */
+    }
+  }
   for (const event of DISPLAY_EVENTS) {
     try {
       screen.removeListener(event, onDisplayChange);

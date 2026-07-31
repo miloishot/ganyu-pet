@@ -16,10 +16,13 @@ import assert from 'node:assert/strict';
 
 import {
   ALLOWED_TOOL_INPUT_KEYS,
+  MAX_PROMPTS,
+  MAX_PROMPT_CHARS,
   RECENT_WINDOW_MS,
   basename,
   buildContext,
   describeAction,
+  recentPrompts,
   describeDuration,
   localTimePhrase,
   pickToolInput,
@@ -35,6 +38,7 @@ import {
   SESSIONS_MENTION_COOLDOWN_MS,
   TIME_MENTION_COOLDOWN_MS,
   buildBrainInput,
+  buildChatInput,
   createMentionMemory,
   decideMentions,
 } from '../src/main/persona.mjs';
@@ -226,6 +230,57 @@ test('secret-looking tokens are redacted out of a command before it is quoted', 
   assert.equal(redactSecrets('npm test -- --watch=false'), 'npm test -- --watch=false');
   assert.equal(shortCommand('  npm   test  '), 'npm test');
   assert.equal(shortCommand('   '), null);
+});
+
+test('the shapes a pasted credential has, which a command line rarely carries', () => {
+  // Prompt text is free text he may have pasted anything into, so these are the
+  // rules that had to be added for it. Each one is a shape the pre-existing
+  // rules could not see: a JWT and a connection string are built out of the very
+  // characters the base64-blob rule excludes, and would have travelled intact.
+  const cases = [
+    ['eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk', 'a JWT'],
+    ['postgres://invoco:s3cr3t-pw@db.example.com:5432/prod', 'a connection string'],
+    ['AKIAIOSFODNN7EXAMPLE', 'an AWS access key id'],
+    ['AIzaSyD-1234567890abcdefghijklmnopqrstuv', 'a Google API key'],
+    ['github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz012345', 'a fine-grained GitHub token'],
+    ['-----BEGIN OPENSSH PRIVATE KEY-----b3BlbnNzaC1rZXktdjEA-----END OPENSSH PRIVATE KEY-----', 'a private key'],
+  ];
+  for (const [secret, label] of cases) {
+    const out = redactSecrets(`here is the thing: ${secret}`);
+    assert.match(out, /<redacted/, `${label} was not redacted at all: ${out}`);
+  }
+
+  // The host of a connection string survives, because "he pasted a database URL"
+  // is the readable half and the password is the part that must not travel.
+  assert.equal(
+    redactSecrets('psql postgres://invoco:s3cr3t-pw@db.example.com:5432/prod'),
+    'psql postgres://<redacted>@db.example.com:5432/prod',
+  );
+  // The full JWT goes, not merely its header — which is all the blob rule could
+  // ever have managed, since the payload and signature carry `-` and `_`.
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+  assert.equal(redactSecrets(jwt), '<redacted>');
+});
+
+test('a credential named in prose loses its value and keeps its name', () => {
+  // How a person types a secret into a prompt, as opposed to how a shell parses
+  // one: no `=`, no `:`, just the word and then the thing.
+  assert.equal(redactSecrets('the password is correcthorsebattery'), 'the password is <redacted>');
+  assert.equal(redactSecrets('api key sk_live_9f8e7d6c5b4a3210'), 'api key <redacted>');
+  assert.equal(redactSecrets('gh auth login --with-token ghp_abcdefghijklmnopqrst'),
+    'gh auth login --with-token <redacted>');
+
+  // And it stays off ordinary English, which is the failure mode that matters:
+  // over-redaction cost her a readable line once already (see the path test).
+  for (const plain of [
+    'the token limit is 8000',
+    'the password is wrong',
+    'secrets are stored in the vault',
+    'rotate the CI secret',
+    'npm test -- --watch=false',
+  ]) {
+    assert.equal(redactSecrets(plain), plain, plain);
+  }
 });
 
 test('an ordinary path is NOT a secret, however long and dashed it is', () => {
@@ -614,6 +669,112 @@ test('with no memory to rate-limit against, the briefing keeps its old shape', (
   const input = buildBrainInput({ kind: 'busy', tool: 'Edit', source: 'claude', context });
   assert.match(input, /^Local time: 22:15/m);
   assert.match(input, /^Right now: 5 coding sessions/m);
+});
+
+// ------------------------------------------------------------ prompt text
+//
+// What he *asked for*, as opposed to what his tools then did. Approved by the
+// owner on 2026-07-31, and the highest-risk field in the system: everything else
+// that leaves the machine is metadata the app chose, and this is free text he
+// may have pasted anything into.
+
+/** A `UserPromptSubmit` entry, exactly as server.mjs would have recorded one. */
+const promptEntry = (prompt, at = NOW) => ({
+  at,
+  source: 'claude',
+  sessionId: 's1',
+  event: 'UserPromptSubmit',
+  mode: 'busy',
+  failed: false,
+  raw: { session_id: 's1', cwd: CWD, hook_event_name: 'UserPromptSubmit', prompt },
+});
+
+test('the most recent prompt is carried, one of them, bounded and on one line', () => {
+  const ring = [
+    promptEntry('fix the DST edge case', NOW - 4 * MIN),
+    entry({ tool: 'Edit', at: NOW - 3 * MIN }),
+    promptEntry('now  run\nthe   tests\tagain', NOW - 2 * MIN),
+    entry({ tool: 'Bash', at: NOW - MIN }),
+  ];
+  // Newest only, and whitespace collapsed: a pasted paragraph is one line by the
+  // time it reaches a prompt, or it wrecks the shape of the whole briefing.
+  assert.deepEqual(recentPrompts(ring, { now: NOW }), ['now run the tests again']);
+  assert.equal(MAX_PROMPTS, 1, 'raising this is a deliberate change, not a tidy-up');
+
+  const long = 'x'.repeat(500);
+  const [only] = recentPrompts([promptEntry(long)], { now: NOW });
+  assert.ok(only.length <= MAX_PROMPT_CHARS, `${only.length} chars`);
+  assert.ok(only.endsWith('…'), 'cut honestly rather than silently');
+});
+
+test('only a UserPromptSubmit payload has a prompt to give', () => {
+  // The allowlist refuses `tool_input.prompt` — a *subagent brief* — and it stays
+  // refused. This is a different key on a different event, and nothing about the
+  // allowlist moved to allow it.
+  const subagent = entry({ tool: 'Task', input: { subagent_type: 'Explore', prompt: 'the brief' } });
+  assert.deepEqual(recentPrompts([subagent], { now: NOW }), []);
+  assert.ok(!ALLOWED_TOOL_INPUT_KEYS.includes('prompt'));
+
+  // A top-level `prompt` on some other event is not one either.
+  const wrongEvent = { ...promptEntry('not this'), raw: { hook_event_name: 'PreToolUse', prompt: 'not this' } };
+  assert.deepEqual(recentPrompts([wrongEvent], { now: NOW }), []);
+
+  // A truncated capture yields nothing at all, exactly as everywhere else here.
+  const truncated = { at: NOW, event: 'UserPromptSubmit', raw: { truncated: true, bytes: 9000, preview: '{"prompt":"secret' } };
+  assert.deepEqual(recentPrompts([truncated], { now: NOW }), []);
+
+  assert.deepEqual(recentPrompts(null, { now: NOW }), []);
+  assert.deepEqual(recentPrompts([promptEntry(42)], { now: NOW }), [], 'a non-string is not a prompt');
+});
+
+test('a prompt older than the window is not what he just asked for', () => {
+  const stale = promptEntry('this morning\'s question', NOW - RECENT_WINDOW_MS - MIN);
+  assert.deepEqual(recentPrompts([stale], { now: NOW }), []);
+});
+
+test('a pasted secret is redacted before the prompt ever reaches the briefing', () => {
+  // The realistic case, and the reason the redaction rules grew: he pastes an
+  // error message, a connection string and a key into one message and asks why
+  // it is failing.
+  const pasted = 'this fails: psql postgres://invoco:s3cr3t-pw@db.example.com/prod '
+    + 'and the token is ghp_abcdefghijklmnopqrst — my api key sk-proj-abcdefghijklmnopqrstuvwxyz01';
+  const [line] = recentPrompts([promptEntry(pasted)], { now: NOW });
+  for (const secret of ['s3cr3t-pw', 'ghp_abcdefghijklmnopqrst', 'sk-proj-abcdefghijklmnopqrstuvwxyz01']) {
+    assert.ok(!line.includes(secret), `leaked ${secret}: ${line}`);
+  }
+  assert.ok(line.includes('db.example.com'), 'the readable half survives');
+
+  // And through the whole stack, not merely through the extractor.
+  const context = buildContext({ ring: [promptEntry(pasted)], state: null, now: NOW });
+  const input = buildBrainInput({ kind: 'busy', tool: 'Bash', source: 'claude', context });
+  assert.ok(!input.includes('s3cr3t-pw'), input);
+  assert.ok(!input.includes('sk-proj-'), input);
+});
+
+test('the prompt reaches both briefings, quoted, next to the event', () => {
+  const ring = [promptEntry('fix the DST edge case in tee_time.ts'), entry({ tool: 'Bash', input: { command: 'npm test' } })];
+  const context = buildContext({ ring, state: null, now: NOW });
+  assert.deepEqual(context.prompts, ['fix the DST edge case in tee_time.ts']);
+
+  const ambient = buildBrainInput({ kind: 'busy', tool: 'Bash', project: 'GolfCRM', source: 'claude', context });
+  assert.match(ambient, /^He asked for: "fix the DST edge case in tee_time\.ts"\.$/m);
+  // Directly under the event: the two are one situation, and she can only see
+  // it if they arrive together.
+  const lines = ambient.split('\n');
+  assert.equal(lines.findIndex((l) => l.startsWith('He asked for:')),
+    lines.findIndex((l) => l.startsWith('Just happened:')) + 1);
+
+  const chat = buildChatInput({ text: 'how is it going?', context });
+  assert.match(chat, /He asked for: "fix the DST edge case in tee_time\.ts"\./);
+});
+
+test('no prompt in the ring simply removes the line', () => {
+  // The omission is the instruction, the same way it is for the clock: she is
+  // told nothing about what he wants rather than told it is unknown.
+  const context = buildContext({ ring: [entry({ tool: 'Edit' })], state: null, now: NOW });
+  assert.deepEqual(context.prompts, []);
+  assert.ok(!buildBrainInput({ kind: 'busy', tool: 'Edit', source: 'claude', context }).includes('He asked for'));
+  assert.ok(!buildChatInput({ text: 'hello', context }).includes('He asked for'));
 });
 
 // ---------------------------------------------------------------- privacy

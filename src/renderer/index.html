@@ -36,6 +36,10 @@
     <div id="menu" role="menu" hidden>
       <button type="button" id="menu-mute" role="menuitem" data-action="toggle-mute">Mute</button>
       <button type="button" id="menu-pin" role="menuitem" data-action="toggle-pin">Pin</button>
+      <!-- Recall. Wired end to end in main since the window module landed, but
+           unreachable until this button existed — MENU_ACTIONS listed 'home' and
+           nothing in the UI ever sent it. -->
+      <button type="button" id="menu-home" role="menuitem" data-action="home">Come here</button>
       <button type="button" id="menu-quit" role="menuitem" data-action="quit">Quit</button>
     </div>
   </div>

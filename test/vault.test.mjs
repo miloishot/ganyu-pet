@@ -9,8 +9,8 @@
 //   1. resolution — a repo directory becomes a vault project through the same
 //      map, and the same loose fallback, that the shell hooks use;
 //   2. privacy — the title, the date and the `Left open` bullets leave the
-//      module, and the rest of the note provably does not; Invoco leaves
-//      nothing at all, and its file is never even opened;
+//      module, and the rest of the note provably does not; a blocked project
+//      leaves nothing at all, and its file is never even opened;
 //   3. degradation — a missing vault, a missing map, an unknown project or an
 //      unreadable file all yield null, which is exactly today's behaviour.
 
@@ -317,28 +317,71 @@ test('a note with no heading falls back to its filename, and no frontmatter to i
 
 // --------------------------------------------------------- the exclusion
 
-test('Invoco is excluded by name, and it is a deliberate constant', () => {
-  // Not an oversight and not a stub: the owner has not approved sending Invoco
-  // business material to a third-party endpoint. If this list is ever emptied,
-  // that must be his decision, and this test is where it gets noticed.
-  assert.deepEqual([...EXCLUDED_PROJECTS], ['Invoco']);
-  assert.ok(isExcluded('Invoco'));
-  assert.ok(isExcluded('invoco'), 'case cannot be the way around it');
+test('the exclusion list is empty, which is the owner\'s decision and not a default', () => {
+  // It held 'Invoco' from the start, because his business notes carry pricing,
+  // customer names and grant applications and the digest leaves the machine.
+  // He was asked, and on 2026-07-31 he approved Invoco specifically. This
+  // assertion is here so that *putting a name back* is also a decision someone
+  // takes deliberately, rather than something a passing refactor can do.
+  assert.deepEqual([...EXCLUDED_PROJECTS], []);
+  assert.ok(!isExcluded('Invoco'), 'Invoco is approved as of 2026-07-31');
   assert.ok(!isExcluded('GolfCRM'));
   assert.ok(!isExcluded(''));
 });
 
-test('an excluded project yields nothing, and its note is never opened', () => {
-  const { fs, vault } = vaultFor('C:\\Users\\kw11l\\Desktop\\Invoco-POS');
+test('the exclusion mechanism still works, on a name that is on a list', () => {
+  // The list is empty; the machinery is not. Exercised with a synthetic name so
+  // this keeps proving the rule whatever the owner later decides to block —
+  // matching is normalized, and a name that is not on the list is not excluded.
+  const BLOCKED = ['Fictional Project'];
+  assert.ok(isExcluded('Fictional Project', BLOCKED));
+  assert.ok(isExcluded('fictional-project', BLOCKED), 'case and punctuation cannot be the way around it');
+  assert.ok(isExcluded('FICTIONALPROJECT', BLOCKED));
+  assert.ok(!isExcluded('GolfCRM', BLOCKED));
+  assert.ok(!isExcluded('', BLOCKED), 'no project is not a blocked project');
+});
+
+test('a blocked project yields nothing, and its note is never opened', () => {
+  // The end-to-end claim, which is the one that matters: the block is checked
+  // *before* the file is read, so a blocked note is never opened rather than
+  // merely absent from the output. Driven with a synthetic name for the same
+  // reason as above — the behaviour is what is pinned here, not the name.
+  const BLOCKED = 'Fictional Project';
+  const fs = vaultFs({
+    tree: {
+      [PROJECTS]: ['GolfCRM', 'Invoco', BLOCKED],
+      [at(BLOCKED)]: ['session-2026-07-30.md'],
+    },
+    files: {
+      [at(BLOCKED, 'session-2026-07-30.md')]: '# Secret\n\n## Left open\n- the private thing\n',
+    },
+  });
+  const vault = createVault({
+    fs,
+    projectsDir: PROJECTS,
+    mapPath: MAP,
+    cwd: `D:\\code\\${BLOCKED}`,
+    excludedProjects: [BLOCKED],
+  });
+
   assert.equal(vault.digest(), null);
-  // The stronger claim: not merely absent from the output — never read at all.
   assert.ok(
-    !fs.reads.some((p) => p.includes('Invoco')),
-    `opened an Invoco file: ${fs.reads.join(', ')}`,
+    !fs.reads.some((p) => p.includes(BLOCKED)),
+    `opened a blocked file: ${fs.reads.join(', ')}`,
   );
-  // And the resolution itself still worked, so this is the exclusion talking
-  // and not a mapping that quietly failed.
-  assert.equal(vault.stats().project, 'Invoco');
+  // And the resolution itself still worked, so this is the block talking and
+  // not a mapping that quietly failed.
+  assert.equal(vault.stats().project, BLOCKED);
+});
+
+test('Invoco is no longer blocked: its notes read like any other project\'s', () => {
+  // The other half of the 2026-07-31 approval, and the reason the list is empty.
+  // `Invoco-POS` resolves through the map to `Invoco`, and now reads its note.
+  const { fs, vault } = vaultFor('C:\\Users\\kw11l\\Desktop\\Invoco-POS');
+  assert.equal(vault.stats().project, null, 'nothing is read until something asks');
+  assert.equal(vault.digest(), 'Your notes for Invoco — "Pricing" (2026-07-30).\n'
+    + 'Still open there: the tier-2 markup.');
+  assert.ok(fs.reads.includes(at('Invoco', 'session-2026-07-30.md')));
 });
 
 // ------------------------------------------------------------- end to end

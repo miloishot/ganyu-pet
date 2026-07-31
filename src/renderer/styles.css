@@ -46,6 +46,14 @@ body {
   image-rendering: pixelated;
   pointer-events: auto;
   flex: 0 0 auto;
+  /* She can be picked up. The cursor is the only place that says so — there is
+     no chrome to hint with, and :active covers the whole press, so no class
+     toggling is needed to close the grab. */
+  cursor: grab;
+}
+
+#pet:active {
+  cursor: grabbing;
 }
 
 #pet[data-broken] {

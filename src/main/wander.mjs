@@ -31,6 +31,17 @@
 //      outranks strolling, and unlike strolling it also runs while pinned and
 //      while the mode is non-calm — gravity is containment, not behaviour.
 //
+// Being picked up is the fourth rule, and it is why `grab`/`moveTo`/`release`
+// live here rather than in module A. Module A owns the *input* (which button
+// went down, where the cursor is), but there must be exactly one writer of the
+// window position or the drag and the stroll fight each other 20 times a second.
+// So a drag suspends this module the same way `waiting`/`failed` does — arm
+// timer cancelled, stroll abandoned, fall dropped — and every dragged pixel goes
+// out through the same `moveWindow` as every strolled one. `release` hands the
+// cursor's velocity back to the physics, which is what turns a flick into a
+// throw: she keeps her horizontal speed through the air, bounces off the side
+// walls, and skids to a stop on the floor.
+//
 // Production wiring (module A):
 //   createWander({
 //     clock: { now: () => Date.now() },
@@ -73,6 +84,18 @@ export const WANDER_DEFAULTS = Object.freeze({
   maxFallPxPerSec: 900, // terminal velocity
   restitution: 0.25, // fraction of impact speed returned by a bounce
   minBounceVelocity: 120, // below this a rebound settles instead of bouncing
+  // Throw physics. A wall returns more than the floor does on purpose: at the
+  // floor's 0.25 a thrown pet hits the side of the screen and stops dead, which
+  // reads as a collision bug rather than as a bounce.
+  wallRestitution: 0.5,
+  // Landing with horizontal speed left is a skid, not a full stop — without it a
+  // flick along the floor (where there is no air time to spend the speed in) does
+  // nothing at all, which reads as the throw having been ignored.
+  groundFrictionPxPerSec2: 1600,
+  minSlideVelocity: 40, // below this a skid stops, and a release is not a throw
+  // A flick can report an arbitrarily large cursor velocity if the sample window
+  // catches a single huge jump; this is the ceiling on what physics is handed.
+  maxThrowPxPerSec: 2400,
 });
 
 /** Sub-pixel slack, so float jitter at rest cannot re-trigger a fall. */
@@ -114,6 +137,10 @@ export function createWander({
   moveWindow,
   getWorkArea,
   onWalkState = () => {},
+  // Fires on the edges of "off the ground" — held in the cursor, or mid-flight.
+  // The renderer draws the jump row from it; nothing here depends on it, so the
+  // default no-op is a complete wiring.
+  onAirborne = () => {},
   isPinned = () => false,
   random = Math.random,
   // Optional: lets the pet resume from where the user actually dragged it, and
@@ -152,9 +179,12 @@ export function createWander({
 
   let strolling = false; // true for a whole stroll, mid-walk pause included
   let falling = false;
+  let held = false; // in the cursor: this module still owns the position, module A aims it
+  let airborne = false; // last value handed to onAirborne (held or falling)
   let walkDir = null; // last value handed to onWalkState
   let x = null; // tracked window position (float; rounded before moveWindow)
   let y = null;
+  let vx = 0; // horizontal velocity, px/s — only ever non-zero after a throw
   let vy = 0; // vertical velocity, px/s, positive = downward
   let target = null;
   let pauseAtX = null; // x threshold that triggers this stroll's breather
@@ -214,7 +244,7 @@ export function createWander({
    * every tick would fight the float integration.
    */
   function readPosition() {
-    if (strolling || falling) return;
+    if (strolling || falling || held) return;
     if (typeof getPosition !== 'function') return;
     try {
       const p = getPosition();
@@ -241,6 +271,14 @@ export function createWander({
     onWalkState(dir ? { dir } : null);
   }
 
+  /** Edge-triggered like pushWalk: the renderer only needs the transitions. */
+  function setAirborne(next) {
+    const value = Boolean(next);
+    if (value === airborne) return;
+    airborne = value;
+    onAirborne(value);
+  }
+
   function between(lo, hi) {
     return lo + random() * (hi - lo);
   }
@@ -261,9 +299,10 @@ export function createWander({
     pushWalk(null);
   }
 
-  // Deliberately leaves a fall in progress alone: `cancel()` is the pin toggle and
-  // setMode's non-calm branch, and neither pinning nor a `failed` mode is a reason
-  // to leave her hanging in mid-air. Only stop() (teardown) kills the fall.
+  // Deliberately leaves a fall in progress — and a pet being held — alone:
+  // `cancel()` is the pin toggle and setMode's non-calm branch, and neither
+  // pinning nor a `failed` mode is a reason to leave her hanging in mid-air or to
+  // yank her out of the owner's hand. Only stop() (teardown) kills either.
   function cancelAll() {
     cancelHandle(armTimer);
     armTimer = null;
@@ -283,23 +322,30 @@ export function createWander({
     scheduleNextStroll();
   }
 
-  function startFall() {
+  /**
+   * `vx0`/`vy0` are the launch velocity: zero for an ordinary fall (dragged up,
+   * or left high by a display change), the cursor's for a throw.
+   */
+  function startFall(vx0 = 0, vy0 = 0) {
     if (stopped || falling) return false;
     if (strolling) abortStroll(); // gravity outranks the stroll
     falling = true;
-    vy = 0;
+    vx = vx0;
+    vy = vy0;
     lastFallAt = clock.now();
     cancelHandle(fallTimer);
     fallTimer = schedule(fallTick, D.tickMs);
+    setAirborne(true);
     return true;
   }
 
   /**
    * Start falling if she is above the floor — dragged up, or left high by a
-   * display change. Runs regardless of mode and pinned state.
+   * display change. Runs regardless of mode and pinned state, but never out of
+   * the owner's hand: while held, this module's position is his to aim.
    */
   function maybeFall(b) {
-    if (stopped || falling || !Number.isFinite(y)) return false;
+    if (stopped || falling || held || !Number.isFinite(y)) return false;
     if (y >= b.bottomY - FLOOR_EPS) return false;
     return startFall();
   }
@@ -307,15 +353,41 @@ export function createWander({
   function fallTick() {
     fallTimer = null;
     if (stopped || !falling) return;
+    if (held) {
+      // Caught in mid-air. grab() already cleared the timer; this is the tick
+      // that was already in flight when it did.
+      falling = false;
+      return;
+    }
 
     const b = bounds();
     const now = clock.now();
     const dt = clamp(now - lastFallAt, 0, D.maxTickDtMs) / 1000; // same clamp as tick()
     lastFallAt = now;
 
+    // Ground contact is decided from where the step *starts*: friction belongs to
+    // a tick that began on the floor, so a skid decays and a flight does not.
+    const onFloor = y >= b.bottomY - FLOOR_EPS;
+
     vy = Math.min(vy + D.gravityPxPerSec2 * dt, D.maxFallPxPerSec);
     y += vy * dt;
-    x = clamp(x, b.minX, b.maxX); // the work area can change mid-fall
+
+    if (vx !== 0) {
+      if (onFloor) {
+        const drop = D.groundFrictionPxPerSec2 * dt;
+        vx = Math.abs(vx) <= drop ? 0 : vx - Math.sign(vx) * drop;
+      }
+      x += vx * dt;
+      if (x < b.minX) {
+        x = b.minX;
+        vx = -vx * D.wallRestitution;
+      } else if (x > b.maxX) {
+        x = b.maxX;
+        vx = -vx * D.wallRestitution;
+      }
+      if (onFloor && Math.abs(vx) < D.minSlideVelocity) vx = 0;
+    }
+    x = clamp(x, b.minX, b.maxX); // the work area can change mid-flight
 
     if (y < b.bottomY) {
       moveWindow(Math.round(x), Math.round(y));
@@ -334,8 +406,86 @@ export function createWander({
     }
 
     vy = 0;
+    if (vx !== 0) {
+      // Landed, but not stopped: she is skidding. Friction ends this.
+      fallTimer = schedule(fallTick, D.tickMs);
+      return;
+    }
     falling = false;
+    setAirborne(false);
     afterLanding();
+  }
+
+  // --------------------------------------------------------------- pick her up
+
+  /**
+   * Picked up. Suspends this module exactly the way a non-calm mode does —
+   * countdown cancelled, stroll abandoned, fall dropped — and takes the window's
+   * real position as the starting point, because module A is about to aim it.
+   */
+  function grab() {
+    if (stopped) return false;
+    cancelHandle(armTimer);
+    armTimer = null;
+    abortStroll();
+    cancelHandle(fallTimer);
+    fallTimer = null;
+    falling = false;
+    vx = 0;
+    vy = 0;
+
+    const b = bounds();
+    readPosition(); // still un-held, so this adopts wherever she really is
+    if (!Number.isFinite(x)) x = b.maxX;
+    if (!Number.isFinite(y)) y = b.bottomY;
+
+    held = true;
+    setAirborne(true);
+    return true;
+  }
+
+  /**
+   * Where the cursor says she should be. Clamped to the work area, so she cannot
+   * be dragged off the screen she was lost off before — containment is not
+   * something the owner should be able to switch off by holding her.
+   */
+  function moveTo(nx, ny) {
+    if (stopped || !held) return false;
+    const b = bounds();
+    x = clamp(num(nx, x), b.minX, b.maxX);
+    y = clamp(num(ny, y), b.minY, b.bottomY);
+    moveWindow(Math.round(x), Math.round(y));
+    return true;
+  }
+
+  /**
+   * Let go, with the cursor's velocity. That velocity is the whole difference
+   * between putting her down and throwing her, so it goes straight into the same
+   * physics that gravity already uses rather than into a second animation path.
+   */
+  function release(velocity) {
+    if (stopped || !held) return false;
+    held = false;
+
+    const cap = D.maxThrowPxPerSec;
+    const vx0 = clamp(num(velocity && velocity.vx, 0), -cap, cap);
+    const vy0 = clamp(num(velocity && velocity.vy, 0), -cap, cap);
+
+    // Set down rather than thrown: already on the floor, not moving up, and no
+    // sideways speed worth simulating. Nothing to fly, so hand her straight back
+    // to the ordinary scheduler.
+    const b = bounds();
+    if (y >= b.bottomY - FLOOR_EPS && vy0 >= 0 && Math.abs(vx0) < D.minSlideVelocity) {
+      y = b.bottomY;
+      vx = 0;
+      vy = 0;
+      setAirborne(false);
+      afterLanding();
+      return true;
+    }
+
+    startFall(vx0, vy0);
+    return true;
   }
 
   /**
@@ -347,7 +497,9 @@ export function createWander({
    * `screen` display events.
    */
   function containNow() {
-    if (stopped) return false;
+    // Held is exempt, and only held: `moveTo` clamps every dragged pixel to the
+    // same bounds, so there is nothing here to fix and a second writer to cause.
+    if (stopped || held) return false;
     const b = bounds();
     readPosition();
     // Nothing known and nothing to read: seed the corner without moving her.
@@ -368,9 +520,10 @@ export function createWander({
   function onArmTimer() {
     armTimer = null;
     if (stopped || !isCalm(mode)) return;
-    // Pinned never strolls, and neither does a pet still in the air; keep polling
-    // so unpinning (or landing) resumes without needing another state change.
-    if (isPinned() || falling) {
+    // Pinned never strolls, and neither does a pet still in the air or in the
+    // owner's hand; keep polling so unpinning (or landing, or being put down)
+    // resumes without needing another state change.
+    if (isPinned() || falling || held) {
       scheduleNextStroll();
       return;
     }
@@ -545,12 +698,21 @@ export function createWander({
       cancelHandle(fallTimer);
       fallTimer = null;
       falling = false;
+      held = false;
+      setAirborne(false);
+      vx = 0;
       vy = 0;
       mode = null;
     },
 
     // Containment, callable at any time from any state. See containNow above.
     containNow,
+
+    // Picked up, dragged, thrown. Module A owns the cursor and calls these three;
+    // the position itself is still written here and nowhere else.
+    grab,
+    moveTo,
+    release,
 
     // For `GET /state`.wandering — true for the whole stroll, breather included.
     isWandering() {
@@ -566,6 +728,11 @@ export function createWander({
     // Diagnostics/tests: mid-fall or mid-bounce.
     isFalling() {
       return falling;
+    },
+
+    // Diagnostics/tests: in the owner's hand.
+    isHeld() {
+      return held;
     },
   };
 }
