@@ -53,6 +53,16 @@ const LEDGER_FILE = 'ledger.jsonl';
 const VAULT_PROJECTS = path.join(os.homedir(), 'second-brain', '03 Projects');
 const PROJECT_MAP = path.join(os.homedir(), '.claude', 'hooks', 'projects.tsv');
 
+/**
+ * The topic-shaped vaults, which are not session logs and so need topics.mjs
+ * rather than vault.mjs. Absent directories are skipped silently — he does not
+ * have these on every machine.
+ */
+const TOPIC_VAULTS = Object.freeze([
+  { dir: path.join(os.homedir(), 'invoco-vault'), label: 'Invoco engineering' },
+  { dir: path.join(os.homedir(), 'invoco-vault-strategy'), label: 'Invoco strategy' },
+]);
+
 const SMOKE = process.env.GANYU_SMOKE === '1';
 const SMOKE_DELAY_MS = 5000;
 const DEFAULT_PORT = 47821;
@@ -524,10 +534,18 @@ async function composeRuntime() {
     });
   }
 
-  /** The two digests, read per chat message. Never a reason a reply fails. */
+  let topics = null;
+  const topicsMod = await tryImport('./topics.mjs');
+  if (topicsMod?.createTopics) {
+    topics = topicsMod.createTopics({ fs, vaults: TOPIC_VAULTS });
+    console.log(`[ganyu] topic vaults: ${topics.digest() ? 'readable' : 'none found'}`);
+  }
+
+  /** The digests, read per chat message. Never a reason a reply fails. */
   const readMemory = () => ({
     ledger: ledger?.digest?.() ?? null,
     vault: vault?.digest?.() ?? null,
+    topics: topics?.digest?.() ?? null,
   });
 
   // The brain is optional in every sense: no .env.local, no key, or an endpoint
