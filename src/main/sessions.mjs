@@ -35,8 +35,9 @@
 //   · `system`, `mode`, `permission-mode`, `queue-operation`, `last-prompt`,
 //     `pr-link`, and any line type not yet seen — unknown types are dropped, so a
 //     future Claude Code release cannot widen this by adding one.
-//   · `isSidechain` lines — subagent transcripts. Dropped for noise as much as for
-//     privacy: a subagent's prose is about its own narrow errand, not about the work.
+//   · `isSidechain` lines — kept as a guard, though measured against the real tree
+//     it never fires here; see `classifyTranscript` for what actually separates a
+//     dispatched agent's errand from one of his own sessions.
 //
 // Two further passes run on the text that *is* allowed, because "assistant prose"
 // is not automatically safe:
@@ -84,6 +85,33 @@ export const MAX_PROBLEM_CHARS = 200;
 export const MAX_ASKS = 4;
 export const MAX_NOTES = 4;
 export const MAX_PROBLEMS = 3;
+
+/**
+ * Asks plus prose blocks below which a read is reported as **thin**.
+ *
+ * THE SECOND DEFECT, AND THE WORSE ONE. Handed a 19-line subagent transcript she
+ * answered "that ganyu-pet session only produced one short reaction line" and "I
+ * don't see any unfinished work in that record" — plainly, confidently, and
+ * wrong about a day of real work. She was not hallucinating; she was faithfully
+ * reporting a bad read, which is worse, because it sounds exactly like a good
+ * answer. A digest that found almost nothing has to *say* it found almost
+ * nothing, so that absence of evidence cannot be delivered as evidence of
+ * absence.
+ *
+ * Four is the total of the two counts, not a threshold on either: a session with
+ * one ask and three accounts of what came of it has been described, and one with
+ * a single ask and a single line back has not. Both counts are of everything in
+ * the file, not of the handful kept for the summary — `MAX_ASKS` and `MAX_NOTES`
+ * cap what she is shown, and capping what she is *told there was* is the bug.
+ */
+export const THIN_TOTAL = 4;
+
+/** `'empty'` · `'thin'` · `'full'` — how much a digest actually found. */
+export function substanceOf(askCount, noteCount) {
+  const total = Math.max(0, Number(askCount) || 0) + Math.max(0, Number(noteCount) || 0);
+  if (total === 0) return 'empty';
+  return total < THIN_TOTAL ? 'thin' : 'full';
+}
 
 /** Default and ceiling for the rendered summary. Callers bound it; see `summarizeSession`. */
 export const DEFAULT_SUMMARY_CHARS = 1200;
@@ -460,6 +488,165 @@ function namesIn(fs, dir) {
 
 const joinPath = (dir, name) => `${String(dir).replace(/[\\/]+$/, '')}/${name}`;
 
+// ---------------------------------------------------------------------------
+// One of HIS sessions, or one of his agents' errands?
+//
+// THE DEFECT THIS EXISTS FOR. `~/.claude/projects/<mangled-cwd>/` holds a
+// transcript for *every* agent run, not only the sessions he sat in front of.
+// Measured on this machine: `C--Users-kw11l-Desktop-ganyu-pet/` holds 74 files
+// and the largest is 19 lines — every one a dispatched subagent — while the day
+// of real work that produced them is in `C--Users-kw11l/`, whose largest file is
+// 2,636 lines. So "read me the ganyu-pet session" returned a 19-line errand, and
+// the "ask" it reported was a persona prompt the app had sent to a model. She
+// then described an internal API probe as something he had asked for.
+//
+// `isSidechain` does not separate them. It is `true` on **0 of the 148**
+// transcripts on this machine: a dispatched agent gets its own top-level
+// transcript rather than sidechain lines inside its parent's. The guard in
+// `ownerAsk` / `assistantNote` is kept because other setups do produce them, but
+// it was never doing this job.
+// ---------------------------------------------------------------------------
+
+/**
+ * Line types Claude Code writes into a session **he was present for**, and not
+ * into a dispatched agent's transcript.
+ *
+ * Chosen by measuring all 148 transcripts under `~/.claude/projects`, not by
+ * picking a plausible-looking marker:
+ *
+ *   · `mode` / `permission-mode` — the session's mode, which only a session with
+ *     a person in it can be put into.
+ *   · `file-history-snapshot`    — the editor's undo record, written when a real
+ *     session first edits a file.
+ *   · `system`                   — hook and system notices addressed to the session.
+ *   · `ai-title`                 — the generated title, which exists so that *he*
+ *     can find the session again in a picker.
+ *
+ * Deliberately a *set*, and deliberately requiring two of them (see
+ * `MIN_INTERACTIVE_MARKERS`) — no single marker is trusted, because no single
+ * marker survived the measurement. `ai-title` alone appears on two 10-line
+ * dispatched runs; `system` alone appears without the others; and one 45-line
+ * dispatched run carries `queue-operation` and nothing else.
+ *
+ * `queue-operation` is **not** here despite appearing in all 74 subagent files:
+ * 8 of the 10 genuine sessions carry it too, so its presence says nothing. What
+ * separates the two populations is the *absence* of the five above.
+ */
+export const INTERACTIVE_LINE_TYPES = Object.freeze([
+  'mode',
+  'permission-mode',
+  'file-history-snapshot',
+  'system',
+  'ai-title',
+]);
+
+/**
+ * How many distinct markers make a transcript his.
+ *
+ * Two, not one. Measured: at two, the rule scores 0 of 74 in the ganyu-pet
+ * folder and 10 of 10 in his home directory, with no file on the machine landing
+ * on the wrong side. At one it would take the two 10-line dispatched runs that
+ * happen to carry `ai-title`.
+ */
+export const MIN_INTERACTIVE_MARKERS = 2;
+
+/**
+ * How much of a transcript's **head** is read to classify it.
+ *
+ * The head, not the tail, and that is the whole reason this is a separate read
+ * from `readTail`. Four of the five markers are written in the opening moments
+ * of a session, so the last two megabytes of a ten-megabyte transcript contain
+ * none of them — classifying from the tail would call his longest, realest
+ * session an errand, which is the exact failure this module is fixing.
+ *
+ * 256 KB because that is what the measurement asked for: 53 of the 58 genuine
+ * sessions here reach two markers inside 8 KB, but five late-titled ones need up
+ * to 215 KB. The read is capped at the file's own size, so the 74 subagent files
+ * (11–55 KB each) are simply read whole. Classifying every transcript on the
+ * machine this way costs 72 ms, and only the whole-machine fallback ever does.
+ */
+export const CLASSIFY_HEAD_BYTES = 256 * 1024;
+
+/**
+ * The leading `maxBytes` of a file. The mirror image of `readTail`, and its
+ * torn line is the **last** one rather than the first.
+ */
+function readHead(fs, filePath, maxBytes = CLASSIFY_HEAD_BYTES) {
+  const size = Number(safe(() => fs.statSync(filePath)?.size, null));
+  if (!Number.isFinite(size) || size <= maxBytes || typeof fs.openSync !== 'function') {
+    const text = safe(() => fs.readFileSync(filePath, 'utf8'), null);
+    return text == null ? null : { text: String(text), partial: false };
+  }
+
+  let fd = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.alloc(maxBytes);
+    const read = fs.readSync(fd, buf, 0, maxBytes, 0);
+    return { text: buf.toString('utf8', 0, read), partial: true };
+  } catch {
+    const text = safe(() => fs.readFileSync(filePath, 'utf8'), null);
+    return text == null ? null : { text: String(text), partial: false };
+  } finally {
+    if (fd !== null) safe(() => fs.closeSync?.(fd));
+  }
+}
+
+/**
+ * How many distinct interactive markers `text` carries, stopping as soon as
+ * enough have been seen.
+ *
+ * **Reads `line.type` and nothing else.** No line's content is examined, so this
+ * adds no privacy surface at all — which matters because `system` lines carry
+ * hook command lines and `file-history-snapshot` lines carry whole file bodies.
+ * Both are counted here purely by the name of their type.
+ */
+function countMarkers(text, partial) {
+  const lines = String(text ?? '').split('\n');
+  // A partial head read ends mid-line; drop that fragment rather than parse it.
+  if (partial && lines.length > 1) lines.pop();
+
+  const seen = new Set();
+  for (const raw of lines) {
+    if (raw.trim() === '') continue;
+    let line = null;
+    try {
+      line = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+    if (INTERACTIVE_LINE_TYPES.includes(line?.type)) {
+      seen.add(line.type);
+      if (seen.size >= MIN_INTERACTIVE_MARKERS) break;
+    }
+  }
+  return seen.size;
+}
+
+/**
+ * `classifyTranscript({fs, filePath, text})` -> `{kind, markers}`.
+ *
+ * `kind` is `'session'` for one of his own, `'subagent'` for a dispatched
+ * agent's errand. Pass `text` when the whole file is already in hand and the
+ * second read can be skipped; otherwise the head is read here.
+ *
+ * An unreadable file classifies as `'subagent'`, which is the safe default: it
+ * keeps a file nothing can be established about out of the answers she gives.
+ */
+export function classifyTranscript({ fs, filePath, text = null } = {}) {
+  if (typeof text === 'string') {
+    const markers = countMarkers(text, false);
+    return { kind: markers >= MIN_INTERACTIVE_MARKERS ? 'session' : 'subagent', markers };
+  }
+  if (!fs || typeof fs.readFileSync !== 'function' || !filePath) {
+    return { kind: 'subagent', markers: 0 };
+  }
+  const read = readHead(fs, filePath);
+  if (read == null) return { kind: 'subagent', markers: 0 };
+  const markers = countMarkers(read.text, read.partial);
+  return { kind: markers >= MIN_INTERACTIVE_MARKERS ? 'session' : 'subagent', markers };
+}
+
 /**
  * `listSessions({fs, projectsDir, cwd, project, limit})` — transcripts, newest first.
  *
@@ -468,9 +655,19 @@ const joinPath = (dir, name) => `${String(dir).replace(/[\\/]+$/, '')}/${name}`;
  * to do with GolfCRM" — and matches worktrees too, see `dirMatchesProject`. With
  * neither, every project directory is in scope.
  *
- * Only stats and names are read here; nothing is opened. That keeps a listing
- * cheap enough to run on every tool call, and it means a listing can never leak
- * anything, because it never sees a byte of content.
+ * **Ordering.** Without `classify`, strictly newest first, and only stats and
+ * names are read — nothing is opened, so the listing stays cheap enough to run
+ * on every tool call and can never leak anything, because it never sees a byte
+ * of content. That is the shape module A and `list` still get.
+ *
+ * With `classify`, each file's head is read to decide whether it is one of his
+ * sessions or a dispatched agent's errand (`classifyTranscript`), and the sort
+ * becomes **his own sessions first, then newest first within each group**. Two
+ * keys, in that order, and nothing cleverer: recency is what "the last session"
+ * means and it must not be traded away, but a 19-line errand from four minutes
+ * ago is not a session however recent it is. `interactiveOnly` drops the errands
+ * altogether and implies `classify`; it is what `read` and `recent` use, so the
+ * `limit` then counts real sessions rather than being spent on noise.
  */
 export function listSessions({
   fs,
@@ -478,6 +675,8 @@ export function listSessions({
   cwd = null,
   project = null,
   limit = DEFAULT_SESSION_LIMIT,
+  classify = false,
+  interactiveOnly = false,
 } = {}) {
   if (!fs || typeof fs.readdirSync !== 'function' || !projectsDir) return [];
 
@@ -502,13 +701,20 @@ export function listSessions({
       // A zero-byte transcript is a session that opened and never said anything.
       if (!Number.isFinite(bytes) || bytes <= 0) continue;
       const mtime = Number(stat?.mtimeMs ?? stat?.mtime);
-      out.push({
+      const entry = {
         id: name.slice(0, -TRANSCRIPT_EXT.length),
         path: filePath,
         dir,
         bytes,
         at: Number.isFinite(mtime) ? mtime : 0,
-      });
+      };
+      if (classify || interactiveOnly) {
+        const { kind, markers } = classifyTranscript({ fs, filePath });
+        if (interactiveOnly && kind !== 'session') continue;
+        entry.kind = kind;
+        entry.markers = markers;
+      }
+      out.push(entry);
     }
   }
 
@@ -516,7 +722,11 @@ export function listSessions({
     Math.max(1, Number.isFinite(Number(limit)) ? Math.floor(Number(limit)) : DEFAULT_SESSION_LIMIT),
     MAX_SESSION_LIMIT,
   );
-  return out.sort((a, b) => b.at - a.at || (a.path < b.path ? -1 : 1)).slice(0, max);
+  // His own sessions ahead of dispatched errands, then newest first inside each.
+  const rank = (entry) => (entry.kind === 'subagent' ? 1 : 0);
+  return out
+    .sort((a, b) => rank(a) - rank(b) || b.at - a.at || (a.path < b.path ? -1 : 1))
+    .slice(0, max);
 }
 
 /**
@@ -573,6 +783,14 @@ export function readSession({
   const read = readTail(fs, filePath, maxBytes);
   if (read == null) return null;
 
+  // Whose session this is, decided from the file's HEAD. When the tail read took
+  // the whole file there is nothing left to read and the same text answers it;
+  // when it did not, the markers are at the far end from what `readTail` holds,
+  // which is exactly why this is a second read and not a scan of `parsed`.
+  const { kind, markers } = read.partial
+    ? classifyTranscript({ fs, filePath })
+    : classifyTranscript({ text: read.text });
+
   const rawLines = read.text.split('\n');
   // A tail read starts mid-line; drop that fragment rather than trying to parse it.
   if (read.partial && rawLines.length > 1) rawLines.shift();
@@ -623,35 +841,56 @@ export function readSession({
     }
   }
 
-  // Backward pass: the bounded, expensive text. Newest first, reversed at the end.
-  for (let i = parsed.length - 1; i >= 0; i -= 1) {
-    const line = parsed[i];
-    if (line.type === 'user' && asks.length < maxAsks) {
+  // Second pass: the bounded, expensive text. Every line is visited rather than
+  // stopping once the caps are full, because `askCount` and `noteCount` are the
+  // honesty signal and a count that stopped counting at four is not one — see
+  // THIN_TOTAL. Only the last `maxAsks` / `maxNotes` are kept for the summary,
+  // so the newest-weighting is unchanged; it is now a slice instead of a break.
+  const seenAsks = new Set();
+  const seenNotes = new Set();
+  for (const line of parsed) {
+    if (line.type === 'user') {
       const ask = ownerAsk(line);
-      if (ask && !asks.includes(ask)) asks.push(ask);
-    } else if (line.type === 'assistant' && notes.length < maxNotes) {
+      if (ask && !seenAsks.has(ask)) {
+        seenAsks.add(ask);
+        asks.push(ask);
+      }
+    } else if (line.type === 'assistant') {
       const note = assistantNote(line);
-      if (note && !notes.includes(note)) notes.push(note);
+      if (note && !seenNotes.has(note)) {
+        seenNotes.add(note);
+        notes.push(note);
+      }
     }
-    if (asks.length >= maxAsks && notes.length >= maxNotes) break;
   }
-  asks.reverse();
-  notes.reverse();
+
+  const askCount = asks.length;
+  const noteCount = notes.length;
+  const keptAsks = asks.slice(-maxAsks);
+  const keptNotes = notes.slice(-maxNotes);
 
   return {
     path: String(filePath),
     project: projectFromCwd(cwd),
     cwd: cwd == null ? null : String(cwd),
     title,
-    asks,
-    notes,
-    problems: problemsFrom(notes),
+    asks: keptAsks,
+    notes: keptNotes,
+    problems: problemsFrom(keptNotes),
     interrupted,
     startedAt: firstAt,
     endedAt: lastAt,
     lines: parsed.length,
     skipped,
     truncated: read.partial,
+    // Whose session this was, and how much of it there turned out to be. Both
+    // travel with the digest so that every caller — and she — is told, rather
+    // than a thin read being returned looking exactly like a full one.
+    kind,
+    markers,
+    askCount,
+    noteCount,
+    substance: substanceOf(askCount, noteCount),
   };
 }
 
@@ -667,6 +906,44 @@ export function describeWhen(at, now = Date.now()) {
   if (hours < 24) return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
   const days = Math.round(hours / 24);
   return days === 1 ? 'yesterday' : `${days} days ago`;
+}
+
+const count = (n, one, many) => (n === 1 ? `1 ${one}` : `${n} ${many}`);
+
+/**
+ * How much this read actually found, in a sentence — the fix for the second
+ * defect, and the reason a thin answer can no longer be handed over looking like
+ * a complete one.
+ *
+ * The counts are of everything in the transcript, not of the few kept for the
+ * summary above, so "4 things he asked for" on a capped digest means at least
+ * four rather than exactly four; `THIN_TOTAL` explains why that distinction is
+ * the whole point. Truncation is reported here too, because a tail-read digest
+ * genuinely has not seen the start of the session and saying otherwise is the
+ * same error in a different coat.
+ */
+function foundLine(digest) {
+  const asks = Math.max(0, Number(digest.askCount ?? digest.asks?.length ?? 0) || 0);
+  const notes = Math.max(0, Number(digest.noteCount ?? digest.notes?.length ?? 0) || 0);
+  const lines = Number(digest.lines);
+  const from = Number.isFinite(lines) && lines > 0 ? `, out of ${count(lines, 'line', 'lines')}` : '';
+
+  const head = `How much is in this record: ${count(asks, 'thing he asked for', 'things he asked for')}`
+    + ` and ${count(notes, 'note of what came of it', 'notes of what came of it')}${from}.`;
+
+  const substance = digest.substance ?? substanceOf(asks, notes);
+  const verdict = substance === 'empty'
+    ? ' That is nothing at all: this record is empty, and it says nothing about what was or was not done.'
+    : (substance === 'thin'
+      ? ' That is very little. This is a THIN record — it is the whole of what was written down here,'
+        + ' not the whole of what happened, and it is no evidence that nothing else was done or finished.'
+      : ' That is a substantial record of the session.');
+
+  const cut = digest.truncated
+    ? ' Only the later part of a long session was read, so the beginning of it is not in this account.'
+    : '';
+
+  return `${head}${verdict}${cut}`;
 }
 
 /**
@@ -694,34 +971,42 @@ export function summarizeSession(digest, { now = Date.now(), maxChars = DEFAULT_
     ? `Session "${digest.title}"${where}`
     : `A session${where}`;
 
-  const parts = [when ? `${head}, ${when}.` : `${head}.`];
+  const body = [];
 
   if (digest.asks?.length) {
-    parts.push(`What he asked for: ${digest.asks.map((a) => `"${a}"`).join(' Then: ')}`);
+    body.push(`What he asked for: ${digest.asks.map((a) => `"${a}"`).join(' Then: ')}`);
   }
   if (digest.notes?.length) {
-    parts.push(`What came of it: ${digest.notes.join(' ')}`);
+    body.push(`What came of it: ${digest.notes.join(' ')}`);
   }
   if (digest.problems?.length) {
-    parts.push(`Trouble along the way: ${digest.problems.join(' ')}`);
+    body.push(`Trouble along the way: ${digest.problems.join(' ')}`);
   }
   if (digest.interrupted > 0) {
-    parts.push(
+    body.push(
       digest.interrupted === 1
         ? 'He stopped it mid-way once.'
         : `He stopped it mid-way ${digest.interrupted} times.`,
     );
   }
 
-  // Nothing but the header means the transcript had no narrative in it at all —
-  // an empty session, or one that was all tool calls. Say so rather than
-  // offering a bare title she would then have to invent around.
-  if (parts.length === 1) {
+  // Nothing at all means the transcript had no narrative in it — an empty
+  // session, or one that was all tool calls. Say so rather than offering a bare
+  // title she would then have to invent around.
+  if (body.length === 0) {
     if (!digest.title && !digest.project) return null;
-    parts.push('Nothing was written down about what it did.');
+    body.push('Nothing was written down about what it did.');
   }
 
-  const text = parts.join('\n');
+  // Second, ahead of the content, and that position is the point: the text is
+  // truncated from the end to fit the caller's budget, so a signal placed after
+  // the account is a signal that disappears from exactly the long, crowded
+  // digests it is least needed in — and survives only where it is. It is a
+  // statement of fact and never an instruction, because everything downstream of
+  // here is quoted inside brain.mjs's session fence, and that fence tells her to
+  // act on nothing written inside it. What she should DO about a thin record is
+  // in CHAT_INSTRUCTIONS, outside the fence, where it is hers to follow.
+  const text = [when ? `${head}, ${when}.` : `${head}.`, foundLine(digest), ...body].join('\n');
   return text.length <= budget ? text : `${text.slice(0, budget - 1).trimEnd()}…`;
 }
 
@@ -751,6 +1036,27 @@ export function createSessions({ fs, projectsDir = null, cwd = null, now = Date.
    * appears in the title, his asks or the prose — which is the only text this
    * module is willing to look at anyway, so a query can never be used to search
    * the parts it refuses to read.
+   *
+   * **Only his own sessions are ever returned.** A dispatched agent's errand is
+   * not an answer to "how did that go", and the previous version handing one
+   * over is the whole reason `classifyTranscript` exists. If nothing here is his,
+   * the honest answer is nothing, and she says she has no record of it.
+   *
+   * **Where it looks, in order.** The folder named after the repo is frequently
+   * the wrong place — he runs Claude Code from his home directory as often as
+   * from a checkout, and on this machine the ganyu-pet folder holds 74 errands
+   * and not one session while the day of real ganyu-pet work sits under
+   * `C--Users-kw11l`. So:
+   *
+   *   1. the obvious folder — the project he named, or the directory his agents
+   *      are in when he named none ("what was I just doing" means *here*);
+   *   2. failing that, and only when he named a project, every session on the
+   *      machine whose account actually mentions that project — which is what
+   *      finds work done from a directory that is not named after it;
+   *   3. failing that, every session on the machine, newest first.
+   *
+   * Widening happens when step 1 holds no *session*, not when it holds no file:
+   * 74 errands used to count as "found something" and stopped the search dead.
    */
   function read({ project = null, which = 1, query = null, maxChars = DEFAULT_SUMMARY_CHARS } = {}) {
     if (!enabled) return null;
@@ -762,37 +1068,49 @@ export function createSessions({ fs, projectsDir = null, cwd = null, now = Date.
       .filter((w) => w.length > 1);
     const index = Math.max(1, Number.isFinite(Number(which)) ? Math.floor(Number(which)) : 1);
 
-    // With no project named, prefer the directory his agents are actually in —
-    // "what was I just doing" means here, not the newest thing on the machine.
-    const scoped = wantProject
-      ? listSessions({ fs, projectsDir, project: wantProject, limit: MAX_SESSION_LIMIT })
-      : listSessions({ fs, projectsDir, cwd: resolveCwd(), limit: MAX_SESSION_LIMIT });
-    const candidates = scoped.length
-      ? scoped
-      : listSessions({ fs, projectsDir, limit: MAX_SESSION_LIMIT });
+    // The tiers overlap, so a file opened for one is not opened again for the next.
+    const digests = new Map();
+    const digestFor = (path) => {
+      if (!digests.has(path)) digests.set(path, readSession({ fs, filePath: path }));
+      return digests.get(path);
+    };
 
-    let seen = 0;
-    for (const entry of candidates) {
-      const digest = readSession({ fs, filePath: entry.path });
-      if (!digest) continue;
-      const summary = summarizeSession(digest, { now: now(), maxChars });
-      if (!summary) continue;
-      if (words.length) {
+    const pick = (entries, mustMention = null) => {
+      let seen = 0;
+      for (const entry of entries) {
+        const digest = digestFor(entry.path);
+        if (!digest || digest.kind !== 'session') continue;
+        const summary = summarizeSession(digest, { now: now(), maxChars });
+        if (!summary) continue;
         const hay = summary.toLowerCase();
-        if (!words.every((w) => hay.includes(w))) continue;
+        if (words.length && !words.every((w) => hay.includes(w))) continue;
+        if (mustMention && !hay.includes(mustMention.toLowerCase())) continue;
+        seen += 1;
+        if (seen >= index) return { ...digest, summary, at: entry.at, id: entry.id };
       }
-      seen += 1;
-      if (seen >= index) return { ...digest, summary, at: entry.at, id: entry.id };
-    }
-    return null;
+      return null;
+    };
+
+    const here = wantProject
+      ? listSessions({ fs, projectsDir, project: wantProject, limit: MAX_SESSION_LIMIT, interactiveOnly: true })
+      : listSessions({ fs, projectsDir, cwd: resolveCwd(), limit: MAX_SESSION_LIMIT, interactiveOnly: true });
+    const found = pick(here);
+    if (found) return found;
+
+    const wide = listSessions({ fs, projectsDir, limit: MAX_SESSION_LIMIT, interactiveOnly: true });
+    return (wantProject ? pick(wide, wantProject) : null) ?? pick(wide);
   }
 
   /** Titles and times only — for "what have I been working on", without opening much. */
   function recent({ project = null, limit = DEFAULT_SESSION_LIMIT } = {}) {
     if (!enabled) return [];
-    const entries = project
-      ? listSessions({ fs, projectsDir, project, limit })
-      : listSessions({ fs, projectsDir, limit });
+    const entries = listSessions({
+      fs,
+      projectsDir,
+      ...(project ? { project } : {}),
+      limit,
+      interactiveOnly: true,
+    });
     return entries.map((entry) => {
       const digest = readSession({ fs, filePath: entry.path, maxAsks: 1, maxNotes: 1 });
       return {

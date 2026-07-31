@@ -20,8 +20,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  INTERACTIVE_LINE_TYPES,
   MAX_SESSION_LIMIT,
+  MIN_INTERACTIVE_MARKERS,
+  THIN_TOTAL,
   assistantNote,
+  classifyTranscript,
   createSessions,
   describeWhen,
   dirMatchesProject,
@@ -32,6 +36,7 @@ import {
   problemsFrom,
   readSession,
   stripCode,
+  substanceOf,
   summarizeSession,
 } from '../src/main/sessions.mjs';
 
@@ -106,6 +111,39 @@ const PROJECTS = 'C:/fixture/projects';
 const GANYU_DIR = `${PROJECTS}/C--Users-kw11l-Desktop-ganyu-pet`;
 const GOLF_DIR = `${PROJECTS}/C--Users-kw11l-desktop-GolfCRM`;
 const GOLF_WORKTREE = `${PROJECTS}/C--Users-kw11l-orca-workspaces-GolfCRM-promo-codes`;
+/** His home directory, where he runs Claude Code as often as from a checkout. */
+const HOME_DIR = `${PROJECTS}/C--Users-kw11l`;
+
+/**
+ * The opening of a transcript of a session he was actually sitting in.
+ *
+ * Shaped from the real tree, and this is the detail whose absence hid the bug:
+ * every fixture in this file used to begin straight in at `ai-title`, which no
+ * real transcript does. All 10 genuine sessions under `C--Users-kw11l` carry
+ * `mode`, `permission-mode` and `file-history-snapshot`; none of the 74
+ * dispatched errands under `C--Users-kw11l-Desktop-ganyu-pet` carries any of the
+ * five markers at all.
+ */
+const INTERACTIVE_HEAD = Object.freeze([
+  { type: 'mode', mode: 'default', timestamp: '2026-07-31T09:59:00.000Z' },
+  { type: 'permission-mode', permissionMode: 'acceptEdits', timestamp: '2026-07-31T09:59:00.500Z' },
+  { type: 'system', subtype: 'session_start', timestamp: '2026-07-31T09:59:01.000Z' },
+]);
+
+/** A transcript of one of HIS sessions. */
+const session = (lines) => jsonl([...INTERACTIVE_HEAD, ...lines]);
+
+/**
+ * A transcript of a dispatched agent's errand. Exactly the line types measured
+ * on the 74 real ones: a queued prompt, his agent's brief, an answer, and no
+ * interactive marker anywhere.
+ */
+const subagent = (lines) => jsonl([
+  { type: 'queue-operation', operation: 'add', timestamp: '2026-07-31T09:59:00.000Z' },
+  { type: 'attachment', attachment: { type: 'file', content: 'x' } },
+  ...lines,
+  { type: 'last-prompt', timestamp: '2026-07-31T10:05:00.000Z' },
+]);
 
 const user = (text, extra = {}) => ({
   type: 'user',
@@ -164,6 +202,85 @@ test('a project matches its own directory and its worktrees, not a word that con
   assert.equal(dirMatchesProject('anything', ''), true);
 });
 
+// ------------------------------------------------- his session, or an errand?
+//
+// The first of the two defects. `~/.claude/projects/<mangled-cwd>/` holds a
+// transcript for every agent run, not only the ones he sat in: measured on this
+// machine the ganyu-pet folder held 74 files whose largest was 19 lines, all
+// dispatched errands, while the day of real work was in `C--Users-kw11l`.
+
+test('a dispatched errand is told apart from a session he sat in', () => {
+  const fs = fakeFs({
+    [`${GANYU_DIR}/his.jsonl`]: session([title('Real work'), user('fix it'), assistant(REAL_NOTE)]),
+    [`${GANYU_DIR}/errand.jsonl`]: subagent([
+      user('You are a dispatched agent. Probe the internal API and report back.'),
+      assistant('I probed the endpoint and it answered with the expected shape, so the wiring is sound.'),
+    ]),
+  });
+
+  assert.equal(classifyTranscript({ fs, filePath: `${GANYU_DIR}/his.jsonl` }).kind, 'session');
+  assert.equal(classifyTranscript({ fs, filePath: `${GANYU_DIR}/errand.jsonl` }).kind, 'subagent');
+  // And it travels on the digest, so no caller has to re-derive it.
+  assert.equal(readSession({ fs, filePath: `${GANYU_DIR}/his.jsonl` }).kind, 'session');
+  assert.equal(readSession({ fs, filePath: `${GANYU_DIR}/errand.jsonl` }).kind, 'subagent');
+});
+
+test('no single marker is trusted — two are needed', () => {
+  // Measured: two 10-line dispatched runs on this machine carry `ai-title` and
+  // nothing else, so one marker would have taken them for real sessions.
+  const fs = fakeFs({
+    [`${GANYU_DIR}/one.jsonl`]: jsonl([title('Titled but dispatched'), assistant(REAL_NOTE)]),
+    [`${GANYU_DIR}/two.jsonl`]: jsonl([
+      { type: 'system', subtype: 'x' },
+      title('Titled and moded'),
+      assistant(REAL_NOTE),
+    ]),
+  });
+  assert.equal(MIN_INTERACTIVE_MARKERS, 2);
+  assert.equal(classifyTranscript({ fs, filePath: `${GANYU_DIR}/one.jsonl` }).markers, 1);
+  assert.equal(classifyTranscript({ fs, filePath: `${GANYU_DIR}/one.jsonl` }).kind, 'subagent');
+  assert.equal(classifyTranscript({ fs, filePath: `${GANYU_DIR}/two.jsonl` }).kind, 'session');
+});
+
+test('queue-operation is not a marker — real sessions carry it too', () => {
+  // 8 of the 10 genuine sessions on this machine have it, so its presence says
+  // nothing. What separates the populations is the absence of the other five.
+  assert.equal(INTERACTIVE_LINE_TYPES.includes('queue-operation'), false);
+  const fs = fakeFs({
+    [`${GANYU_DIR}/s.jsonl`]: session([
+      { type: 'queue-operation', operation: 'add' },
+      title('Queued but his'),
+      assistant(REAL_NOTE),
+    ]),
+  });
+  assert.equal(classifyTranscript({ fs, filePath: `${GANYU_DIR}/s.jsonl` }).kind, 'session');
+});
+
+test('classification reads the HEAD, so a long session is not mistaken for an errand', () => {
+  // The markers are written in the opening moments of a session, and a big
+  // transcript is read from its *tail* — so classifying from what `readTail`
+  // holds would call his longest, realest session an errand. On this machine the
+  // 10 MB session is exactly that shape.
+  const body = [];
+  for (let i = 1; i <= 40; i += 1) {
+    body.push(user(`ask number ${i} which he typed out in full for the record`));
+    body.push(assistant(`Account number ${i}: the work reached a point genuinely worth writing down.`));
+  }
+  const text = session(body);
+  const fs = fakeFs({ [`${GANYU_DIR}/big.jsonl`]: text });
+
+  // A window small enough that the interactive header is far outside it.
+  const digest = readSession({ fs, filePath: `${GANYU_DIR}/big.jsonl`, maxBytes: 2_000 });
+  assert.equal(digest.truncated, true, 'fixture must actually be tail-read');
+  assert.equal(digest.kind, 'session');
+});
+
+test('an unreadable transcript classifies as an errand, which is the safe default', () => {
+  const fs = fakeFs({});
+  assert.equal(classifyTranscript({ fs, filePath: `${GANYU_DIR}/gone.jsonl` }).kind, 'subagent');
+  assert.equal(classifyTranscript({}).kind, 'subagent');
+});
+
 // ------------------------------------------------------------- listSessions
 
 function listingFs() {
@@ -214,6 +331,66 @@ test('a cwd scopes the listing to that one working directory, case-insensitively
 test('a project scopes the listing to the repo and its worktrees', () => {
   const found = listSessions({ fs: listingFs(), projectsDir: PROJECTS, project: 'GolfCRM' });
   assert.deepEqual(found.map((f) => f.id), ['ccc', 'ddd']);
+});
+
+/** The measured shape: a folder full of recent errands, the real session elsewhere. */
+function realShapeFs() {
+  const files = {
+    [`${HOME_DIR}/real.jsonl`]: session([
+      title('The ganyu-pet work'),
+      user('the ganyu-pet bubble is not showing the session summary'),
+      assistant('The session digest reaches the bubble now, and the wander behaviour survived the change.'),
+      user('now make her honest about thin reads'),
+      assistant('She says when a record is thin instead of reporting the gap as though it were a finding.'),
+    ]),
+  };
+  const mtimes = { [`${HOME_DIR}/real.jsonl`]: 1_000 };
+  // Nine errands, every one of them newer than the real session.
+  for (let i = 0; i < 9; i += 1) {
+    const path = `${GANYU_DIR}/errand${i}.jsonl`;
+    files[path] = subagent([
+      user('You are Ganyu. React in one line to the briefing below.'),
+      assistant('A short Ganyu-style reaction line, which is all this errand ever produced.'),
+    ]);
+    mtimes[path] = 9_000 + i;
+  }
+  return fakeFs(files, { mtimes });
+}
+
+test('classified listing puts his own sessions ahead of errands, however recent the errands', () => {
+  const found = listSessions({ fs: realShapeFs(), projectsDir: PROJECTS, classify: true, limit: 25 });
+  assert.equal(found[0].id, 'real', 'a nine-minute-newer errand must not outrank a real session');
+  assert.equal(found[0].kind, 'session');
+  assert.ok(found.slice(1).every((f) => f.kind === 'subagent'));
+  // Recency still decides inside each group.
+  assert.deepEqual(found.slice(1, 3).map((f) => f.id), ['errand8', 'errand7']);
+});
+
+test('interactiveOnly drops errands, so the limit is spent on real sessions', () => {
+  const fs = realShapeFs();
+  const only = listSessions({ fs, projectsDir: PROJECTS, interactiveOnly: true, limit: 25 });
+  assert.deepEqual(only.map((f) => f.id), ['real']);
+
+  // The folder named after the repo holds nine transcripts and not one session.
+  const scoped = listSessions({
+    fs, projectsDir: PROJECTS, cwd: 'C:\\Users\\kw11l\\Desktop\\ganyu-pet', interactiveOnly: true,
+  });
+  assert.deepEqual(scoped, []);
+  // Unclassified, the same folder looks full — which is what fooled the old code.
+  assert.equal(
+    listSessions({ fs, projectsDir: PROJECTS, cwd: 'C:\\Users\\kw11l\\Desktop\\ganyu-pet', limit: 25 }).length,
+    9,
+  );
+});
+
+test('an unclassified listing is untouched — still pure mtime, still opens nothing', () => {
+  const opened = [];
+  const base = listingFs();
+  const watched = { ...base, readFileSync(p) { opened.push(p); return base.readFileSync(p); } };
+  const found = listSessions({ fs: watched, projectsDir: PROJECTS });
+  assert.deepEqual(found.map((f) => f.id), ['aaa', 'ccc', 'ddd', 'bbb']);
+  assert.deepEqual(opened, [], 'a plain listing must never read a byte of content');
+  assert.equal(found[0].kind, undefined);
 });
 
 test('the limit is honoured and capped, and a missing tree is not an error', () => {
@@ -705,17 +882,17 @@ test('a session with no narrative says so rather than offering a bare title', ()
 function wiredFs() {
   return fakeFs(
     {
-      [`${GANYU_DIR}/new.jsonl`]: jsonl([
+      [`${GANYU_DIR}/new.jsonl`]: session([
         title('The newest pet session'),
         user('make her stop naming files'),
         assistant('She talks about what the work achieved now instead of listing the files that changed.'),
       ]),
-      [`${GANYU_DIR}/old.jsonl`]: jsonl([
+      [`${GANYU_DIR}/old.jsonl`]: session([
         title('An older pet session'),
         user('add the wander behaviour'),
         assistant('The pet strolls along the taskbar when nothing has happened for a while, and stops when grabbed.'),
       ]),
-      [`${GOLF_DIR}/golf.jsonl`]: jsonl([
+      [`${GOLF_DIR}/golf.jsonl`]: session([
         title('Merge the booking PRs'),
         user('merge three and four'),
         assistant('Both are merged and the deploy branch carries the booking guard along with the layout work.'),
@@ -786,6 +963,171 @@ test('recent() lists titles without opening much, newest first', () => {
     'An older pet session',
   ]);
   assert.deepEqual(sessions.recent({ project: 'GolfCRM' }).map((s) => s.title), ['Merge the booking PRs']);
+});
+
+// ------------------------------------------- the defect, end to end
+//
+// Asking about ganyu-pet returned a 19-line errand whose "ask" was a persona
+// prompt the app had sent to a model, and she described an internal API probe as
+// something he had wanted.
+
+test('read() never hands back a dispatched errand, and looks past the folder full of them', () => {
+  const sessions = createSessions({
+    fs: realShapeFs(),
+    projectsDir: PROJECTS,
+    cwd: () => 'C:\\Users\\kw11l\\Desktop\\ganyu-pet',
+  });
+
+  const found = sessions.read({});
+  assert.equal(found.title, 'The ganyu-pet work');
+  assert.equal(found.kind, 'session');
+  // The errand's prose must not appear anywhere in what she is handed.
+  assert.equal(found.summary.includes('Ganyu-style reaction line'), false);
+  assert.equal(found.summary.includes('You are Ganyu'), false);
+});
+
+test('read() finds a project by name even when no folder is named after it', () => {
+  // He runs Claude Code from his home directory as often as from a checkout, so
+  // the ganyu-pet work lives under `C--Users-kw11l` and the folder that *is*
+  // named ganyu-pet holds only errands.
+  const sessions = createSessions({
+    fs: realShapeFs(),
+    projectsDir: PROJECTS,
+    cwd: () => 'C:\\Users\\kw11l\\Desktop\\ganyu-pet',
+  });
+  assert.equal(sessions.read({ project: 'ganyu-pet' }).title, 'The ganyu-pet work');
+  // A project nothing on the machine mentions still falls back to the newest
+  // real session rather than to an errand.
+  assert.equal(sessions.read({ project: 'kubernetes' }).kind, 'session');
+});
+
+test('with only errands on the whole machine there is no record, rather than a wrong one', () => {
+  const fs = fakeFs({
+    [`${GANYU_DIR}/errand.jsonl`]: subagent([
+      user('You are a dispatched agent, go and probe the API.'),
+      assistant('The probe came back clean and the endpoint answered in the shape that was expected.'),
+    ]),
+  });
+  const sessions = createSessions({ fs, projectsDir: PROJECTS, cwd: () => 'C:\\Users\\kw11l\\Desktop\\ganyu-pet' });
+  assert.equal(sessions.read({}), null);
+  assert.deepEqual(sessions.recent(), []);
+});
+
+test('recent() lists his sessions only', () => {
+  const sessions = createSessions({ fs: realShapeFs(), projectsDir: PROJECTS });
+  assert.deepEqual(sessions.recent({ limit: 10 }).map((s) => s.title), ['The ganyu-pet work']);
+});
+
+// ------------------------------------------------ how much was actually found
+//
+// The second defect, and the worse one. Given the 19-line errand she said "that
+// ganyu-pet session only produced one short Ganyu-style reaction line" and "I
+// don't see any unfinished work in that record" — both plainly, both wrong about
+// a day of real work. She was faithfully reporting a bad read, which sounds
+// exactly like a good answer.
+
+test('the digest counts everything that was in the transcript, not just what it kept', () => {
+  const lines = [];
+  for (let i = 1; i <= 6; i += 1) {
+    lines.push(user(`ask number ${i} which he typed out in full`));
+    lines.push(assistant(`Account number ${i}: the work reached a point worth writing down about it.`));
+  }
+  const fs = fakeFs({ [`${GANYU_DIR}/s.jsonl`]: session(lines) });
+
+  const digest = readSession({ fs, filePath: `${GANYU_DIR}/s.jsonl`, maxAsks: 2, maxNotes: 2 });
+  // Capping what she is SHOWN is right; capping what she is told there WAS is the bug.
+  assert.equal(digest.asks.length, 2);
+  assert.equal(digest.notes.length, 2);
+  assert.equal(digest.askCount, 6);
+  assert.equal(digest.noteCount, 6);
+  assert.equal(digest.substance, 'full');
+});
+
+test('substanceOf splits empty from thin from full', () => {
+  assert.equal(substanceOf(0, 0), 'empty');
+  assert.equal(substanceOf(1, 1), 'thin');
+  assert.equal(substanceOf(THIN_TOTAL - 1, 0), 'thin');
+  assert.equal(substanceOf(1, 3), 'full');
+  assert.equal(substanceOf(9, 9), 'full');
+});
+
+test('a thin read is LABELLED thin in the text she is handed', () => {
+  // The exact shape of the errand that caused this: one ask, one line back.
+  const fs = fakeFs({
+    [`${GANYU_DIR}/s.jsonl`]: session([
+      title('A very short one'),
+      user('have a look at the bubble'),
+      assistant('I looked at the bubble and it is drawing in the corner where it should be drawing.'),
+    ]),
+  });
+  const digest = readSession({ fs, filePath: `${GANYU_DIR}/s.jsonl` });
+  assert.equal(digest.substance, 'thin');
+
+  const summary = summarizeSession(digest);
+  assert.match(summary, /How much is in this record: 1 thing he asked for and 1 note of what came of it/);
+  assert.match(summary, /THIN record/);
+  assert.match(summary, /not the whole of what happened/);
+  assert.match(summary, /no evidence that nothing else was done/);
+});
+
+test('an empty record says it is empty rather than implying nothing happened', () => {
+  const fs = fakeFs({ [`${GANYU_DIR}/s.jsonl`]: session([title('Nothing here')]) });
+  const summary = summarizeSession(readSession({ fs, filePath: `${GANYU_DIR}/s.jsonl` }));
+  assert.match(summary, /this record is empty/);
+  assert.match(summary, /says nothing about what was or was not done/);
+});
+
+test('a full record says so, and a tail-read one admits it did not see the start', () => {
+  const lines = [];
+  for (let i = 1; i <= 6; i += 1) {
+    lines.push(user(`ask number ${i} which he typed out in full for the record`));
+    lines.push(assistant(`Account number ${i}: the work reached a point genuinely worth writing down.`));
+  }
+  const fs = fakeFs({ [`${GANYU_DIR}/s.jsonl`]: session(lines) });
+
+  const whole = summarizeSession(readSession({ fs, filePath: `${GANYU_DIR}/s.jsonl` }), { maxChars: 2000 });
+  assert.match(whole, /That is a substantial record of the session\./);
+  assert.equal(whole.includes('THIN'), false);
+  assert.equal(whole.includes('Only the later part'), false);
+
+  const tail = summarizeSession(
+    readSession({ fs, filePath: `${GANYU_DIR}/s.jsonl`, maxBytes: 2_000 }),
+    { maxChars: 2000 },
+  );
+  assert.match(tail, /Only the later part of a long session was read/);
+});
+
+test('the thin label survives a tight budget — it is placed where truncation cannot eat it', () => {
+  // The summary is cut from the end to fit, so a signal written after the
+  // account would vanish from exactly the crowded digests it is needed in.
+  const fs = fakeFs({
+    [`${GANYU_DIR}/s.jsonl`]: session([
+      title('A very short one'),
+      user('have a look at the bubble'),
+      assistant('I looked at the bubble and it is drawing in the corner where it should be drawing.'),
+    ]),
+  });
+  const digest = readSession({ fs, filePath: `${GANYU_DIR}/s.jsonl` });
+  for (const maxChars of [200, 300, 600]) {
+    const summary = summarizeSession(digest, { maxChars });
+    assert.ok(summary.length <= maxChars);
+    assert.match(summary, /How much is in this record/, `lost the signal at ${maxChars} chars`);
+  }
+});
+
+test('PRIVACY: classification reads line types only, and adds nothing to the digest', () => {
+  // `system` lines carry hook command lines and `file-history-snapshot` lines
+  // carry whole file bodies — both are counted here purely by the name of their
+  // type, so being a marker must not make their contents reachable.
+  const fs = fakeFs({ [`${GANYU_DIR}/hostile.jsonl`]: hostileTranscript() });
+  const digest = readSession({ fs, filePath: `${GANYU_DIR}/hostile.jsonl` });
+  assert.equal(digest.kind, 'session', 'the hostile fixture is shaped like a real session');
+
+  const emitted = `${JSON.stringify(digest)}\n${summarizeSession(digest, { maxChars: 2000 })}`;
+  assert.equal(emitted.includes('curl -H'), false);
+  assert.equal(emitted.includes('stop_hook_summary'), false);
+  assert.equal(emitted.includes('hookInfos'), false);
+  assert.equal(typeof digest.markers, 'number');
 });
 
 test('no fs and no projects directory is an object that answers nothing, not a crash', () => {
