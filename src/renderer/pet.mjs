@@ -279,6 +279,13 @@ export function createInteractivity({ setInteractive }) {
   };
 }
 
+/**
+ * The reasons main is allowed to give for closing the overlay (window.mjs
+ * `DISMISS_REASONS`). Duplicated rather than imported: this module is loaded from
+ * a file:// page in the renderer, and window.mjs imports node:fs.
+ */
+export const DISMISS_REASONS = Object.freeze(['escape', 'pointer-left']);
+
 const MENU_MARGIN = 4;
 
 /** Clamp the menu inside the (small) window so it never renders off-screen. */
@@ -425,6 +432,16 @@ export async function boot({
   });
   interactivity.sync(); // establish the known-false baseline
 
+  /**
+   * Optional members of the preload bridge, called by name. Declared this high
+   * up because `closeMenu` uses it and `closeMenu` runs from the `ganyu:state`
+   * subscription below — which module A force-pushes on did-finish-load, while
+   * boot() is still awaiting getFlags(). A `const` read before its declaration
+   * throws, and this one has to be readable from the first push onward.
+   */
+  const bridge = (name, ...args) =>
+    (typeof ganyu[name] === 'function' ? ganyu[name](...args) : undefined);
+
   // ---- drag ----------------------------------------------------------------
   // The renderer's whole share of picking her up is the button: down on the
   // sprite, and up anywhere. Main watches the real cursor from there and decides
@@ -475,6 +492,7 @@ export async function boot({
   ganyu.onState((state) => {
     animator.setState(state || {}, now());
     setDragging(Boolean(state && state.dragging));
+    guardMenuReachable();
   });
   ganyu.onSpeak((payload) => {
     // Ambient priority: a hook line yields to a reply he is still reading.
@@ -492,6 +510,30 @@ export async function boot({
   // salience gates, so there is nothing left to decide here beyond interrupting
   // whatever she was mid-sentence on.
   if (typeof ganyu.onAudio === 'function') ganyu.onAudio((payload) => voice.play(payload));
+
+  /**
+   * Main asking the overlay to close, for the two dismissals only main can see:
+   * Escape (this window is unfocusable, so no keystroke ever reaches the DOM)
+   * and the cursor having left the window for longer than the grace period.
+   * Filtered against the reason list exactly as menu actions and drag phases
+   * are — an unrecognized message must not be able to close her menu.
+   *
+   * Layered, not blanket: Escape takes the topmost thing down, so with a menu up
+   * it closes the menu and leaves a half-typed message alone. `pointer-left`
+   * never touches the input strip at all — he walks away from the keyboard
+   * mid-sentence all the time, and the pointer sitting elsewhere is not consent
+   * to throw away what he wrote.
+   */
+  if (typeof ganyu.onDismiss === 'function') {
+    ganyu.onDismiss((reason) => {
+      if (!DISMISS_REASONS.includes(reason)) return;
+      if (!menuEl.hidden) {
+        closeMenu();
+        return;
+      }
+      if (reason === 'escape') closeChat();
+    });
+  }
 
   const flags = (await ganyu.getFlags()) || {};
   let muted = Boolean(flags.muted);
@@ -517,6 +559,37 @@ export async function boot({
     // permanently interactive (i.e. blocking the desktop underneath).
     interactivity.setOverMenu(false);
     interactivity.setMenuOpen(false);
+    // Unconditionally, on every close path there is: this is what releases the
+    // global Escape hook main armed on open, and Escape must not stay ours for
+    // one instant longer than the menu it belongs to.
+    bridge('setOverlayOpen', { menu: false });
+  }
+
+  /**
+   * The hard invariant. A visible menu is only reachable because `menuOpen`
+   * holds the overlay interactive — drop that latch and the menu is still
+   * painted on a window that now passes every click through to the desktop.
+   * Nothing can then be clicked, nothing can be hovered, and every remaining
+   * close path is an event that will never be delivered. That is the state that
+   * costs a restart, so it is not allowed to exist for a frame: the menu closes
+   * itself instead of stranding the app.
+   */
+  function guardMenuReachable() {
+    if (menuEl.hidden || interactivity.interactive) return false;
+    closeMenu();
+    return true;
+  }
+
+  /**
+   * Every latch down at once — and the surfaces that depended on them, in the
+   * same breath. `interactivity.releaseAll()` on its own is exactly the
+   * violation `guardMenuReachable` exists to catch, so nothing in here calls it
+   * bare.
+   */
+  function releaseAll() {
+    closeMenu();
+    closeChat();
+    interactivity.releaseAll();
   }
 
   async function openMenuAt(clientX, clientY) {
@@ -535,6 +608,11 @@ export async function boot({
     menuEl.style.top = '0px';
     menuEl.hidden = false;
     interactivity.setMenuOpen(true);
+    // Main's half of the dismissal contract: this arms the global Escape hook
+    // and starts the pointer-leave watch. Both are things this window cannot do
+    // for itself — it is built unfocusable, so it receives neither keystrokes
+    // nor a reliable mouseleave.
+    bridge('setOverlayOpen', { menu: true });
     const rect = menuEl.getBoundingClientRect();
     const view = doc.documentElement || { clientWidth: 256, clientHeight: 320 };
     const { x, y } = clampMenu({
@@ -558,9 +636,6 @@ export async function boot({
   // over the sprite's feet rather than beside it.
 
   let chatPending = false;
-
-  const bridge = (name, ...args) =>
-    (typeof ganyu[name] === 'function' ? ganyu[name](...args) : undefined);
 
   function chatIsOpen() {
     return chatEl.hidden !== true;
@@ -658,7 +733,7 @@ export async function boot({
     // And the same again mid-drag, where the pointer leaving is not a signal at
     // all — she is being carried, and the window is behind the cursor.
     if (pressing || dragging) return;
-    interactivity.releaseAll();
+    releaseAll();
   });
 
   // Left button down on the sprite starts a *press*, which becomes either a drag
@@ -686,7 +761,14 @@ export async function boot({
       suppressClick = false;
       return;
     }
-    closeMenu();
+    // An open menu spends the click. Clicking her used to close the menu *and*
+    // open the input strip, so the one gesture he tried when the menu would not
+    // go away answered by putting something else on screen — which reads as the
+    // menu having been replaced rather than dismissed.
+    if (!menuEl.hidden) {
+      closeMenu();
+      return;
+    }
     if (chatIsOpen()) closeChat();
     else openChat();
   });
@@ -708,8 +790,15 @@ export async function boot({
     if (menuEl.hidden) openMenuAt(ev.clientX, ev.clientY);
     else closeMenu();
   });
+  // Right-click on the menu closes it. It used to only suppress Chromium's own
+  // menu and stop there, which made the single most natural recovery — right-
+  // click the thing that a right-click produced — a dead end. It matters most
+  // in exactly the case that goes wrong: the menu opens *at* the cursor, so it
+  // is usually sitting over the sprite, and a second right-click aimed at her
+  // lands here rather than on the canvas.
   on(menuEl, 'contextmenu', (ev) => {
     if (ev && typeof ev.preventDefault === 'function') ev.preventDefault();
+    closeMenu();
   });
 
   on(menuEl, 'click', (ev) => {
@@ -726,10 +815,20 @@ export async function boot({
   on(doc, 'mousedown', (ev) => {
     const target = ev && ev.target;
     const inside = (el) => Boolean(el.contains && el.contains(target));
+    // The sprite is exempt from *both* rules below, for the same reason: a
+    // mousedown on her is the first half of a gesture the canvas handlers finish,
+    // and acting on it here pre-empts them.
+    //
+    // For the chat strip it would reopen an input he had just typed into. For the
+    // menu it was worse and entirely invisible: on Windows the right button
+    // fires mousedown before contextmenu, so this line closed the menu a beat
+    // before `canvas.contextmenu` looked at it — which then found it hidden and
+    // opened it straight back up. The `else closeMenu()` branch there could never
+    // run, and right-clicking her to dismiss the menu just moved it. That is the
+    // gesture the owner would have tried first.
+    if (target === canvas) return;
     if (!menuEl.hidden && !inside(menuEl)) closeMenu();
-    // The sprite is exempt: mousedown precedes click, so closing here would let
-    // the click that follows reopen an input he had just typed into.
-    if (chatIsOpen() && target !== canvas && !inside(chatEl)) closeChat();
+    if (chatIsOpen() && !inside(chatEl)) closeChat();
   });
   on(doc, 'keydown', (ev) => {
     if (ev.key !== 'Escape') return;
@@ -773,6 +872,9 @@ export async function boot({
   function loop() {
     const { row, frame } = animator.tick(now());
     renderer.draw(row, frame);
+    // Two boolean reads a frame, and the only check that runs continuously
+    // whatever else has gone wrong — see guardMenuReachable.
+    guardMenuReachable();
     if (running) handle = raf(loop);
   }
   if (running) handle = raf(loop);
@@ -784,6 +886,7 @@ export async function boot({
     interactivity,
     renderer,
     chat: { open: openChat, close: closeChat, submit: submitChat, get isOpen() { return chatIsOpen(); } },
+    menu: { close: closeMenu, guard: guardMenuReachable, get isOpen() { return menuEl.hidden !== true; } },
     drag: { get pressing() { return pressing; }, get dragging() { return dragging; } },
     flags: { get muted() { return muted; }, get pinned() { return pinned; }, spritePath },
     dispose() {
@@ -794,9 +897,10 @@ export async function boot({
       for (const undo of off.splice(0)) undo();
       bubbles.hide();
       voice.stop(); // a bubble torn down while she is still speaking is a ghost
-      closeMenu();
-      closeChat();
-      interactivity.releaseAll();
+      // Closes the menu, which is also what tells main to give Escape back to
+      // the rest of the machine. A teardown that skipped it would leave a global
+      // Escape hook installed with nothing left alive to release it.
+      releaseAll();
     },
   };
 }

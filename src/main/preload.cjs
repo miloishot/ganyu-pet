@@ -28,6 +28,15 @@ contextBridge.exposeInMainWorld('ganyu', {
   setInteractive: (interactive) => ipcRenderer.send('ganyu:set-interactive', Boolean(interactive)),
   menuAction: (action) => ipcRenderer.send('ganyu:menu', String(action)),
   /**
+   * What the overlay has open. Main arms two things off this that the renderer
+   * cannot build for itself, both because the window is `focusable: false`: a
+   * global Escape hook, and the pointer-left-the-window dismissal timer. See
+   * `createEscapeHatch` / `createLeaveWatch` in window.mjs.
+   */
+  setOverlayOpen: (open) => ipcRenderer.send('ganyu:overlay-open', { menu: Boolean(open && open.menu) }),
+  /** Main asking the overlay to close: 'escape' or 'pointer-left'. */
+  onDismiss: (cb) => subscribe('ganyu:dismiss', cb),
+  /**
    * The left button went down on the sprite ('press') or came up ('release').
    * Only the button — whether it became a drag is main's call, because on this
    * machine a click-through overlay does not reliably see the mousemove that

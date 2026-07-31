@@ -9,19 +9,24 @@ import assert from 'node:assert/strict';
 import { CHAT_CHANNELS, createChat } from '../src/main/chat.mjs';
 import {
   CHANNELS,
+  DISMISS_REASONS,
   DRAG_HOLD_MS,
   DRAG_MAX_MS,
   DRAG_PHASES,
   DRAG_THRESHOLD_PX,
   HOVER_POLL_MS,
   MENU_ACTIONS,
+  MENU_ESCAPE_ACCELERATOR,
+  MENU_LEAVE_GRACE_MS,
   SIZE_DRIFT_TOLERANCE,
   SPRITE_SIZE,
   THROW_SAMPLE_WINDOW_MS,
   WINDOW_SIZE,
   computeInitialBounds,
   createDragTracker,
+  createEscapeHatch,
   createHoverWatch,
+  createLeaveWatch,
   createPetWindow,
   enforceWindowSize,
   moveWindowPinned,
@@ -117,6 +122,242 @@ test('a missing window or cursor reading re-arms click-through instead of throwi
   assert.equal(watch.poll(), false);
   assert.deepEqual(applied, [false]);
   assert.ok(HOVER_POLL_MS > 0 && HOVER_POLL_MS <= 250);
+});
+
+// ------------------------------------------------------------- escape hatch
+//
+// The window is built focusable:false so the pet can never take the caret from
+// the editor. Nobody wrote down the consequence, and it is what left the owner
+// unable to close her menu: an unfocusable window receives no keystrokes, so the
+// renderer's Escape handler is unreachable, and it can never blur, so its blur
+// handler is unreachable too. A globalShortcut is the only mechanism that needs
+// no focus — and the price is that while it is registered, Escape belongs to
+// this app and to nothing else on the machine. Hence: armed only between the
+// menu opening and the menu closing, and released on every path out.
+
+function shortcutDouble({ registerReturns = true } = {}) {
+  const log = [];
+  return {
+    log,
+    registered: new Set(),
+    fire(accelerator = MENU_ESCAPE_ACCELERATOR) {
+      const fn = this.handlers.get(accelerator);
+      if (!fn) throw new Error(`${accelerator} is not registered`);
+      fn();
+      return true;
+    },
+    handlers: new Map(),
+    api: {
+      register: (accelerator, fn) => {
+        log.push(`register:${accelerator}`);
+        if (registerReturns === false) return false;
+        if (registerReturns instanceof Error) throw registerReturns;
+        return true;
+      },
+      unregister: (accelerator) => {
+        log.push(`unregister:${accelerator}`);
+      },
+    },
+  };
+}
+
+/** Wires the double's handler map to the real registration, for `fire()`. */
+function escapeHarness(opts = {}) {
+  const shortcut = shortcutDouble(opts);
+  const fired = [];
+  const warnings = [];
+  const base = shortcut.api.register;
+  shortcut.api.register = (accelerator, fn) => {
+    const ok = base(accelerator, fn);
+    if (ok !== false) shortcut.handlers.set(accelerator, fn);
+    return ok;
+  };
+  const hatch = createEscapeHatch({
+    globalShortcut: shortcut.api,
+    onEscape: () => fired.push('escape'),
+    log: { warn: (m) => warnings.push(m) },
+  });
+  return { hatch, shortcut, fired, warnings };
+}
+
+test('the escape hatch is armed only while the menu is open', () => {
+  const h = escapeHarness();
+  assert.equal(h.hatch.armed, false, 'nothing is installed at rest');
+  assert.deepEqual(h.shortcut.log, [], 'and nothing was registered to get there');
+
+  assert.equal(h.hatch.arm(), true);
+  assert.equal(h.hatch.armed, true);
+  assert.deepEqual(h.shortcut.log, ['register:Escape']);
+
+  assert.equal(h.hatch.arm(), true, 'arming twice is not two registrations');
+  assert.deepEqual(h.shortcut.log, ['register:Escape']);
+
+  assert.equal(h.hatch.release(), true);
+  assert.equal(h.hatch.armed, false);
+  assert.deepEqual(h.shortcut.log, ['register:Escape', 'unregister:Escape']);
+
+  assert.equal(h.hatch.release(), false, 'releasing twice is not two unregistrations');
+  assert.deepEqual(h.shortcut.log, ['register:Escape', 'unregister:Escape']);
+});
+
+test('firing Escape gives the key back before it says a word to the renderer', () => {
+  // The renderer may never answer — it may be wedged, or gone. Escape must not
+  // stay ours because of it, so the hook releases on the way out rather than
+  // waiting for a close to be reported back.
+  const h = escapeHarness();
+  h.hatch.arm();
+
+  h.shortcut.fire();
+
+  assert.deepEqual(h.fired, ['escape'], 'the dismissal went out');
+  assert.equal(h.hatch.armed, false, 'and the key was already handed back');
+  assert.deepEqual(h.shortcut.log, ['register:Escape', 'unregister:Escape']);
+
+  // And it can be armed again for the next menu.
+  h.hatch.arm();
+  assert.equal(h.hatch.armed, true);
+  assert.deepEqual(h.shortcut.log.slice(2), ['register:Escape']);
+});
+
+test('an Escape another app already owns costs the hook, not the pet', () => {
+  const h = escapeHarness({ registerReturns: false });
+  assert.equal(h.hatch.arm(), false, 'register said no');
+  assert.equal(h.hatch.armed, false, 'so we do not believe we hold it');
+  assert.equal(h.warnings.length, 1, 'and it is said once, not swallowed');
+  assert.equal(h.hatch.release(), false, 'releasing something we never had is a no-op');
+  assert.deepEqual(h.shortcut.log, ['register:Escape'], 'no unregister for a registration that failed');
+});
+
+test('a globalShortcut that throws never takes the app down, either way', () => {
+  const thrower = escapeHarness({ registerReturns: new Error('no such accelerator') });
+  assert.doesNotThrow(() => thrower.hatch.arm());
+  assert.equal(thrower.hatch.armed, false);
+
+  const warnings = [];
+  const hatch = createEscapeHatch({
+    globalShortcut: {
+      register: () => true,
+      unregister: () => {
+        throw new Error('gone');
+      },
+    },
+    onEscape: () => {},
+    log: { warn: (m) => warnings.push(m) },
+  });
+  hatch.arm();
+  assert.doesNotThrow(() => hatch.release());
+  // The flag is cleared even though the unregister failed: believing we are
+  // still armed would make the next arm() a no-op, and *that* is how a stale
+  // global Escape hook would outlive the menu it belongs to.
+  assert.equal(hatch.armed, false, 'a failed release must not latch us armed forever');
+  assert.equal(hatch.arm(), true, 'so the next menu can still install one');
+  assert.equal(warnings.length, 1);
+});
+
+test('the hatch is inert without a globalShortcut to hang off', () => {
+  const hatch = createEscapeHatch({ onEscape: () => {} });
+  assert.equal(hatch.arm(), false);
+  assert.equal(hatch.armed, false);
+  assert.equal(hatch.release(), false);
+  assert.equal(hatch.accelerator, MENU_ESCAPE_ACCELERATOR);
+});
+
+// -------------------------------------------------------------- leave watch
+//
+// The pointer left the window and never came back. Read from the cursor poll
+// that already runs for hover, because a renderer `mouseleave` is not an event
+// this window can be trusted to receive (see createHoverWatch).
+
+function leaveHarness({ graceMs = MENU_LEAVE_GRACE_MS } = {}) {
+  let t = 0;
+  const expired = [];
+  const watch = createLeaveWatch({ now: () => t, graceMs, onExpired: () => expired.push(t) });
+  return {
+    watch,
+    expired,
+    at: (ms) => {
+      t = ms;
+      return watch;
+    },
+    get now() {
+      return t;
+    },
+  };
+}
+
+test('an abandoned menu closes itself once the grace period is up', () => {
+  const h = leaveHarness();
+  assert.equal(h.at(0).poll(true, true), false, 'cursor is on the window');
+
+  assert.equal(h.at(100).poll(true, false), false, 'clock starts, nothing yet');
+  assert.equal(h.watch.waiting, true);
+  assert.equal(h.at(100 + MENU_LEAVE_GRACE_MS - 1).poll(true, false), false, 'one tick short');
+  assert.deepEqual(h.expired, []);
+
+  assert.equal(h.at(100 + MENU_LEAVE_GRACE_MS).poll(true, false), true);
+  assert.deepEqual(h.expired, [100 + MENU_LEAVE_GRACE_MS]);
+  assert.equal(h.watch.waiting, false, 'and the clock is not left running');
+
+  // It fires once per departure, not once per poll thereafter.
+  assert.equal(h.at(100 + MENU_LEAVE_GRACE_MS * 3).poll(true, false), false);
+  assert.deepEqual(h.expired, [100 + MENU_LEAVE_GRACE_MS]);
+});
+
+test('travelling between the sprite and the menu can never start the clock', () => {
+  // The journey the grace period must not punish. It is safe structurally rather
+  // than by being generous: the sprite and the menu are both inside the same
+  // 256x320 window, so `inside` stays true for the whole trip and there is no
+  // clock to outrun. The number could be far shorter and this would still hold.
+  const h = leaveHarness();
+  for (const t of [0, 120, 240, 360, 480, 600, 5000]) {
+    assert.equal(h.at(t).poll(true, true), false);
+    assert.equal(h.watch.waiting, false, `t=${t}: no clock while the cursor is on the window`);
+  }
+  assert.deepEqual(h.expired, []);
+});
+
+test('coming back inside cancels the dismissal outright', () => {
+  const h = leaveHarness();
+  h.at(0).poll(true, false);
+  h.at(MENU_LEAVE_GRACE_MS - 1).poll(true, false);
+  assert.equal(h.watch.waiting, true, 'most of the way there');
+
+  h.at(MENU_LEAVE_GRACE_MS).poll(true, true); // back on the window
+  assert.equal(h.watch.waiting, false, 'the clock is cancelled, not paused');
+
+  h.at(MENU_LEAVE_GRACE_MS + 1).poll(true, false);
+  assert.equal(h.at(MENU_LEAVE_GRACE_MS * 2).poll(true, false), false, 'the next departure starts over');
+  assert.deepEqual(h.expired, []);
+});
+
+test('a closed menu is never on the clock, and closing it clears one', () => {
+  const h = leaveHarness();
+  for (const t of [0, MENU_LEAVE_GRACE_MS * 5]) {
+    assert.equal(h.at(t).poll(false, false), false, 'no menu, no dismissal');
+  }
+  assert.deepEqual(h.expired, []);
+
+  h.at(0).poll(true, false);
+  assert.equal(h.watch.waiting, true);
+  h.at(10).poll(false, false); // the menu closed some other way
+  assert.equal(h.watch.waiting, false, 'the pending dismissal went with it');
+
+  h.at(20).poll(true, false);
+  h.watch.reset();
+  assert.equal(h.watch.waiting, false, 'and reset() says the same thing explicitly');
+});
+
+test('the grace period is long enough to be a decision, short enough to be a fix', () => {
+  // Ten cursor samples. One stray reading cannot trip it, and an abandoned menu
+  // is gone about as fast as he could notice he abandoned it.
+  assert.equal(MENU_LEAVE_GRACE_MS, 1200);
+  assert.ok(MENU_LEAVE_GRACE_MS >= HOVER_POLL_MS * 5, 'a single bad sample must not dismiss her menu');
+  assert.ok(MENU_LEAVE_GRACE_MS <= 2000, 'and an abandoned menu must not sit there');
+});
+
+test('DISMISS_REASONS is the closed set the renderer filters against', () => {
+  assert.deepEqual([...DISMISS_REASONS], ['escape', 'pointer-left']);
+  assert.ok(Object.isFrozen(DISMISS_REASONS));
 });
 
 // ---------------------------------------------------------------- smoke flags
@@ -346,7 +587,8 @@ test('registerIpc registers the chat pair alongside the original three, and disp
   assert.ok(h.handlers.has(CHAT_CHANNELS.chat), 'ganyu:chat');
   assert.ok(h.handlers.has(CHAT_CHANNELS.setFocus), 'ganyu:set-focus');
   assert.ok(h.handlers.has(CHANNELS.drag), 'ganyu:drag');
-  assert.equal(h.handlers.size, 6, 'the four renderer->main channels plus the chat pair');
+  assert.ok(h.handlers.has(CHANNELS.overlayOpen), 'ganyu:overlay-open');
+  assert.equal(h.handlers.size, 7, 'the five renderer->main channels plus the chat pair');
 
   // chat.mjs is the single home of these two strings; CHANNELS must not grow a
   // second copy of either, which is the only way the two tables could drift.
@@ -356,6 +598,52 @@ test('registerIpc registers the chat pair alongside the original three, and disp
 
   h.dispose();
   assert.equal(h.handlers.size, 0, 'dispose removes every listener it added');
+});
+
+test('ganyu:overlay-open reduces whatever it is sent to one boolean', () => {
+  // Two things hang off this flag: a hook on the machine's Escape key, and a
+  // timer that closes her menu. Neither may be armed by a truthy accident.
+  const seen = [];
+  const handlers = new Map();
+  const ipcMain = {
+    on: (channel, fn) => handlers.set(channel, fn),
+    handle: (channel, fn) => handlers.set(channel, fn),
+    removeListener: (channel) => handlers.delete(channel),
+    removeHandler: (channel) => handlers.delete(channel),
+  };
+  const dispose = registerIpc({
+    ipcMain,
+    getWindow: () => null,
+    getFlags: () => ({}),
+    onMenuAction: () => {},
+    onOverlayOpen: (open) => seen.push(open),
+  });
+  const send = (payload) => handlers.get(CHANNELS.overlayOpen)(null, payload);
+
+  for (const payload of [{ menu: true }, { menu: false }, { menu: 1 }, { menu: 'yes' }, { menu: 0 }]) {
+    send(payload);
+  }
+  for (const junk of [null, undefined, 'menu', 42, {}, { chat: true }]) send(junk);
+
+  assert.deepEqual(seen, [
+    { menu: true },
+    { menu: false },
+    { menu: true },
+    { menu: true },
+    { menu: false },
+    ...Array(6).fill({ menu: false }),
+  ], 'always {menu: boolean}, never anything else');
+
+  dispose();
+  assert.equal(handlers.size, 0);
+});
+
+test('registerIpc without onOverlayOpen still registers the channel and swallows the message', () => {
+  // Same shape as onDrag: the renderer sends it unconditionally, so an
+  // unregistered channel would be a console warning on every menu open.
+  const h = ipcHarness();
+  assert.ok(h.handlers.has(CHANNELS.overlayOpen));
+  assert.doesNotThrow(() => h.call(CHANNELS.overlayOpen, { menu: true }));
 });
 
 test('ganyu:chat answers null before the chat module exists, then relays the reply', async () => {

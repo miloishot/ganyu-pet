@@ -164,7 +164,32 @@ export const CHANNELS = Object.freeze({
    * words it belongs to.
    */
   audio: 'ganyu:audio',
+  /**
+   * Renderer -> main, `{menu: boolean}`. What the overlay currently has open.
+   *
+   * Main needs this because two of the menu's escape routes cannot be built in
+   * the renderer at all. The window is `focusable: false` (see createPetWindow),
+   * so it never receives a keystroke and never fires `blur` — a DOM `keydown`
+   * for Escape and a window `blur` are both dead letters while the menu is up.
+   * Main answers both from outside the window: a `globalShortcut` armed only
+   * while the menu is open (`createEscapeHatch`), and the cursor poll that
+   * already exists for hover (`createLeaveWatch`).
+   */
+  overlayOpen: 'ganyu:overlay-open',
+  /**
+   * Main -> renderer, push-only, carrying a reason string from `DISMISS_REASONS`.
+   * The renderer closes whatever is open on receipt. This is the return leg of
+   * `overlayOpen`: the two dismissals main owns (Escape, and the pointer having
+   * left the window for longer than the grace period) have no other way back in.
+   */
+  dismiss: 'ganyu:dismiss',
 });
+
+/**
+ * Why main asked the overlay to close. Filtered on the renderer side exactly as
+ * `MENU_ACTIONS` and `DRAG_PHASES` are, so a stray message cannot close her menu.
+ */
+export const DISMISS_REASONS = Object.freeze(['escape', 'pointer-left']);
 
 /**
  * The only two things the renderer says about a drag. It reports the button, not
@@ -277,6 +302,140 @@ export function createHoverWatch({ getBounds, getCursorPoint, apply, sprite = SP
     sync,
     get interactive() {
       return applied === true;
+    },
+  };
+}
+
+/**
+ * Escape, for a window that can never be sent a keystroke.
+ *
+ * `createPetWindow` builds the overlay `focusable: false` so it cannot steal the
+ * caret from the editor, and that flag has a consequence nobody wrote down: the
+ * renderer's `keydown` listener is unreachable. No focus, no key events. The
+ * menu's Escape path was therefore dead from the day it was written, and so was
+ * its `blur` path — a window that cannot take focus cannot lose it. That left one
+ * live route out of an open menu, and the owner could not find it.
+ *
+ * A `globalShortcut` is the only mechanism that needs no focus, and it comes with
+ * an obligation: while it is registered, Escape belongs to this app and to
+ * nothing else on the machine. So it is armed **only** between the menu opening
+ * and the menu closing, and every path that can end the menu — the renderer
+ * reporting it closed, the pointer-leave grace expiring, the renderer reloading
+ * or dying, the window closing, and app teardown — releases it. It also releases
+ * itself the moment it fires, because its entire purpose is to close the thing
+ * that armed it, and an Escape swallowed system-wide by a wedged renderer is a
+ * far worse bug than the one being fixed.
+ *
+ * Registration can legitimately fail — another app may already hold Escape — and
+ * that is not fatal: the other close paths still work, so it warns once and
+ * carries on.
+ */
+export const MENU_ESCAPE_ACCELERATOR = 'Escape';
+
+export function createEscapeHatch({
+  globalShortcut,
+  onEscape,
+  accelerator = MENU_ESCAPE_ACCELERATOR,
+  log = console,
+} = {}) {
+  let armed = false;
+
+  function release() {
+    if (!armed) return false;
+    // Cleared first: if `unregister` throws we have no way to try again, and
+    // believing we are still armed would suppress the next `arm()` as a no-op —
+    // which is how a *stale* global Escape hook would outlive the menu.
+    armed = false;
+    try {
+      globalShortcut.unregister(accelerator);
+    } catch (err) {
+      log?.warn?.(`[ganyu] could not release the ${accelerator} hook: ${err?.message}`);
+    }
+    return true;
+  }
+
+  return {
+    /** Menu opened. Idempotent; false means Escape is not ours to have. */
+    arm() {
+      if (!globalShortcut || typeof globalShortcut.register !== 'function') return false;
+      if (armed) return true;
+      try {
+        const ok = globalShortcut.register(accelerator, () => {
+          // Released on the way out, not on the way back: the renderer may never
+          // answer, and Escape must not stay ours because of it.
+          release();
+          onEscape?.();
+        });
+        armed = ok !== false;
+        if (!armed) log?.warn?.(`[ganyu] ${accelerator} is held by another app — the menu keeps its other exits`);
+        return armed;
+      } catch (err) {
+        log?.warn?.(`[ganyu] could not arm the ${accelerator} hook: ${err?.message}`);
+        armed = false;
+        return false;
+      }
+    },
+    release,
+    get armed() {
+      return armed;
+    },
+    accelerator,
+  };
+}
+
+/**
+ * The last resort: the pointer left the window and never came back.
+ *
+ * Driven from the cursor poll that already exists for hover, for the reason
+ * documented on `createHoverWatch` — forwarded mouse-move does not reach this
+ * window on Electron 43.2.0 / Windows 11 22000, so a renderer `mouseleave` is not
+ * a signal that can be trusted to arrive.
+ *
+ * `graceMs` is 1200: ten samples at `HOVER_POLL_MS`, so one stray cursor reading
+ * cannot trip it, and long enough that overshooting the window edge and coming
+ * back is not read as abandonment. Travelling between the sprite and the menu
+ * cannot start the clock at all — both live inside the same 256x320 rect, so the
+ * cursor never leaves the window on that journey. That is a structural guarantee
+ * rather than a generous timeout, which is why the number can stay this short.
+ */
+export const MENU_LEAVE_GRACE_MS = 1200;
+
+export function createLeaveWatch({
+  now = () => Date.now(),
+  graceMs = MENU_LEAVE_GRACE_MS,
+  onExpired = () => {},
+} = {}) {
+  let leftAt = null;
+
+  return {
+    /**
+     * One sample. `open` — is the menu up; `inside` — is the cursor within the
+     * window. Returns true on the tick it dismissed. A caller that cannot read
+     * the cursor or the bounds must pass `inside: true`: an unknown reading is
+     * not evidence he walked away, and closing her menu on it would be a new
+     * unpredictability in place of the old one.
+     */
+    poll(open, inside) {
+      if (!open || inside) {
+        leftAt = null;
+        return false;
+      }
+      const t = now();
+      if (leftAt === null) {
+        leftAt = t;
+        return false;
+      }
+      if (t - leftAt < graceMs) return false;
+      leftAt = null;
+      onExpired();
+      return true;
+    },
+    reset() {
+      leftAt = null;
+    },
+    /** True while the grace period is running. */
+    get waiting() {
+      return leftAt !== null;
     },
   };
 }
@@ -628,6 +787,7 @@ export function registerIpc({
   onMenuAction,
   onInteractive = null,
   onDrag = null,
+  onOverlayOpen = null,
   getChat = null,
   onReply = null,
 }) {
@@ -647,6 +807,14 @@ export function registerIpc({
   /** Filtered like the menu action, and for the same reason. */
   const handleDrag = (_event, phase) => {
     if (onDrag && DRAG_PHASES.includes(phase)) onDrag(phase);
+  };
+  /**
+   * The overlay reporting what it has open. Coerced to a plain boolean here so
+   * the two things that hang off it — a global Escape hook and a dismissal timer
+   * — can never be armed by a truthy accident.
+   */
+  const handleOverlayOpen = (_event, open) => {
+    if (onOverlayOpen) onOverlayOpen({ menu: Boolean(open && open.menu) });
   };
 
   /**
@@ -724,6 +892,7 @@ export function registerIpc({
   ipcMain.on(CHANNELS.setInteractive, handleSetInteractive);
   ipcMain.on(CHANNELS.menu, handleMenu);
   ipcMain.on(CHANNELS.drag, handleDrag);
+  ipcMain.on(CHANNELS.overlayOpen, handleOverlayOpen);
   ipcMain.handle(CHANNELS.getFlags, handleGetFlags);
   ipcMain.on(CHAT_CHANNELS.setFocus, handleSetFocus);
   ipcMain.handle(CHAT_CHANNELS.chat, handleChat);
@@ -732,6 +901,7 @@ export function registerIpc({
     ipcMain.removeListener(CHANNELS.setInteractive, handleSetInteractive);
     ipcMain.removeListener(CHANNELS.menu, handleMenu);
     ipcMain.removeListener(CHANNELS.drag, handleDrag);
+    ipcMain.removeListener(CHANNELS.overlayOpen, handleOverlayOpen);
     ipcMain.removeListener(CHAT_CHANNELS.setFocus, handleSetFocus);
     if (typeof ipcMain.removeHandler === 'function') {
       ipcMain.removeHandler(CHANNELS.getFlags);

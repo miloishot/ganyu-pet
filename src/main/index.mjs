@@ -2,7 +2,7 @@
 // composition of modules B (server+state), D (speech) and E (wander) with
 // production dependencies injected.
 
-import { app, BrowserWindow, ipcMain, screen } from 'electron';
+import { app, BrowserWindow, globalShortcut, ipcMain, screen } from 'electron';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -18,10 +18,13 @@ import {
   WINDOW_SIZE,
   computeInitialBounds,
   createDragTracker,
+  createEscapeHatch,
   createHoverWatch,
+  createLeaveWatch,
   createPetWindow,
   enforceWindowSize,
   moveWindowPinned,
+  pointInBox,
   registerIpc,
   resolveSpritePath,
   sizeWithinTolerance,
@@ -113,6 +116,8 @@ let walk = null;
 let statePoll = null;
 let hoverPoll = null;
 let hoverWatch = null;
+let escapeHatch = null;
+let leaveWatch = null;
 let dragTracker = null;
 let dragPoll = null;
 let disposeIpc = null;
@@ -264,6 +269,63 @@ function send(channel, payload) {
   const wc = win.webContents;
   if (!wc || wc.isDestroyed()) return;
   wc.send(channel, payload);
+}
+
+// ---------------------------------------------------------------------------
+// Dismissing the overlay from outside it
+// ---------------------------------------------------------------------------
+//
+// The window is built `focusable: false` so an always-on-top pet can never take
+// the caret from the editor. The cost, which went unnoticed until the owner could
+// not close her menu: the renderer's own Escape and blur handlers are unreachable
+// — no focus means no key events, and a window that cannot be focused cannot be
+// blurred. Both of the menu's keyboard-shaped exits were dead on arrival.
+//
+// Main owns the two that still work from outside the window: a global Escape hook
+// held only while the menu is up, and the cursor poll that already runs for hover.
+
+/** What the renderer last reported it has open. */
+const overlay = { menu: false };
+
+/** True unless we can positively see the cursor outside the window. */
+function cursorInsideWindow() {
+  const at = windowPosition();
+  const point = at ? cursorPoint() : null;
+  // A reading we could not take is not evidence that he walked away, and closing
+  // her menu on it would just be a different kind of unpredictable.
+  if (!at || !point) return true;
+  return pointInBox(point, { ...at, ...measuredWindowSize() });
+}
+
+/**
+ * Close whatever is open, and drop main's half of it first. The Escape hook is
+ * released here rather than waiting for the renderer to confirm: it is the whole
+ * machine's Escape key, and it must not stay ours because a renderer went quiet.
+ */
+function dismissOverlay(reason) {
+  overlay.menu = false;
+  if (escapeHatch) escapeHatch.release();
+  if (leaveWatch) leaveWatch.reset();
+  send(CHANNELS.dismiss, reason);
+}
+
+/**
+ * `ganyu:overlay-open`. Also the release valve for every way a renderer can stop
+ * existing — a reload, a crash, the window closing — because each of those means
+ * the menu is gone whatever it last told us, and a global Escape hook outliving
+ * it would swallow the key system-wide with nothing left to close.
+ */
+function setOverlayOpen(next) {
+  const menu = Boolean(next && next.menu);
+  if (menu === overlay.menu) return menu;
+  overlay.menu = menu;
+  if (menu) {
+    if (escapeHatch) escapeHatch.arm();
+  } else {
+    if (escapeHatch) escapeHatch.release();
+    if (leaveWatch) leaveWatch.reset();
+  }
+  return menu;
 }
 
 function currentAggregate() {
@@ -984,8 +1046,16 @@ async function main() {
   captureWindowSize();
   win.on('closed', () => {
     win = null;
+    setOverlayOpen({ menu: false });
   });
-  win.webContents.on('did-finish-load', () => pushState(true));
+  win.webContents.on('did-finish-load', () => {
+    // A fresh renderer has no menu open, whatever the last one reported before
+    // it went away. Says so explicitly rather than trusting the flag to be right.
+    setOverlayOpen({ menu: false });
+    pushState(true);
+  });
+  // The renderer died mid-menu. Nothing will ever send the close it owed us.
+  win.webContents.on('render-process-gone', () => setOverlayOpen({ menu: false }));
   win.loadFile(RENDERER).catch((err) => {
     console.error('[ganyu] failed to load renderer:', err?.message);
   });
@@ -1008,7 +1078,26 @@ async function main() {
       if (win && !win.isDestroyed()) win.setIgnoreMouseEvents(!interactive, { forward: true });
     },
   });
-  hoverPoll = setInterval(() => hoverWatch.poll(), HOVER_POLL_MS);
+  // Escape, for a window that can never receive a keystroke. Armed only while
+  // the menu is open — see createEscapeHatch for why that boundary is strict.
+  escapeHatch = createEscapeHatch({
+    globalShortcut,
+    log: console,
+    onEscape: () => dismissOverlay('escape'),
+  });
+
+  // And the last resort: he opened the menu, walked the cursor away and never
+  // came back. Rides the hover poll rather than a renderer mouseleave, for the
+  // same reason the hover watch does — that event does not reliably arrive here.
+  leaveWatch = createLeaveWatch({
+    now: () => Date.now(),
+    onExpired: () => dismissOverlay('pointer-left'),
+  });
+
+  hoverPoll = setInterval(() => {
+    hoverWatch.poll();
+    leaveWatch.poll(overlay.menu, cursorInsideWindow());
+  }, HOVER_POLL_MS);
 
   disposeIpc = registerIpc({
     ipcMain,
@@ -1016,6 +1105,9 @@ async function main() {
     getFlags,
     onMenuAction: handleMenuAction,
     onInteractive: (interactive) => hoverWatch.setRendererWants(interactive),
+    // What the overlay has open, which is what arms and releases the Escape hook
+    // and the pointer-leave timer above.
+    onOverlayOpen: setOverlayOpen,
     // Read through the module-level tracker, not captured: composeRuntime builds
     // it below, and a press before then is simply a press with nothing behind it.
     onDrag: onDragPhase,
@@ -1062,6 +1154,16 @@ function cleanup() {
   statePoll = null;
   if (hoverPoll) clearInterval(hoverPoll);
   hoverPoll = null;
+  // Before anything else that might throw: leaving a global Escape hook behind
+  // would break the key for the whole machine, with this app gone and no way
+  // left to release it.
+  if (escapeHatch) {
+    try {
+      escapeHatch.release();
+    } catch {
+      /* shutting down */
+    }
+  }
   stopDragPoll();
   if (dragTracker) {
     try {

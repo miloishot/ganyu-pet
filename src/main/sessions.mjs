@@ -143,9 +143,10 @@ const PREAMBLE_MAX_CHARS = 200;
  * in real transcripts on this machine; the list is a prefix test, so a block that
  * opens with one is dropped whole.
  *
- * `<system-reminder>` is the exception and is handled separately in `ownerAsk` —
- * it is usually *appended* to a genuine prompt rather than being the whole line,
- * so dropping the line would throw away the ask along with it.
+ * Anything that can arrive *alongside* an ask instead of replacing it is not
+ * here — `<system-reminder>`, the agent-notification envelope and the rest go
+ * through `stripWrappedBlocks`, which cuts the machine part out and leaves his
+ * words. A prefix rule on those would throw away the ask with them.
  */
 const USER_NOISE_PREFIXES = Object.freeze([
   '<task-notification>',
@@ -310,12 +311,92 @@ export function stripCode(text) {
   return s;
 }
 
-/** `<system-reminder>…</system-reminder>` and friends, which ride along on real prompts. */
+/**
+ * Elements the harness wraps machine content in on the `user` channel.
+ *
+ * Measured, not guessed: across the 148 transcripts on this machine these are
+ * every element that ever opens a user text block — `<task-notification>` 155
+ * times, `<local-command-caveat>` 51, `<command-name>` 51,
+ * `<local-command-stdout>` 38, `<command-message>` 5 — plus
+ * `<teammate-message>` and `<agent-message>`, which occur 73 times *inside* the
+ * envelope `MACHINE_WRAPPERS` describes.
+ *
+ * Those last two carry attributes — `teammate_id`, `color`, `summary`, `from` —
+ * and that is the whole bug. The previous pattern admitted no attributes, so
+ * `<teammate-message teammate_id="sync-fix" color="yellow">` matched nothing and
+ * 66 background-agent notifications were read back as things the owner had asked
+ * for. The attribute list is optional, so the bare forms still match.
+ */
+const MACHINE_BLOCK_TAGS = [
+  'system-reminder',
+  'local-command-caveat',
+  'local-command-stdout',
+  'local-command-stderr',
+  'task-notification',
+  'command-name',
+  'command-message',
+  'command-args',
+  'user-prompt-submit-hook',
+  'teammate-message',
+  'agent-message',
+].join('|');
+
+const MACHINE_BLOCK_RE = new RegExp(`<(${MACHINE_BLOCK_TAGS})(?:\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>`, 'gi');
+const MACHINE_BLOCK_UNCLOSED_RE = new RegExp(`<(?:${MACHINE_BLOCK_TAGS}|local-command-[a-z]+)(?:\\s[^>]*)?>[\\s\\S]*$`, 'i');
+
+/**
+ * Fixed sentences the harness writes *around* machine content, which are prose
+ * rather than elements and so are invisible to everything above.
+ *
+ * THE DEFECT. A digest of a real session opened with
+ * `What he asked for: "Another Claude session sent a message. <teammate-message
+ * teammate_id="sync-fix" color="yellow". {"type":"idle_notification"…` — a
+ * background agent reporting itself idle, offered as something he wanted. The
+ * envelope is identical every time it occurs here:
+ *
+ *     Another Claude session sent a message:
+ *     <teammate-message teammate_id="…" color="…">…</teammate-message>   (1..n)
+ *
+ *     This came from another Claude session — not typed by your user, …
+ *
+ * so the blocks come out with `MACHINE_BLOCK_RE` and these three take the prose
+ * that framed them. 73 user lines carry that envelope; 66 were reaching `asks`
+ * (the other 7 were already `isMeta`). The third rule is the context-compaction
+ * header, which is the harness summarising the session to itself.
+ *
+ * EVERY RULE IS ANCHORED, and that is what keeps this from over-filtering. The
+ * target is text that IS the envelope, never text that mentions one: the first
+ * must be a whole line on its own, the second must carry the boilerplate's own
+ * "not typed by your user" clause, and the third must open the block. So "why
+ * are the teammate notifications showing up?" matches nothing and survives whole.
+ */
+const MACHINE_WRAPPERS = Object.freeze([
+  /^[ \t]*Another Claude session sent a message[:.]?[ \t]*$/gim,
+  /^[ \t]*This came from another Claude session\s*[—–-]\s*not typed by your user\b[\s\S]*?(?:\n[ \t]*\n|$)/gim,
+  /^\s*This session is being continued from a previous conversation that ran out of context\.[\s\S]*$/i,
+]);
+
+/**
+ * Machine content removed from a user line — **stripped, not dropped**.
+ *
+ * Which is the difference that matters when a line is mixed. The blocks and the
+ * envelope prose are cut out and whatever else was in the line is left standing,
+ * so a prompt that quotes a notification to ask about it keeps his question and
+ * loses the quoted payload. When there was nothing but envelope the result is
+ * whitespace, and `ownerAsk` turns that into `null` on its own — no separate
+ * whole-line rule, and therefore no way for one to fire on a line that had an
+ * ask in it.
+ *
+ * The wrapper prose runs first, while the line breaks it is anchored to are
+ * still there; block removal collapses them.
+ */
 function stripWrappedBlocks(text) {
-  return String(text ?? '')
-    .replace(/<(system-reminder|local-command-caveat|local-command-stdout|local-command-stderr|task-notification|command-name|command-message|command-args|user-prompt-submit-hook)>[\s\S]*?<\/\1>/gi, ' ')
+  let s = String(text ?? '');
+  for (const re of MACHINE_WRAPPERS) s = s.replace(re, ' ');
+  return s
+    .replace(MACHINE_BLOCK_RE, ' ')
     // An unterminated one, same reasoning as the fence above.
-    .replace(/<(?:system-reminder|task-notification|local-command-[a-z]+)>[\s\S]*$/i, ' ');
+    .replace(MACHINE_BLOCK_UNCLOSED_RE, ' ');
 }
 
 const isNoise = (text) => {

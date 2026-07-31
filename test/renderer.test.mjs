@@ -191,12 +191,26 @@ function makeDom() {
  *   is called with the text so a test can gate or fail a single exchange.
  */
 function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
-  const calls = { setInteractive: [], menuAction: [], getFlags: 0, sendChat: [], setFocused: [], drag: [] };
+  const calls = {
+    setInteractive: [],
+    menuAction: [],
+    getFlags: 0,
+    sendChat: [],
+    setFocused: [],
+    drag: [],
+    /** `{menu}` on every open and close — main arms Escape off this. */
+    overlayOpen: [],
+  };
   let stateCb = null;
   let speakCb = null;
   let audioCb = null;
+  let dismissCb = null;
   return {
     calls,
+    /** Main asking the overlay to close, for the two dismissals only it can see. */
+    get dismissCb() {
+      return dismissCb;
+    },
     get stateCb() {
       return stateCb;
     },
@@ -226,8 +240,17 @@ function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
           audioCb = null;
         };
       },
+      onDismiss(cb) {
+        dismissCb = cb;
+        return () => {
+          dismissCb = null;
+        };
+      },
       setInteractive(v) {
         calls.setInteractive.push(v);
+      },
+      setOverlayOpen(open) {
+        calls.overlayOpen.push({ menu: Boolean(open && open.menu) });
       },
       menuAction(a) {
         calls.menuAction.push(a);
@@ -957,7 +980,11 @@ test('menu closes on outside mousedown, Escape and window blur', async () => {
   await open();
   doc.dispatch('mousedown', { target: menu.children[1] });
   assert.equal(menu.hidden, false, 'inside clicks keep it open');
-  doc.dispatch('mousedown', { target: canvas });
+  // Anywhere in the window that is not the menu and not the sprite: the bubble,
+  // or the transparent corners, whose hit target is the body. The sprite is
+  // deliberately not this case — mousedown on her is the first half of a gesture
+  // the canvas handlers finish, and the test below is what covers it.
+  doc.dispatch('mousedown', { target: h.dom.bubble });
   assert.equal(menu.hidden, true);
 
   await open();
@@ -972,6 +999,341 @@ test('menu closes on outside mousedown, Escape and window blur', async () => {
   await open();
   canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
   assert.equal(menu.hidden, true);
+  app.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// closing the menu — the paths that were dead
+// ---------------------------------------------------------------------------
+//
+// The owner could not close the menu and had to restart the app. The reason is
+// that of the five ways out a user would try, four could not work:
+//
+//   Escape                   the window is focusable:false, so no keydown ever
+//                            reaches the DOM (main answers this — see the
+//                            escape-hatch tests in window.test.mjs)
+//   clicking away            a window that cannot take focus cannot blur, and a
+//                            click outside its 256x320 rect is not its event
+//   right-clicking the menu  preventDefault() and nothing else
+//   right-clicking her       mousedown closed it, then contextmenu reopened it
+//   clicking her             closed it and opened the chat strip, which reads as
+//                            being handed something else rather than dismissed
+//
+// The Escape and blur handlers stay wired regardless: the chat flow lifts
+// focusability, so both are live there, and the tests above still hold them.
+
+test('right-clicking her toggles the menu shut, in the real browser event order', async () => {
+  // The bug in one test. On Windows the right button fires mousedown before
+  // contextmenu, and the document handler used to close the menu on that
+  // mousedown — so contextmenu found it hidden and opened it straight back up.
+  // The fake DOM does not bubble, which is exactly why the old toggle test
+  // passed against a toggle that could not work.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas, doc } = h.dom;
+
+  const rightClickOnSprite = async () => {
+    doc.dispatch('mousedown', { target: canvas, button: 2 }); // bubbled
+    canvas.dispatch('mousedown', { button: 2 });
+    canvas.dispatch('contextmenu', { clientX: 40, clientY: 40 });
+    await flush();
+  };
+
+  await rightClickOnSprite();
+  assert.equal(menu.hidden, false, 'first right-click opens it');
+
+  await rightClickOnSprite();
+  assert.equal(menu.hidden, true, 'and the second one closes it, rather than moving it');
+  assert.equal(app.interactivity.interactive, false, 'the latch goes with it');
+
+  await rightClickOnSprite();
+  assert.equal(menu.hidden, false, 'still a toggle, not a one-shot');
+  app.dispose();
+});
+
+test('right-clicking the menu itself closes it', async () => {
+  // The single most natural recovery — right-click the thing a right-click
+  // produced — and it used to do nothing at all. It matters most in the case
+  // that goes wrong: the menu opens at the cursor, so it is normally sitting
+  // over the sprite, and a second right-click aimed at her lands on the menu.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  assert.equal(menu.hidden, false);
+
+  const ev = menu.dispatch('contextmenu', { clientX: 12, clientY: 12 });
+  assert.equal(ev.defaultPrevented, true, 'Chromium\'s own menu is still suppressed');
+  assert.equal(menu.hidden, true, 'and it closes');
+  assert.equal(app.interactivity.interactive, false);
+
+  // A menu button is inside the menu, and gets the same treatment.
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  menu.dispatch('contextmenu', { target: menu.children[2] });
+  assert.equal(menu.hidden, true, 'anywhere on the menu, not just its padding');
+  assert.deepEqual(h.g.calls.menuAction, [], 'and closing is not acting');
+  app.dispose();
+});
+
+test('clicking her closes an open menu, and does not open the chat strip instead', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas, chat, doc } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  assert.equal(menu.hidden, false);
+
+  doc.dispatch('mousedown', { target: canvas, button: 0 }); // bubbled
+  canvas.dispatch('mousedown', { button: 0 });
+  doc.dispatch('mouseup', { button: 0 });
+  canvas.dispatch('click', {});
+
+  assert.equal(menu.hidden, true, 'the click dismissed it');
+  assert.equal(chat.hidden, true, 'and was spent doing so — nothing else appeared');
+  assert.equal(app.interactivity.interactive, false);
+
+  // The very next click is an ordinary one: dismissal costs exactly one.
+  canvas.dispatch('mousedown', { button: 0 });
+  doc.dispatch('mouseup', { button: 0 });
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, false, 'the chat strip still opens when no menu is up');
+  app.dispose();
+});
+
+test('a mousedown on her never pre-empts the gesture the canvas handlers finish', async () => {
+  // Both canvas rules in the document handler are the same rule: her mousedown
+  // is half a gesture, and acting on it here breaks the other half. For the chat
+  // strip it reopened an input he had just typed into; for the menu it made the
+  // right-click toggle unreachable.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas, chat, chatInput, doc } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  doc.dispatch('mousedown', { target: canvas, button: 2 });
+  assert.equal(menu.hidden, false, 'the menu survives her mousedown');
+
+  app.menu.close();
+  canvas.dispatch('click', {});
+  chatInput.value = 'still typing';
+  doc.dispatch('mousedown', { target: canvas, button: 0 });
+  assert.equal(chat.hidden, false, 'and so does the input strip');
+  assert.equal(chatInput.value, 'still typing');
+  app.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// the dismissal contract with main
+// ---------------------------------------------------------------------------
+
+test('the menu tells main every time it opens and closes', async () => {
+  // This is what arms and releases the global Escape hook. A close that forgot
+  // to report would leave Escape belonging to this app with no menu to close —
+  // strictly worse than the bug being fixed, so every close path must report.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas, doc, win } = h.dom;
+
+  const open = async () => {
+    canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+    await flush();
+    assert.equal(menu.hidden, false);
+  };
+
+  await open();
+  assert.deepEqual(h.g.calls.overlayOpen, [{ menu: true }]);
+
+  // Every way out, each of which must produce exactly one `false`.
+  const closes = [
+    ['a menu action', () => menu.dispatch('click', { target: menu.children[0] })],
+    ['right-click on the menu', () => menu.dispatch('contextmenu', {})],
+    ['outside mousedown', () => doc.dispatch('mousedown', { target: h.dom.bubble })],
+    ['clicking her', () => canvas.dispatch('click', {})],
+    ['Escape from main', () => h.g.dismissCb('escape')],
+    ['the pointer-leave grace', () => h.g.dismissCb('pointer-left')],
+    ['blur', () => win.dispatch('blur')],
+    ['a drag starting', () => h.g.stateCb({ mode: 'idle', dragging: true, walk: null })],
+  ];
+  for (const [label, close] of closes) {
+    h.g.calls.overlayOpen.length = 0;
+    if (menu.hidden) await open();
+    h.g.calls.overlayOpen.length = 0;
+    close();
+    assert.equal(menu.hidden, true, `${label} closes the menu`);
+    assert.deepEqual(h.g.calls.overlayOpen, [{ menu: false }], `${label} reports the close`);
+    h.g.stateCb({ mode: 'idle', dragging: false, walk: null });
+  }
+
+  await open();
+  h.g.calls.overlayOpen.length = 0;
+  app.dispose();
+  assert.deepEqual(h.g.calls.overlayOpen, [{ menu: false }], 'teardown reports it too');
+});
+
+test('a dismissal from main closes the menu, and only for a reason it recognises', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+
+  for (const junk of ['quit', '', null, undefined, 'ESCAPE', { reason: 'escape' }]) {
+    h.g.dismissCb(junk);
+    assert.equal(menu.hidden, false, `${String(junk)} is not a dismissal`);
+  }
+
+  h.g.dismissCb('escape');
+  assert.equal(menu.hidden, true);
+  assert.equal(app.interactivity.interactive, false, 'and the latch went with it');
+  app.dispose();
+});
+
+test('Escape takes the menu down first, and leaves a half-typed message alone', async () => {
+  // Main's Escape hook is armed while the menu is open, and it outranks the
+  // input's own keydown — so with both up it has to behave like a layered
+  // dismissal rather than clearing the screen.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas, chat, chatInput } = h.dom;
+
+  canvas.dispatch('click', {});
+  chatInput.value = 'half a thought';
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  assert.equal(menu.hidden, false);
+  assert.equal(chat.hidden, false, 'both are up');
+
+  h.g.dismissCb('escape');
+  assert.equal(menu.hidden, true, 'the topmost thing goes');
+  assert.equal(chat.hidden, false, 'and what he was writing survives');
+  assert.equal(chatInput.value, 'half a thought');
+
+  h.g.dismissCb('escape');
+  assert.equal(chat.hidden, true, 'a second Escape closes the input');
+  app.dispose();
+});
+
+test('the pointer-leave grace never throws away what he is typing', async () => {
+  // He walks the cursor off a 256px window constantly while typing — he is
+  // looking at the keyboard. The grace period exists for an abandoned menu, and
+  // it must not become a way to lose a message.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { chat, chatInput, canvas } = h.dom;
+
+  canvas.dispatch('click', {});
+  chatInput.value = 'most of a sentence';
+
+  h.g.dismissCb('pointer-left');
+  assert.equal(chat.hidden, false, 'the input strip is not the menu');
+  assert.equal(chatInput.value, 'most of a sentence');
+  assert.equal(app.interactivity.interactive, true, 'and the overlay stays reachable');
+  app.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// the hard invariant
+// ---------------------------------------------------------------------------
+
+test('a menu that has lost the latch keeping it reachable closes itself', async () => {
+  // The state that costs a restart: the menu is still painted, but the latch
+  // that held the window mouse-opaque is gone, so every click now passes through
+  // to the desktop. Nothing on it can be clicked, and no event that could close
+  // it will ever be delivered again. It is not allowed to survive a frame.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  assert.equal(menu.hidden, false);
+  assert.equal(app.interactivity.interactive, true);
+
+  // Reach behind the renderer and drop the latch on its own, which is exactly
+  // what a future `releaseAll()` in the wrong place would do.
+  app.interactivity.releaseAll();
+  assert.equal(app.menu.guard(), true, 'the guard caught it');
+  assert.equal(menu.hidden, true, 'and closed the menu rather than stranding it');
+  assert.deepEqual(h.g.calls.overlayOpen.at(-1), { menu: false }, 'main told, so Escape is released');
+
+  assert.equal(app.menu.guard(), false, 'and it is quiet when nothing is wrong');
+  app.dispose();
+});
+
+test('the guard runs on the frame loop and on every state push', async () => {
+  // Two carriers because neither covers everything: the frame loop does not
+  // exist when the spritesheet failed to load, and state pushes are deduped.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, canvas } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  app.interactivity.releaseAll();
+  h.stepRaf();
+  assert.equal(menu.hidden, true, 'the frame loop swept it up');
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  app.interactivity.releaseAll();
+  h.g.stateCb({ mode: 'busy', celebrate: false, walk: null });
+  assert.equal(menu.hidden, true, 'and so does a state push');
+  app.dispose();
+});
+
+test('releaseAll never leaves a visible surface on a click-through window', async () => {
+  // The watchdog path: the pointer left the page. It stands down for an open
+  // menu, an open input and a live drag — but when it does fire, nothing may be
+  // left painted on a window that no longer accepts a click.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { menu, chat, canvas, documentElement } = h.dom;
+
+  canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+  await flush();
+  documentElement.dispatch('mouseleave');
+  assert.equal(menu.hidden, false, 'an open menu holds the watchdog off');
+  assert.equal(app.interactivity.interactive, true);
+
+  app.menu.close();
+  canvas.dispatch('click', {});
+  documentElement.dispatch('mouseleave');
+  assert.equal(chat.hidden, false, 'so does an open input');
+  assert.equal(app.interactivity.interactive, true);
+
+  canvas.dispatch('click', {}); // closes the strip
+  documentElement.dispatch('mouseleave');
+  assert.equal(app.interactivity.interactive, false, 'and now it fires');
+  assert.equal(menu.hidden, true);
+  assert.equal(chat.hidden, true);
   app.dispose();
 });
 
