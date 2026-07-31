@@ -74,12 +74,16 @@ export function buildSummary(ev = {}) {
  *   3-5 variants per kind · <= MAX_LINE_CHARS · at most one emoji · no honorific
  *   · at least one variant per kind needs no slot, so an event with no tool or
  *     project name still gets a natural line instead of a literal "{tool}".
+ *   · at most one variant per kind mentions her notes. Three of the four `failed`
+ *     lines used to, and two of the four greetings, so a table meant to sound
+ *     like her sounded like a filing clerk — see VOICE_EXAMPLES for the same
+ *     defect at greater cost.
  */
 export const MESSAGES = Object.freeze({
   greeting: Object.freeze([
     'Session started in {project}.',
-    'A new session in {project}. I have the notes ready.',
-    "Reporting in. I'll keep the records.",
+    "A new session in {project}. I'll watch it with you.",
+    "Reporting in. I'll keep you company.",
     'Session started. Ganyu at your service. 📖',
   ]),
   busy: Object.freeze([
@@ -96,9 +100,9 @@ export const MESSAGES = Object.freeze({
   ]),
   failed: Object.freeze([
     "Error in {tool}. I've noted it.",
-    '{tool} failed. I kept the details.',
+    '{tool} stopped short. These things happen.',
     'Something failed in {project}.',
-    'That step failed. I marked where it stopped.',
+    "That step didn't get through.",
   ]),
   // The first thing that works after something broke. Its own kind rather than a
   // `busy` line, because "Running Bash…" is the wrong thing to say at the moment
@@ -148,24 +152,36 @@ export const BRAIN_LINE_TARGET_CHARS = 110;
  * **And none of them may claim an action she cannot take.** This list is where
  * the "I've set that page aside for you" bug came from: the model does not copy
  * an example, it generalises from it, and a secretary who files things and
- * fetches tea generalises into one who handles his work. The record-keeping
- * lines survive because the ledger (ledger.mjs) makes them true — she really
- * does write down what she saw. Everything past writing it down is gone, and
- * the denylist in test/speech.test.mjs keeps it gone.
+ * fetches tea generalises into one who handles his work. Record-keeping is the
+ * one claim that survives, because the ledger (ledger.mjs) makes it true — she
+ * really does write down what she saw. Everything past writing it down is gone,
+ * and the denylist in test/speech.test.mjs keeps it gone.
+ *
+ * **But the surviving claim is rationed, because the fix for that bug caused the
+ * next one.** Her one true capability ended up in six of the twelve examples,
+ * and half a list is not a register, it is a theme: she opened her ledger at
+ * every moment that reached her, morning after morning, until the owner asked
+ * what she even meant by it. Two of the twelve mention the record now — the
+ * failure, where noting *where* it stopped is the useful thing, and the quiet
+ * moment, where the word "ledger" reads as who she is rather than as a tic —
+ * and the instruction under the list says so in as many words. The count is
+ * held by a test, because this is the third defect in this file whose whole
+ * cause was that something over-represented in the prompt came back out of the
+ * model (see also: the clock, and the session count, in `decideMentions`).
  */
 export const VOICE_EXAMPLES = Object.freeze([
-  ['a session starts', `Good evening, ${OWNER_NAME}. I have the ledger open.`],
+  ['a session starts', `There you are, ${OWNER_NAME}. I'll be right here.`],
   ['something failed', "Oh — that one stopped short. I've written down where."],
   ['it failed again', 'The same error a third time. Perhaps set it down and come back to it?'],
-  ['it works again', "It's running again. I've corrected the record."],
+  ['it works again', "It's going again. Whatever that was, it seems to have passed."],
   ['waiting on permission', "This one won't move until you say so."],
-  ['a task finished', "That's done, and written down. Nothing else is waiting."],
+  ['a task finished', "That's the last of it. Nothing else is waiting on you."],
   ['the same file, many times', 'The fifth pass over that one file… perhaps it is time for tea.'],
   ['the same command over and over', "Three runs of it now. I don't think it has changed its mind."],
   ['a long night', `It's past one, ${OWNER_NAME}. I'm no better at stopping than you are, but one of us should.`],
   ['a very long stretch of work', 'Six hours. Even the Qixing send me home eventually.'],
-  ['an unusual number of sessions', 'Seven at once. I have never had to keep seven sets of notes before.'],
-  ['a quiet moment', 'Still here, still writing it down. 📖'],
+  ['an unusual number of sessions', 'Seven at once, and not one of them slowing. You are braver than I am.'],
+  ['a quiet moment', 'Quiet for a while. Just me, the ledger, and the tea going cold. 📖'],
 ]);
 
 /**
@@ -224,7 +240,9 @@ export const BRAIN_INSTRUCTIONS = [
     'If he asks you for something you cannot do, say so plainly and kindly: do not pretend, and do not promise it for later.',
   ].join(' '),
   [
-    'Examples of the voice. They show the register only — never reuse one as your line, and never borrow a detail from one as if it were a fact:',
+    'Examples of the voice. They show the register only — never reuse one as your line, and never borrow a detail from one as if it were a fact.',
+    'They are a range to move within, not a checklist to work through: most of your lines should not mention your notes or your record at all.',
+    'Say you have written something down only where that is the useful thing to say — when something broke, and where — and never as a way to round a line off.',
     ...VOICE_EXAMPLES.map(([situation, line]) => `- (${situation}) ${line}`),
   ].join('\n'),
 ].join('\n\n');

@@ -428,7 +428,9 @@ test('every kind renders with no tool and no project without leaking a slot', ()
 test('an event with no tool and no project still gets a natural line', () => {
   const h = harness();
   const greeting = h.speech.notify({ source: 'codex', event: 'SessionStart', sessionId: 's1' });
-  assert.equal(greeting.text, "Reporting in. I'll keep the records.");
+  // "I'll keep the records" until the greeting was rebalanced: two of the four
+  // greetings announced her filing, and this is the one that fires every session.
+  assert.equal(greeting.text, "Reporting in. I'll keep you company.");
 
   h.advance(QUIET_THROTTLE_MS);
   const idle = h.speech.notify({ source: 'codex', event: 'SessionEnd', sessionId: 's1' });
@@ -655,6 +657,57 @@ test('no line of hers claims an action she cannot take', () => {
       assert.ok(!pattern.test(line), `${where} claims ${claim}: ${line}`);
     }
   }
+});
+
+/**
+ * The vocabulary she keeps records in. Matching on words rather than on whole
+ * lines is the point: no single line here was ever wrong, and a rewrite that
+ * swapped "the ledger" for "my notes" in six places would have fixed nothing.
+ */
+const RECORD_KEEPING = [
+  /\bledgers?\b/i,
+  /\brecords?\b/i,
+  /\bnotes?\b/i,
+  /\bnoted\b/i,
+  /\bwrit(e|es|ten|ing)\b/i,
+  /\bwrote\b/i,
+  /\bjot(s|ted|ting)?\b/i,
+];
+
+const mentionsRecordKeeping = (line) => RECORD_KEEPING.some((re) => re.test(line));
+
+/**
+ * Six of the twelve examples used to be about writing things down — the fix for
+ * the claim bug above, overapplied — and half a list is not a register but a
+ * theme, so she announced her ledger at every moment that reached her until the
+ * owner asked what she even meant by it. The capability is true and stays; its
+ * share is what broke, exactly as it did for the clock and the session count.
+ */
+test('record-keeping is one note in her voice, not the whole of it', () => {
+  const withRecord = VOICE_EXAMPLES.filter(([, line]) => mentionsRecordKeeping(line));
+  assert.ok(
+    withRecord.length <= 3,
+    `${withRecord.length} of ${VOICE_EXAMPLES.length} examples are about her records `
+      + `(${withRecord.map(([situation]) => situation).join(', ')})`,
+  );
+  // The floor matters too: rebalancing it away entirely would take with it the
+  // one claim the ledger exists to make honest.
+  assert.ok(withRecord.length >= 1, 'she keeps a real ledger — at least one example may say so');
+  assert.ok(
+    VOICE_EXAMPLES.filter(([, line]) => /\bledgers?\b/i.test(line)).length <= 1,
+    'the word "ledger" twice is a catchphrase; once is character',
+  );
+
+  // MESSAGES goes into the bubble verbatim, so the same skew reads the same way.
+  for (const [kind, table] of Object.entries(MESSAGES)) {
+    const n = table.filter(mentionsRecordKeeping).length;
+    assert.ok(n <= 1, `${kind} has ${n} of ${table.length} variants about her records`);
+  }
+});
+
+test('the examples are introduced as a range, not as a checklist to work through', () => {
+  assert.match(BRAIN_INSTRUCTIONS, /not a checklist to work through/i);
+  assert.match(BRAIN_INSTRUCTIONS, /should not mention your notes or your record at all/i);
 });
 
 test('the standing rule names what she may claim and what she may not', () => {
