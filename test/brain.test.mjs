@@ -18,6 +18,7 @@ import {
   MAX_CHAT_LINE_CHARS,
   REQUIRED_KEYS,
   ROUTES,
+  allowChatFallbackFrom,
   createBrain,
   loadBrainConfig,
   seePromptsFrom,
@@ -42,6 +43,16 @@ const CONFIG = Object.freeze({
   model: 'test-model',
   apiKey: 'sk-test-not-a-real-key',
 });
+
+/**
+ * The same brain with the chat-completions fallback opted into. It is a separate
+ * config rather than the default because the default is *off* — on the owner's
+ * proxy that route cannot displace an injected coding-agent system prompt (see
+ * ROUTE_ORDER in brain.mjs for the measured token counts), so falling back to it
+ * is worse than the canned line. Every test below that exercises the fallback's
+ * request shape uses this, and the shapes themselves are unchanged.
+ */
+const ALLOW_CHAT = Object.freeze({ ...CONFIG, allowChatFallback: true });
 
 const DETAIL = Object.freeze({
   kind: 'failed',
@@ -134,6 +145,7 @@ test('a full .env.local enables the brain, trimmed and without the trailing slas
     apiKey: 'sk-test-not-a-real-key',
     reasoningEffort: DEFAULT_REASONING_EFFORT,
     seePrompts: true,
+    allowChatFallback: false,
   });
   assert.equal(DEFAULT_REASONING_EFFORT, 'low');
 
@@ -161,6 +173,27 @@ test('GANYU_SEE_PROMPTS defaults on, because he asked for it, and honours a fals
   assert.ok(!REQUIRED_KEYS.includes('GANYU_OPENAI_REASONING_EFFORT'));
 });
 
+test('GANYU_ALLOW_CHAT_FALLBACK defaults off, and is the one switch that does', (t) => {
+  // The opposite default to GANYU_SEE_PROMPTS above, and deliberately so: this
+  // one costs him a degraded persona and ~160x the input tokens if it is wrong,
+  // so a key he has not written is a key he has not opted into.
+  assert.equal(loadBrainConfig({ envPath: tempEnv(t, FULL_ENV) }).allowChatFallback, false);
+  assert.equal(allowChatFallbackFrom(undefined), false);
+  assert.equal(allowChatFallbackFrom(null), false);
+
+  for (const on of ['1', 'true', 'yes', 'on', 'allow', 'TRUE', ' On ']) {
+    assert.equal(allowChatFallbackFrom(on), true, `"${on}" should turn it on`);
+  }
+  for (const off of ['0', 'false', 'no', 'off', '', '   ', 'maybe', 'sure why not']) {
+    assert.equal(allowChatFallbackFrom(off), false, `"${off}" should leave it off`);
+  }
+
+  const allowed = loadBrainConfig({ envPath: tempEnv(t, `${FULL_ENV}GANYU_ALLOW_CHAT_FALLBACK=1\n`) });
+  assert.equal(allowed.allowChatFallback, true);
+  assert.equal(allowed.enabled, true, 'and it is not a required key either way');
+  assert.ok(!REQUIRED_KEYS.includes('GANYU_ALLOW_CHAT_FALLBACK'));
+});
+
 test('parseEnvFile skips blanks and comments and keeps `=` inside a value', () => {
   assert.deepEqual(parseEnvFile('# c\n\nA=1\nB=x=y\n  C  =  z  \n=novalue\n'), {
     A: '1',
@@ -171,9 +204,34 @@ test('parseEnvFile skips blanks and comments and keeps `=` inside a value', () =
 
 // ---------------------------------------------------------------- routing
 
-test('a 404 on /v1/responses falls back to chat completions, and is remembered', async () => {
-  const fetchImpl = scriptedFetch(reply(404, {}), chatOk('Understood, Kahweng.'));
+test('a 404 on /v1/responses does not quietly fall back — chat completions is opt-in', async () => {
+  // The defect this guards. On the owner's proxy a `system` message does not
+  // displace the injected "You are Codex, a coding agent" prompt the way
+  // `instructions` does — it is prepended to it (4,421 input tokens against 27),
+  // so a reply from that route is written by a coding agent wearing her name.
+  // That is worse than the canned line, so it is treated as a failure and not as
+  // a second route, and it degrades *silently*, which is why the default is off.
+  const fetchImpl = scriptedFetch(reply(404, {}));
   const brain = createBrain({ config: CONFIG, fetchImpl });
+
+  assert.equal(await brain.requestLine({ detail: DETAIL, summary: SUMMARY }), null, 'the canned line instead');
+  assert.deepEqual(fetchImpl.urls(), [`${CONFIG.baseUrl}${ROUTES.responses}`], 'chat completions was never asked');
+  assert.equal(brain.stats().route, null, 'and nothing was remembered');
+
+  // Declining the fallback is not a kill switch the way a 401 is: a missing
+  // /v1/responses is usually a restart or a deploy, and the next request should
+  // find it back rather than the pet having given up for the evening.
+  assert.equal(brain.isEnabled(), true);
+  assert.equal(await brain.requestChat({ text: 'still there?' }), null);
+  assert.deepEqual(fetchImpl.urls(), [
+    `${CONFIG.baseUrl}${ROUTES.responses}`,
+    `${CONFIG.baseUrl}${ROUTES.responses}`,
+  ], 'it probes the preferred route again');
+});
+
+test('GANYU_ALLOW_CHAT_FALLBACK on restores the 404 fallback, and it is remembered', async () => {
+  const fetchImpl = scriptedFetch(reply(404, {}), chatOk('Understood, Kahweng.'));
+  const brain = createBrain({ config: ALLOW_CHAT, fetchImpl });
 
   assert.equal(await brain.requestLine({ detail: DETAIL, summary: SUMMARY }), 'Understood, Kahweng.');
   assert.deepEqual(fetchImpl.urls(), [
@@ -185,6 +243,48 @@ test('a 404 on /v1/responses falls back to chat completions, and is remembered',
   assert.equal(fetchImpl.calls.length, 3, 'the second call does not re-probe /v1/responses');
   assert.equal(fetchImpl.urls()[2], `${CONFIG.baseUrl}${ROUTES.chat}`);
   assert.equal(brain.stats().route, 'chat');
+});
+
+test('either way the route decision is logged, once, naming what it costs', async () => {
+  // Both outcomes are invisible from the outside — a canned line looks like an
+  // ordinary quiet moment, a degraded one like the brain having a bad day — so
+  // the log is the only place a future session can find out which happened.
+  const declinedLog = recorder();
+  const declined = createBrain({
+    config: CONFIG,
+    fetchImpl: scriptedFetch(reply(404, {})),
+    log: declinedLog,
+  });
+  await declined.requestLine({ detail: DETAIL });
+  await declined.requestLine({ detail: DETAIL });
+  await declined.requestChat({ text: 'hello?' });
+
+  const refusals = declinedLog.lines.filter((l) => l.includes('fallback is off'));
+  assert.equal(refusals.length, 1, 'said once per process, not once per request');
+  assert.match(refusals[0], /coding-agent system prompt/, 'names the consequence');
+  assert.match(refusals[0], /prepended to it, never substituted/, 'and why the persona cannot displace it');
+  assert.match(refusals[0], /4,400 input tokens per request against 27/, 'and what it costs');
+  assert.match(refusals[0], /GANYU_ALLOW_CHAT_FALLBACK=1/, 'and how to turn it on anyway');
+
+  const usedLog = recorder();
+  const used = createBrain({
+    config: ALLOW_CHAT,
+    fetchImpl: scriptedFetch(reply(404, {}), chatOk('Noted.')),
+    log: usedLog,
+  });
+  await used.requestLine({ detail: DETAIL });
+  await used.requestLine({ detail: DETAIL });
+
+  const warnings = usedLog.lines.filter((l) => l.includes('falling back to /v1/chat/completions'));
+  assert.equal(warnings.length, 1, 'opting in is warned about once too, not silently accepted');
+  assert.match(warnings[0], /her persona sits\s+underneath it/, 'names the consequence');
+  assert.match(warnings[0], /sounding like a coding agent, this is why/, 'and the symptom to look for');
+
+  // Neither line is allowed to carry the endpoint or the key, like every other.
+  for (const line of [...declinedLog.lines, ...usedLog.lines]) {
+    assert.ok(!line.includes(CONFIG.apiKey), `leaked the key: ${line}`);
+    assert.ok(!line.includes(CONFIG.baseUrl), `leaked the endpoint: ${line}`);
+  }
 });
 
 test('the responses route is used first and its shorthand output_text is read', async () => {
@@ -352,11 +452,32 @@ test('the responses request body carries store:false, the model and both prompt 
   assert.equal(init.headers.authorization, `Bearer ${CONFIG.apiKey}`);
 });
 
+test('both output caps leave real room for a reasoning item, not just for the line', async () => {
+  // Measured live: an ambient line is ~60 output tokens and a chat reply ~62.
+  // On the Responses API a reasoning item is billed against the same cap, so a
+  // cap sized for the line alone can be spent entirely on thinking and come back
+  // empty — which resolves to null and shows the canned line with nothing in the
+  // log to explain it. These are ceilings, not spends; the 10s abort is what
+  // bounds latency.
+  const MEASURED_LINE_TOKENS = 62;
+
+  const ambient = scriptedFetch(responsesOk('Noted.'));
+  await createBrain({ config: CONFIG, fetchImpl: ambient }).requestLine({ detail: DETAIL });
+  const ambientCap = ambient.calls[0].body.max_output_tokens;
+
+  const chat = scriptedFetch(responsesOk('Noted.'));
+  await createBrain({ config: CONFIG, fetchImpl: chat }).requestChat({ text: 'how did it go?' });
+  const chatCap = chat.calls[0].body.max_output_tokens;
+
+  assert.ok(ambientCap - MEASURED_LINE_TOKENS >= 500, `only ${ambientCap - MEASURED_LINE_TOKENS} left to think in`);
+  assert.ok(chatCap > ambientCap, 'a chat reply is 100 characters longer, so its cap is larger');
+});
+
 test('the responses body asks for low reasoning effort, and the chat body never does', async () => {
   // Measured on the owner's endpoint: `low` answered in 3.0s against 5.5s, and
   // wrote better lines. Chat completions has no such parameter at all.
   const fetchImpl = scriptedFetch(reply(404, {}), chatOk('Noted.'));
-  const brain = createBrain({ config: CONFIG, fetchImpl });
+  const brain = createBrain({ config: ALLOW_CHAT, fetchImpl });
   await brain.requestLine({ detail: DETAIL });
 
   assert.deepEqual(fetchImpl.calls[0].body.reasoning, { effort: 'low' });
@@ -446,8 +567,11 @@ test('GANYU_SEE_PROMPTS off strips his prompt text at the network boundary', asy
 });
 
 test('the chat-completions body carries the same prompt as system + user', async () => {
+  // Still covered, and still exactly this shape, because the route is one key
+  // away from being live — and on an endpoint that is not this proxy it is an
+  // ordinary fallback rather than a degraded one.
   const fetchImpl = scriptedFetch(reply(405, {}), chatOk('Noted.'));
-  const brain = createBrain({ config: CONFIG, fetchImpl });
+  const brain = createBrain({ config: ALLOW_CHAT, fetchImpl });
   await brain.requestLine({ detail: DETAIL, summary: SUMMARY });
 
   const { body } = fetchImpl.calls[1];
@@ -616,7 +740,7 @@ test('the chat backstop still cuts a runaway reply, at a word boundary', async (
 
 test('the chat path follows the same transport rules as the ambient one', async () => {
   const fetchImpl = scriptedFetch(reply(404, {}), chatOk('Of course.'));
-  const brain = createBrain({ config: CONFIG, fetchImpl });
+  const brain = createBrain({ config: ALLOW_CHAT, fetchImpl });
 
   assert.equal(await brain.requestChat({ text: 'busy?' }), 'Of course.');
   assert.deepEqual(fetchImpl.urls(), [

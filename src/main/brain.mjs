@@ -58,6 +58,31 @@ export const MAX_CHAT_LINE_CHARS = 240;
  * sets `wire_api = "responses"`), but it serves chat completions too — probed
  * live, both answer 401 unauthenticated, so both exist. Try the native one
  * first and fall back only on 404/405, i.e. "this route is not here".
+ *
+ * **The two routes are not interchangeable on this endpoint, and the difference
+ * is not a general truth about chat-completions APIs — it is a measured property
+ * of this proxy.** Probed live against `api.api2cn.com`, same model, same
+ * prompt, counting the input tokens it reported back:
+ *
+ * | Request                                        | Input tokens |
+ * |------------------------------------------------|--------------|
+ * | `/v1/responses`, no `instructions`              | 4,434        |
+ * | `/v1/responses`, with `instructions`            | 27           |
+ * | `/v1/chat/completions`, with a `system` message | 4,421        |
+ *
+ * The proxy injects a ~21,000-character "You are Codex, a coding agent" system
+ * prompt of its own. On the Responses route `instructions` **replaces** it
+ * outright — which is why the same request costs 27 tokens instead of 4,434. On
+ * the chat-completions route a `system` message is only **prepended** to it, so
+ * the injection survives and sits *above* Ganyu's persona, where nothing she is
+ * told about herself can displace it. Answering from that route means answering
+ * as a coding agent wearing a Ganyu hat, at roughly 160x the input tokens.
+ *
+ * That is worse than the canned MESSAGES line this module already falls back to,
+ * so it is treated as a failure mode rather than as a second route: see
+ * `GANYU_ALLOW_CHAT_FALLBACK` and `exchange`. The route stays listed here — it
+ * exists, and on an endpoint that is *not* this proxy it is an ordinary
+ * fallback — but reaching it takes an explicit key.
  */
 export const ROUTES = Object.freeze({
   responses: '/v1/responses',
@@ -66,22 +91,49 @@ export const ROUTES = Object.freeze({
 const ROUTE_ORDER = ['responses', 'chat'];
 
 /**
- * Generous because on the Responses API reasoning tokens are charged against
- * this budget too — a cap tight enough for a 140-char line can be spent
- * entirely on reasoning and return empty output. The line itself measured at
- * most 62 tokens live, so this is headroom for the thinking, not for the line;
- * it is a ceiling, not a spend, and lowering it only buys empty replies.
+ * The two things a future debugging session needs to find in the log, written
+ * out in full because by the time either matters the measurement above will be
+ * a year old and nobody will remember it. Each is said at most once per process
+ * (`sayOnce`). Neither carries a config value: the route paths are constants,
+ * and the endpoint and the key appear in neither.
  */
-const MAX_OUTPUT_TOKENS = 300;
+const CHAT_FALLBACK_DECLINED =
+  'brain: /v1/responses is not answering and the chat-completions fallback is off, '
+  + 'so this is a canned line rather than a generated one. On this endpoint '
+  + '/v1/chat/completions cannot displace the proxy\'s injected coding-agent system '
+  + 'prompt — a system message is prepended to it, never substituted for it — so she '
+  + 'would answer as a coding agent wearing her name, at ~4,400 input tokens per '
+  + 'request against 27. Set GANYU_ALLOW_CHAT_FALLBACK=1 in .env.local to allow it anyway.';
+
+const CHAT_FALLBACK_IN_USE =
+  'brain: falling back to /v1/chat/completions, because GANYU_ALLOW_CHAT_FALLBACK is set. '
+  + 'Measured on the owner\'s proxy: this route cannot displace the injected coding-agent '
+  + 'system prompt — a system message is only prepended to it — so her persona sits '
+  + 'underneath it and her register will drift, and input cost rises to ~4,400 tokens per '
+  + 'request against 27 on /v1/responses. If she starts sounding like a coding agent, this is why.';
 
 /**
- * The same headroom logic for chat: the reply itself is at most ~60 tokens, and
- * the rest is the reasoning budget the Responses API bills against this cap. A
- * chat reply is a real question answered rather than a remark made, so it is
- * given more room to think in — and, as above, this is a ceiling and not a
- * spend.
+ * Both caps are one number: a shared reasoning headroom, plus that path's own
+ * line allowance. On the Responses API a reasoning item is billed against
+ * `max_output_tokens` alongside the text, so a cap sized for the line alone can
+ * be spent entirely on thinking and return empty output — which arrives here as
+ * a blank string, resolves to null, and shows the canned line with nothing in
+ * the log to say why. The line is the small half: measured live, an ambient
+ * remark is ~60 output tokens and a chat reply ~62.
+ *
+ * They were 300 and 500 and the ambient one was tight — 240 tokens of headroom
+ * for a reasoning item that a `low`-effort model can spend several hundred on,
+ * with no room left over if a `function_call` item is ever added beside it. The
+ * caps are ceilings and not spends, and the 10s `AbortController` already bounds
+ * the latency, so the only thing raising them costs is the reasoning that today
+ * gets truncated into an empty reply — which is a thing worth paying for, since
+ * the alternative is not a cheaper line but no line at all.
+ *
+ * The two differ only because the lines do: 140 characters against 240 (see
+ * MAX_BRAIN_LINE_CHARS / MAX_CHAT_LINE_CHARS), which is ~40 tokens against ~70.
  */
-const MAX_CHAT_OUTPUT_TOKENS = 500;
+const MAX_OUTPUT_TOKENS = 600;
+const MAX_CHAT_OUTPUT_TOKENS = 700;
 
 /** What each request kind asks for and what it will accept back. */
 const AMBIENT_LIMITS = Object.freeze({ maxChars: MAX_BRAIN_LINE_CHARS, maxTokens: MAX_OUTPUT_TOKENS });
@@ -118,6 +170,33 @@ const NO_REASONING = new Set(['none', 'off', 'default', '']);
 const FALSEY = new Set(['0', 'false', 'no', 'off', 'never', '']);
 export const seePromptsFrom = (value) =>
   value == null || !FALSEY.has(String(value).trim().toLowerCase());
+
+/**
+ * `GANYU_ALLOW_CHAT_FALLBACK` in `.env.local` — whether a missing
+ * `/v1/responses` may be answered from `/v1/chat/completions` instead.
+ * **Default off**, and it is the one switch here that defaults the strict way.
+ *
+ * The measurement behind that is next to ROUTE_ORDER: on the owner's proxy the
+ * chat route cannot displace the injected coding-agent system prompt, so a reply
+ * from it is written by a coding agent underneath a Ganyu hat, at ~160x the
+ * input tokens. This module's whole contract is that the brain is *never worse*
+ * than the canned MESSAGES line — so on this endpoint the fallback fails that
+ * test, and the honest thing to do with it is what is already done with a
+ * timeout or a 500: return null and let her say a canned line, which is at least
+ * hers. Silently degrading her into a coding agent is the one failure mode the
+ * owner would not be able to see.
+ *
+ * It is a key rather than a deletion because the defect is the *proxy's*, not
+ * the route's: pointed at an ordinary OpenAI-compatible server that has no
+ * Responses API at all, the fallback is exactly right, and turning it back on
+ * is one line in `.env.local`.
+ *
+ * Only these spellings turn it on. Everything else, including a missing key, an
+ * empty one and an unparseable one, leaves it off.
+ */
+const TRUTHY = new Set(['1', 'true', 'yes', 'on', 'allow']);
+export const allowChatFallbackFrom = (value) =>
+  value != null && TRUTHY.has(String(value).trim().toLowerCase());
 
 /** Minimal KEY=VALUE parser: blank lines and `#` comments skipped, values trimmed. */
 export function parseEnvFile(text) {
@@ -160,6 +239,7 @@ export function loadBrainConfig({ envPath } = {}) {
     apiKey: env.GANYU_OPENAI_API_KEY,
     reasoningEffort: env.GANYU_OPENAI_REASONING_EFFORT || DEFAULT_REASONING_EFFORT,
     seePrompts: seePromptsFrom(env.GANYU_SEE_PROMPTS),
+    allowChatFallback: allowChatFallbackFrom(env.GANYU_ALLOW_CHAT_FALLBACK),
   };
 }
 
@@ -226,6 +306,11 @@ export function createBrain({
   // Absent means on: a brain constructed from a hand-built config in a test, or
   // from a `.env.local` written before the key existed, behaves as he asked.
   const seePrompts = config?.seePrompts !== false;
+  // And this one absent means off, for the opposite reason: `loadBrainConfig`
+  // has already turned the key into a boolean, so anything else reaching here —
+  // a hand-built config, a `.env.local` written before the key existed — is a
+  // config that never opted in.
+  const allowChatFallback = config?.allowChatFallback === true;
 
   // A brain with nothing to call is born disabled rather than special-cased at
   // every call site: speech treats "returns null forever" identically to absent.
@@ -259,6 +344,19 @@ export function createBrain({
     } catch {
       /* a broken logger must not break the pet */
     }
+  };
+
+  /**
+   * Said once per process, for the things that are true from now on rather than
+   * true this once. A route decision repeats on every single request, and a
+   * warning printed every ten seconds is one a reader scrolls past — which would
+   * defeat the entire point of printing it.
+   */
+  const said = new Set();
+  const sayOnce = (level, tag, message) => {
+    if (said.has(tag)) return;
+    said.add(tag);
+    say(level, message);
   };
 
   function bodyFor(kind, instructions, input, limits) {
@@ -360,10 +458,30 @@ export function createBrain({
    * request kinds so the transport rules — route order, the remembered route, a
    * 404/405 meaning "try the next one", a 401/403 disabling the brain outright —
    * are written once and cannot drift apart between them.
+   *
+   * `/v1/responses` is the preferred route and always the first one tried. The
+   * gate below is the only asymmetry: reaching chat completions takes an
+   * explicit opt-in, and either way it is said out loud, because both outcomes
+   * are otherwise invisible — a canned line looks like an ordinary quiet moment,
+   * and a degraded one looks like the brain simply having a bad day.
+   *
+   * A declined fallback deliberately does **not** disable the brain the way a
+   * 401 does: `/v1/responses` going missing is usually a proxy restart or a
+   * deploy, and the next request should find it back. The warning is what stops
+   * that costing a log line every ten seconds.
    */
   async function exchange(instructions, input, limits) {
     const order = route ? [route, ...ROUTE_ORDER.filter((r) => r !== route)] : ROUTE_ORDER;
     for (const kind of order) {
+      if (kind === 'chat') {
+        if (!allowChatFallback) {
+          sayOnce('warn', 'chat-declined', CHAT_FALLBACK_DECLINED);
+          return null;
+        }
+        // Before the request, not after it: the input tokens are spent on the
+        // way out, so a 500 from this route has already cost what it costs.
+        sayOnce('warn', 'chat-in-use', CHAT_FALLBACK_IN_USE);
+      }
       const verdict = await attempt(kind, instructions, input, limits);
       if (verdict.absent) continue;
       if (verdict.fatal) {
