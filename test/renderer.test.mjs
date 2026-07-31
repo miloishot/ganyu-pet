@@ -1874,6 +1874,82 @@ test('dispose closes an open chat and hands focusability back', async () => {
   assert.equal(h.g.calls.setInteractive.at(-1), false);
 });
 
+// ---------------------------------------------------------------------------
+// chat — the same audit the menu failed
+// ---------------------------------------------------------------------------
+
+test('the input strip does not share the menu\'s dead exits, because it lifts focus', async () => {
+  // The audit, pinned. The menu's Escape and blur handlers were unreachable
+  // because the window is focusable:false. The strip is not in that position and
+  // never was: `openChat` asks main to make the window focusable and focuses the
+  // field, which is precisely what makes a keydown and a blur real events here.
+  // Three independent ways out, none of them the mouse-only one the menu was
+  // left with. If a future change stops lifting focus, this is the test that
+  // should fail rather than the owner discovering it with a restart.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, chat, chatInput, doc, win } = h.dom;
+
+  const open = () => {
+    canvas.dispatch('click', {});
+    assert.equal(chat.hidden, false);
+    assert.equal(
+      h.g.calls.setFocused.at(-1),
+      true,
+      'the strip is only closable by keyboard because it asked for focus',
+    );
+  };
+
+  open();
+  chatInput.dispatch('keydown', { key: 'Escape' });
+  assert.equal(chat.hidden, true, 'Escape in the field');
+
+  open();
+  doc.dispatch('keydown', { key: 'Escape' });
+  assert.equal(chat.hidden, true, 'Escape anywhere on the page');
+
+  open();
+  win.dispatch('blur');
+  assert.equal(chat.hidden, true, 'clicking into the editor');
+
+  open();
+  doc.dispatch('mousedown', { target: h.dom.menu });
+  assert.equal(chat.hidden, true, 'a mousedown elsewhere on the overlay');
+
+  open();
+  canvas.dispatch('click', {});
+  assert.equal(chat.hidden, true, 'and clicking her toggles it');
+  app.dispose();
+});
+
+test('a click-through overlay is still typeable, which is why the strip is not force-closed', async () => {
+  // The asymmetry, deliberately. `setIgnoreMouseEvents` takes the mouse away and
+  // leaves keyboard focus alone, so a menu on an unlatched window is unusable
+  // while an input strip on one is merely unclickable — he can still type and
+  // still press Escape. Closing it under him would destroy a message to fix
+  // nothing, so the reachability guard covers the menu and stops there.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  const { canvas, chat, chatInput } = h.dom;
+
+  canvas.dispatch('click', {});
+  chatInput.value = 'most of a sentence';
+  app.interactivity.releaseAll();
+
+  assert.equal(app.menu.guard(), false, 'no menu, nothing to sweep up');
+  assert.equal(chat.hidden, false, 'the strip stays');
+  assert.equal(chatInput.value, 'most of a sentence', 'and so does what he wrote');
+
+  // It is still closable by every keyboard route, which is the whole argument.
+  chatInput.dispatch('keydown', { key: 'Escape' });
+  assert.equal(chat.hidden, true);
+  app.dispose();
+});
+
 test('boot no-ops when the chat elements are missing from the page', async () => {
   const dom = makeDom();
   const byId = {

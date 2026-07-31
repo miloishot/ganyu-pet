@@ -84,10 +84,12 @@ Preload exposes exactly:
 - `ganyu.getFlags()` → Promise of `{muted, pinned, spritePath}` (spritePath as `file://` URL for the `<img>`/canvas source).
 - `ganyu.sendChat(text)` → Promise of `{text, audio}` — her reply and, when synthesis beat the hold, the sound of it — or `null` when there is no reply at all. Never rejects, and never outlives the hold: the pending dots cover both the brain writing the line and the synthesizer voicing it, so the reply and its audio come down onto the bubble together (see §Chat, §Voice). The renderer still accepts a bare string, which is what this channel answered before she had a voice.
 - `ganyu.setFocused(bool)` — lifts and restores window focusability so the chat input can take a keystroke (see §Window).
+- `ganyu.setOverlayOpen({menu})` — what the overlay currently has open. Sent on **every** menu open and **every** close path there is, because it is what arms and releases the global Escape hook (see §Dismissing the menu). Coerced to a plain boolean in main: two things hang off this flag and neither may be armed by a truthy accident.
+- `ganyu.onDismiss(cb)` — cb receives `'escape' | 'pointer-left'`, the two dismissals main owns on the overlay's behalf. Filtered against `DISMISS_REASONS` in the renderer exactly as menu actions and drag phases are filtered in main.
 
-Channels (main side): `ganyu:state`, `ganyu:speak`, `ganyu:audio`, `ganyu:set-interactive`, `ganyu:menu`, `ganyu:drag`, `ganyu:get-flags`, `ganyu:chat`, `ganyu:set-focus`. Nothing else.
+Channels (main side): `ganyu:state`, `ganyu:speak`, `ganyu:audio`, `ganyu:dismiss`, `ganyu:set-interactive`, `ganyu:menu`, `ganyu:drag`, `ganyu:overlay-open`, `ganyu:get-flags`, `ganyu:chat`, `ganyu:set-focus`. Nothing else.
 
-The seven main-owned names are in `window.CHANNELS`; the chat pair is named in `chat.CHAT_CHANNELS` and **not** duplicated into `CHANNELS`, because two frozen tables of the same strings is the only way they could drift. `window.registerIpc` registers and disposes the renderer→main half; `state`, `speak` and `audio` are push-only and have nothing to register. The preload hardcodes every string, as it always has — it is CommonJS and cannot import an ESM module.
+The nine main-owned names are in `window.CHANNELS`; the chat pair is named in `chat.CHAT_CHANNELS` and **not** duplicated into `CHANNELS`, because two frozen tables of the same strings is the only way they could drift. `window.registerIpc` registers and disposes the renderer→main half; `state`, `speak`, `audio` and `dismiss` are push-only and have nothing to register. The preload hardcodes every string, as it always has — it is CommonJS and cannot import an ESM module.
 
 **`dragging` and `airborne` ride `ganyu:state` rather than getting channels of their own.** The renderer wants them for the same reasons it already wants `walk` — to choose a sprite row, and to know whether the pointer is doing something to her — and one deduped push is cheaper than three. `toStatePayload(aggregate, walk, motion)` assembles them; both default to false, so a caller that knows nothing about motion produces the original payload plus two falses. They are **not** the same flag: `dragging` ends at the mouseup, `airborne` stays true through the whole throw until she lands.
 
@@ -138,7 +140,31 @@ Three details are load-bearing. It is still **text in the same bubble**, so §Ch
 
 **Every `MENU_ACTIONS` entry needs a `menuLabels()` entry.** `paintMenu` writes only labels it finds, so a missing one is a silently blank button rather than a crash — which is exactly how `home` stayed unreachable for two modules' worth of work while main filtered it through faithfully. `test/renderer.test.mjs` walks the action list against the label table for that reason.
 
-**Interactivity latches.** `createInteractivity` ORs five: `overPet`, `overMenu`, `menuOpen`, `chatOpen`, `dragging`. The last exists because the window chases the cursor during a drag, so on a fast throw it trails behind and the pointer spends most of the gesture off the sprite — without the latch the overlay would go click-through mid-throw and the `mouseup` that ends the drag would land on the desktop. `releaseAll()` drops all five.
+**Interactivity latches.** `createInteractivity` ORs five: `overPet`, `overMenu`, `menuOpen`, `chatOpen`, `dragging`. The last exists because the window chases the cursor during a drag, so on a fast throw it trails behind and the pointer spends most of the gesture off the sprite — without the latch the overlay would go click-through mid-throw and the `mouseup` that ends the drag would land on the desktop. `releaseAll()` drops all five, and in the renderer it is only ever reached through a wrapper that closes the menu and the input strip first — see the invariant below.
+
+### Dismissing the menu
+
+**`focusable: false` silently deletes two of the menu's three exits, and that is what made the pet unusable.** The window is built unfocusable so an always-on-top pet can never take the caret from the editor (§Window), and that flag must stay. What nobody wrote down is its consequence for input: a window that never takes focus receives **no key events**, so the renderer's `keydown` handler cannot see Escape; and a window that cannot be focused cannot be **blurred**, so its `blur` handler never fires either. Both of the menu's keyboard-shaped exits were dead from the day they were written. The chat strip is exempt only because `openChat` lifts focusability first — that lift is precisely what makes its Escape and blur real.
+
+A third exit was dead for an unrelated reason. On Windows the right button fires `mousedown` **before** `contextmenu`, and the document-level mousedown handler closed the menu on that mousedown — so `canvas.contextmenu` then found it hidden and opened it straight back up. Right-clicking her to dismiss the menu only moved it, and the `else closeMenu()` branch could never run. The renderer's fake DOM does not bubble, which is why the toggle test passed against a toggle that could not work; the replacement test dispatches the document mousedown explicitly.
+
+**Five ways out, and no single one of them is load-bearing:**
+
+| Route | Owner | Note |
+|---|---|---|
+| Click a menu entry | renderer | acts, then closes |
+| Right-click anywhere on the menu | renderer | a toggle is what a right-click implies; this used to `preventDefault()` and stop |
+| Right-click or left-click the sprite | renderer | the sprite is exempt from the document mousedown rule, so the canvas handlers own the whole gesture. A click that dismisses the menu is **spent**: it does not also open the chat strip |
+| Escape | **main** | `createEscapeHatch` — a `globalShortcut` registered on menu open and unregistered on close |
+| Pointer left the window for `MENU_LEAVE_GRACE_MS` | **main** | `createLeaveWatch`, on the existing hover poll |
+
+**The Escape hook is a loan, not a fixture.** While registered it takes Escape from the whole machine, so it is armed only between the menu opening and the menu closing, and released by: the renderer reporting the close (every close path calls `setOverlayOpen({menu:false})`), the pointer-leave grace expiring, the renderer reloading (`did-finish-load`), the renderer dying (`render-process-gone`), the window closing, and `will-quit` → `cleanup()`. It also **releases itself the instant it fires**, before the renderer is told anything — a wedged renderer must not be able to keep Escape. A failed `unregister` still clears the armed flag, because believing we are armed would make the next `arm()` a no-op, and *that* is how a stale hook would outlive its menu. Registration returning false (another app owns Escape) is a warning, not a failure: the other four routes stand.
+
+**`MENU_LEAVE_GRACE_MS` is 1200** — ten samples at `HOVER_POLL_MS`, so a single stray cursor reading cannot trip it. Travelling between the sprite and the menu cannot start the clock **at all**, because both live inside the same 256×320 window and the cursor never leaves it on that journey; the guarantee is structural, not a generous timeout. A cursor or bounds reading that could not be taken counts as *inside* — an unknown is not evidence he walked away. Read from the cursor poll rather than a renderer `mouseleave`, for the reason `createHoverWatch` already documents.
+
+**The invariant: the menu may never outlive the latch that makes it reachable.** A visible menu on a click-through window is painted, unclickable, un-hoverable, and has no event left that could ever close it — the exact state that costs a restart. `guardMenuReachable()` closes it instead, and runs on the frame loop and on every `ganyu:state` push (two carriers because neither is sufficient alone: the frame loop does not exist when the spritesheet failed to load, and state pushes are deduped).
+
+**The input strip is deliberately not covered by that guard, and the asymmetry is the point.** `setIgnoreMouseEvents` takes the mouse and leaves keyboard focus alone, so a menu on an unlatched window is unusable while an input strip on one is merely unclickable — he can still type into it and still press Escape. Force-closing it would destroy a half-written message to fix nothing. For the same reason `'pointer-left'` never touches the strip (he walks the cursor off a 256px window constantly while typing), and `'escape'` is layered: with a menu up it takes the menu and leaves the message alone.
 
 ### Drag (module A — `createDragTracker` in `window.mjs`)
 
