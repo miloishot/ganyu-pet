@@ -15,12 +15,14 @@ const subscribe = (channel, cb) => {
 
 contextBridge.exposeInMainWorld('ganyu', {
   onState: (cb) => subscribe('ganyu:state', cb),
+  /** `{text, audio?}` — one line, with her voice when it arrived in time. */
   onSpeak: (cb) => subscribe('ganyu:speak', cb),
   /**
-   * Her voice: `{mime, base64}` for a line already on `ganyu:speak`. A separate
-   * channel because it arrives a second or so later — synthesis is not allowed
-   * to delay the bubble — and main sends it only for lines that passed the same
-   * mute and salience gates the bubble did.
+   * Her voice: `{mime, base64}` for a line already shown. Now the exception
+   * rather than the rule — audio normally rides on `ganyu:speak` beside its own
+   * words. This channel is what is left when the words could not wait: an urgent
+   * kind, and any line whose synthesis overran main's hold. Main sends it only
+   * for lines that passed the same mute and salience gates the bubble did.
    */
   onAudio: (cb) => subscribe('ganyu:audio', cb),
   setInteractive: (interactive) => ipcRenderer.send('ganyu:set-interactive', Boolean(interactive)),
@@ -33,7 +35,11 @@ contextBridge.exposeInMainWorld('ganyu', {
    */
   drag: (phase) => ipcRenderer.send('ganyu:drag', String(phase)),
   getFlags: () => ipcRenderer.invoke('ganyu:get-flags'),
-  /** Owner -> Ganyu. Resolves to her reply, or null when there isn't one. */
+  /**
+   * Owner -> Ganyu. Resolves `{text, audio}` — her reply and, when synthesis
+   * beat main's hold, the sound of it, so the strip can show and play them in
+   * one tick. Null when there is no reply at all.
+   */
   sendChat: (text) => ipcRenderer.invoke('ganyu:chat', String(text ?? '')),
   /**
    * The window is created focusable:false so it never steals focus from the

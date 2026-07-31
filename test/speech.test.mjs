@@ -242,8 +242,11 @@ test('a throttled line is dropped, not queued', () => {
   assert.deepEqual(h.lines.map((l) => l.kind), ['greeting']);
   // A stale status is worse than none, so there is no queue and no timer to flush.
   assert.deepEqual(Object.keys(h.speech.stats()).sort(), [
-    'failStreak', 'lastKind', 'lastMode', 'lastNotableAt', 'lastSpokeAt',
+    'failStreak', 'holding', 'lastKind', 'lastMode', 'lastNotableAt', 'lastSpokeAt',
   ]);
+  // `holding` is the one slot that can delay a line, and only ever for its own
+  // audio: a line she refused makes no bubble, so there is nothing to hold.
+  assert.equal(h.speech.stats().holding, false);
 });
 
 test('a spoken interrupt still restarts the throttle for ordinary kinds', () => {

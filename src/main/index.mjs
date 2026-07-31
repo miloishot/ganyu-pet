@@ -75,6 +75,9 @@ function userDataFile(name) {
 const VAULT_PROJECTS = path.join(os.homedir(), 'second-brain', '03 Projects');
 const PROJECT_MAP = path.join(os.homedir(), '.claude', 'hooks', 'projects.tsv');
 
+/** Where Claude Code keeps its session transcripts, one folder per mangled cwd. */
+const CLAUDE_PROJECTS = path.join(os.homedir(), '.claude', 'projects');
+
 /**
  * The topic-shaped vaults, which are not session logs and so need topics.mjs
  * rather than vault.mjs. Absent directories are skipped silently — he does not
@@ -306,45 +309,103 @@ function pushState(force = false) {
 }
 
 /**
- * Push one line's audio to the renderer. `mime` and `base64` only — the rest of
- * what voice.mjs returns (byte count, latency, which synthesizer) is for the log
- * and for `stats()`, and there is no reason to ship it across the bridge.
+ * One synthesis, trimmed to what the renderer needs. `mime` and `base64` only —
+ * the rest of what voice.mjs returns (byte count, latency, which synthesizer) is
+ * for the log and for `stats()`, and there is no reason to ship it across the
+ * bridge. Null for anything unplayable, which is how every caller tells whether
+ * it has a voice to send.
  */
-function sendAudio(audio) {
-  if (!audio || typeof audio.base64 !== 'string' || audio.base64 === '') return;
+function audioPayload(audio) {
+  if (!audio || typeof audio.base64 !== 'string' || audio.base64 === '') return null;
   if (process.env.GANYU_DEBUG === '1') {
     console.log(`[ganyu][voice] ${audio.source} ${audio.bytes}B in ${audio.ms}ms`);
   }
-  send(CHANNELS.audio, { mime: audio.mime, base64: audio.base64 });
+  return { mime: audio.mime, base64: audio.base64 };
 }
 
 /**
- * Say a chat reply out loud. The ambient path does not come through here — it
- * hangs off speech.mjs's `show()` gate, which is the only thing allowed to
- * decide that a line is worth making a sound about. A reply needs no such gate:
- * he asked, so it is wanted by construction. Mute is checked twice, before and
- * after synthesis, for the same reason speech.mjs checks it late — a second
- * passes in between and he may have reached for the menu.
+ * Push audio for a line the renderer has *already* shown — an urgent kind, or
+ * one whose synthesis overran the hold. Audio that arrived in time never comes
+ * through here; it rides on `ganyu:speak` beside the words it belongs to.
  */
-async function speakReply(text) {
-  if (!voice || flags.muted) return;
-  try {
-    const audio = await voice.speak(text, { kind: 'chat' });
-    if (audio && !flags.muted) sendAudio(audio);
-  } catch (err) {
-    console.warn('[ganyu] voice failed:', err?.message);
-  }
+function sendAudio(audio) {
+  const payload = audioPayload(audio);
+  if (payload) send(CHANNELS.audio, payload);
+}
+
+/**
+ * The reply hold, in milliseconds. Module D owns the number and the reasoning
+ * behind it (`AUDIO_HOLD_MS` in speech.mjs); this is a mirror so the two paths
+ * cannot drift, with the literal repeated exactly once as the value used when
+ * module D is missing entirely — in which case there are no ambient lines at
+ * all, but the chat path still needs a deadline.
+ */
+let replyHoldMs = 3_500;
+
+/**
+ * Say a chat reply out loud, and hand the audio *back* rather than pushing it.
+ *
+ * The ambient path does not come through here — it hangs off speech.mjs's
+ * `show()` gate, which is the only thing allowed to decide that a line is worth
+ * making a sound about. A reply needs no such gate: he asked, so it is wanted by
+ * construction.
+ *
+ * Resolves the audio when synthesis beats `replyHoldMs`, so `handleChat` can
+ * return the words and the sound of them together and the strip shows both in
+ * one tick. Resolves null when it does not — and in that case the audio is still
+ * sent on `ganyu:audio` when it finally lands, because a slow endpoint should
+ * cost her the sync and not the voice.
+ *
+ * Never rejects and never outlives the deadline: `handleChat` awaits this, so a
+ * hang here would be a chat strip stuck on the pending dots.
+ *
+ * Mute is checked twice, before and after synthesis, for the same reason
+ * speech.mjs checks it late — seconds pass in between and he may have reached
+ * for the menu.
+ */
+function speakReply(text) {
+  if (!voice || flags.muted) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      settled = true;
+      resolve(null); // deadline: let the words go up on their own
+    }, replyHoldMs);
+    const finish = (audio) => {
+      if (settled) {
+        if (audio && !flags.muted) sendAudio(audio); // late, but still hers
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(flags.muted ? null : audioPayload(audio));
+    };
+    Promise.resolve()
+      .then(() => voice.speak(text, { kind: 'chat' }))
+      .then(finish)
+      .catch((err) => {
+        console.warn('[ganyu] voice failed:', err?.message);
+        finish(null);
+      });
+  });
 }
 
 function sendSpeak(line) {
   const text = typeof line === 'string' ? line : line?.text;
   if (typeof text === 'string' && text.trim()) {
+    // Her voice, when it arrived in time to travel with the words. Module D
+    // holds a line back until this exists (or until it gives up), so the bubble
+    // and the sound reach the renderer in the same message.
+    const audio = audioPayload(line?.audio);
     // The only externally observable proof that a POST /event reached the speech
     // trigger path rather than stopping at the state aggregator.
     if (process.env.GANYU_DEBUG === '1') {
-      console.log(`[ganyu][speak] ${text.trim()}${line?.summary ? ` — ${line.summary}` : ''}`);
+      console.log(
+        `[ganyu][speak] ${text.trim()}${line?.summary ? ` — ${line.summary}` : ''}` +
+          `${audio ? '' : ' (unvoiced)'}`,
+      );
     }
-    send(CHANNELS.speak, { text: text.trim() });
+    send(CHANNELS.speak, audio ? { text: text.trim(), audio } : { text: text.trim() });
   }
 }
 
@@ -580,6 +641,18 @@ async function composeRuntime() {
     });
   }
 
+  /**
+   * The Claude Code transcripts. Only ever the narrative — his asks, the
+   * assistant's prose, what failed — never tool inputs, tool results, diffs or
+   * file contents; sessions.mjs enforces that, this only points at the folder.
+   */
+  let sessions = null;
+  const sessionsMod = await tryImport('./sessions.mjs');
+  if (sessionsMod?.createSessions) {
+    sessions = sessionsMod.createSessions({ fs, projectsDir: CLAUDE_PROJECTS, cwd: agentCwd });
+    console.log(`[ganyu] sessions: ${sessions.enabled ? 'readable' : 'disabled'}`);
+  }
+
   let topics = null;
   const topicsMod = await tryImport('./topics.mjs');
   if (topicsMod?.createTopics) {
@@ -621,6 +694,13 @@ async function composeRuntime() {
         // absent when the ledger has no file to read.
         searchMemory: ledger?.enabled && typeof ledger.search === 'function'
           ? (args) => ledger.search(args)
+          : null,
+        // Her second tool: the narrative of a past coding session, so "what did
+        // that GolfCRM session actually do" is answered from the transcript
+        // rather than from filenames. A function rather than the module, for the
+        // same reason as searchMemory — brain.mjs imports neither.
+        readSession: sessions?.enabled && typeof sessions.read === 'function'
+          ? (args) => sessions.read(args)
           : null,
       });
       console.log(`[ganyu] brain: enabled (model ${brainConfig.model})`);
@@ -685,6 +765,8 @@ async function composeRuntime() {
   }
 
   const speechMod = await tryImport('./speech.mjs');
+  // One deadline for both paths — see replyHoldMs.
+  if (Number.isFinite(speechMod?.AUDIO_HOLD_MS)) replyHoldMs = speechMod.AUDIO_HOLD_MS;
   if (speechMod?.createSpeech) {
     const speech = speechMod.createSpeech({
       clock,
@@ -940,11 +1022,10 @@ async function main() {
     // Read per message, not captured: composeRuntime builds `chat` below, after
     // this runs. Anything he types before then answers null instead of rejecting.
     getChat: () => chat,
-    // And her half of it, said out loud. Fire-and-forget: the reply is already
-    // on its way back to the strip before this starts.
-    onReply: (line) => {
-      speakReply(line);
-    },
+    // And her half of it, said out loud. No longer fire-and-forget: the reply
+    // waits for its own voice (bounded by replyHoldMs) so the strip can show the
+    // words and play them together, with the pending dots covering the wait.
+    onReply: (line) => speakReply(line),
   });
 
   try {

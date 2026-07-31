@@ -126,6 +126,36 @@ function makeInput(id) {
   return input;
 }
 
+/**
+ * The <audio> element she is played through — the four members
+ * `createVoicePlayer` touches, and a log of every source it was handed. Present
+ * in the harness because her voice now arrives *with* her words rather than
+ * seconds behind them, so "did the bubble and the sound happen together" is a
+ * question this file has to be able to ask.
+ */
+function makeAudioEl() {
+  const el = makeEl('voice', {
+    played: [],
+    pauses: 0,
+    loads: 0,
+    src: '',
+    pause() {
+      el.pauses += 1;
+    },
+    play() {
+      el.played.push(el.src);
+      return Promise.resolve();
+    },
+    load() {
+      el.loads += 1;
+    },
+    removeAttribute() {
+      el.src = '';
+    },
+  });
+  return el;
+}
+
 function makeDom() {
   const canvas = makeCanvas();
   const bubble = makeEl('bubble');
@@ -144,14 +174,15 @@ function makeDom() {
   chat.hidden = true;
   chat.children = [chatInput];
   const documentElement = makeEl('html', { clientWidth: 256, clientHeight: 320 });
-  const byId = { pet: canvas, bubble, menu, chat, 'chat-input': chatInput };
+  const voice = makeAudioEl();
+  const byId = { pet: canvas, bubble, menu, chat, 'chat-input': chatInput, voice };
   const doc = makeEl('#document', {
     documentElement,
     readyState: 'complete',
     getElementById: (id) => byId[id] || null,
   });
   const win = makeEl('#window', { devicePixelRatio: 1 });
-  return { canvas, bubble, menu, chat, chatInput, documentElement, doc, win };
+  return { canvas, bubble, menu, chat, chatInput, voice, documentElement, doc, win };
 }
 
 /**
@@ -163,6 +194,7 @@ function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
   const calls = { setInteractive: [], menuAction: [], getFlags: 0, sendChat: [], setFocused: [], drag: [] };
   let stateCb = null;
   let speakCb = null;
+  let audioCb = null;
   return {
     calls,
     get stateCb() {
@@ -170,6 +202,10 @@ function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
     },
     get speakCb() {
       return speakCb;
+    },
+    /** The late-audio channel: a line already on screen, catching up with itself. */
+    get audioCb() {
+      return audioCb;
     },
     api: {
       onState(cb) {
@@ -182,6 +218,12 @@ function makeGanyu(flagsPromise, { reply = 'Of course.' } = {}) {
         speakCb = cb;
         return () => {
           speakCb = null;
+        };
+      },
+      onAudio(cb) {
+        audioCb = cb;
+        return () => {
+          audioCb = null;
         };
       },
       setInteractive(v) {
@@ -949,6 +991,84 @@ test('speak payloads land in the bubble; junk is ignored', async () => {
   assert.equal(h.dom.bubble.hidden, true, 'dispose clears the bubble');
 });
 
+// ------------------------------------------------ her words and her voice, together
+//
+// Main holds a line back until its audio exists and then sends both in one
+// message, so the renderer's whole job is to paint and play them in the same
+// tick. What is worth testing here is the seam either side of that: the audio
+// must not outlive a line the bubble refused, and it must not be waited for.
+
+const MP3 = { mime: 'audio/mpeg', base64: 'QUJD' };
+
+test('a line arrives with its own audio and both happen in the same tick', async () => {
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.g.speakCb({ text: 'The build is clean.', audio: MP3 });
+
+  assert.equal(h.dom.bubble.textContent, 'The build is clean.');
+  assert.equal(h.dom.bubble.hidden, false);
+  assert.deepEqual(h.dom.voice.played, ['data:audio/mpeg;base64,QUJD'], 'played, not queued');
+  assert.equal(app.voice.playing, true);
+  app.dispose();
+});
+
+test('a line with no audio is still shown, immediately', async () => {
+  // The deadline expired, or the synthesizer is off. Either way she is read.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.g.speakCb({ text: 'The build is clean.' });
+
+  assert.equal(h.dom.bubble.textContent, 'The build is clean.');
+  assert.deepEqual(h.dom.voice.played, []);
+  app.dispose();
+});
+
+test('audio for a line the bubble refused is never heard', async () => {
+  // He asked a question and is reading the answer; a hook line arriving behind
+  // it is dropped by the priority rule. Playing its audio anyway would have her
+  // speaking a sentence that is nowhere on screen.
+  const h = await bootHarness({ reply: 'The tests pass.' });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  h.dom.chatInput.value = 'how did it go?';
+  h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+  assert.equal(h.dom.bubble.textContent, 'The tests pass.');
+  const heard = h.dom.voice.played.length;
+
+  h.g.speakCb({ text: 'Edit finished in ganyu-pet.', audio: MP3 });
+
+  assert.equal(h.dom.bubble.textContent, 'The tests pass.', 'the reply keeps the bubble');
+  assert.equal(h.dom.voice.played.length, heard, 'and the refused line stays silent');
+  app.dispose();
+});
+
+test('late audio still plays, because its line is already up', async () => {
+  // The other half of the rule: an urgent kind shows at once and is voiced when
+  // it can be, so `ganyu:audio` is played on arrival with nothing left to decide.
+  const h = await bootHarness();
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.g.speakCb({ text: 'Claude needs your approval.' });
+  assert.deepEqual(h.dom.voice.played, [], 'shown unvoiced first');
+
+  h.g.audioCb(MP3);
+
+  assert.deepEqual(h.dom.voice.played, ['data:audio/mpeg;base64,QUJD']);
+  app.dispose();
+});
+
 test('a missing or broken spritesheet degrades instead of throwing', async () => {
   for (const spritePath of [undefined, 'file:///broken.webp']) {
     const dom = makeDom();
@@ -1228,6 +1348,67 @@ test('a failed reply replaces the pending dots rather than leaving them hanging'
     );
     app.dispose();
   }
+});
+
+test('the dots carry the audio wait too, and come down onto words and sound at once', async () => {
+  // The one thing that must not happen: the dots being replaced by a blank
+  // pause, or by the reply arriving mute and then talking to itself later. Main
+  // holds the reply until its audio is ready, so the dots cover both waits and
+  // the strip paints and plays in the same tick.
+  const gate = deferred();
+  const h = await bootHarness({ reply: () => gate.promise });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  h.dom.chatInput.value = 'how did the build go?';
+  h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+  assert.equal(h.dom.bubble.textContent, THINKING_MARK, 'still thinking while the voice is made');
+  assert.deepEqual(h.dom.voice.played, [], 'and nothing is playing yet');
+
+  gate.resolve({ text: 'It goes well, thank you.', audio: MP3 });
+  await flush();
+
+  assert.equal(h.dom.bubble.textContent, 'It goes well, thank you.');
+  assert.equal(h.dom.bubble.classList.contains(THINKING_CLASS), false);
+  assert.deepEqual(h.dom.voice.played, ['data:audio/mpeg;base64,QUJD'], 'spoken as it appears');
+  app.dispose();
+});
+
+test('a reply that outran its own audio is still shown, and stays silent', async () => {
+  const h = await bootHarness({ reply: { text: 'It goes well.', audio: null } });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  h.dom.chatInput.value = 'well?';
+  h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+
+  assert.equal(h.dom.bubble.textContent, 'It goes well.');
+  assert.deepEqual(h.dom.voice.played, []);
+  app.dispose();
+});
+
+test('a bare string reply is still understood', async () => {
+  // What the channel answered before she had a voice. Tolerated so a shape
+  // mismatch between main and the renderer costs the sound, not the answer.
+  const h = await bootHarness({ reply: 'It goes well.' });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+
+  h.dom.canvas.dispatch('click', {});
+  h.dom.chatInput.value = 'well?';
+  h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+
+  assert.equal(h.dom.bubble.textContent, 'It goes well.');
+  assert.deepEqual(h.dom.voice.played, []);
+  app.dispose();
 });
 
 test('the pending state is wordless, and the failure line is not', () => {

@@ -136,18 +136,32 @@ export const PET_ID = 'ganyu--chenxin-dlut';
  */
 export const CHANNELS = Object.freeze({
   state: 'ganyu:state',
+  /**
+   * Main -> renderer, `{text, audio?}`. `audio` is `{mime, base64}` and is
+   * present whenever the line's synthesis finished before module D gave up
+   * waiting for it (AUDIO_HOLD_MS) — the renderer shows the words and plays the
+   * sound in the same tick, which is the whole point of the field. Its absence
+   * means the line is unvoiced *so far*, not that it will never be voiced: an
+   * urgent kind, or one whose audio overran the hold, gets its sound on
+   * `audio` below instead.
+   */
   speak: 'ganyu:speak',
   setInteractive: 'ganyu:set-interactive',
   menu: 'ganyu:menu',
   getFlags: 'ganyu:get-flags',
   drag: 'ganyu:drag',
   /**
-   * Main -> renderer, carrying `{mime, base64}` for one line she has just said.
-   * Push-only, like `state` and `speak`, so `registerIpc` has nothing to
-   * register for it. The audio is synthesized in main because that is where the
-   * network and the `.env.local` config already live, and it rides its own
-   * channel rather than `speak` because it arrives a second or so later — the
-   * bubble must never wait for a synthesizer.
+   * Main -> renderer, carrying `{mime, base64}` for a line that is *already on
+   * screen*. Push-only, like `state` and `speak`, so `registerIpc` has nothing
+   * to register for it. The audio is synthesized in main because that is where
+   * the network and the `.env.local` config already live.
+   *
+   * This channel used to carry every line's audio, which is what made her voice
+   * trail her bubble by seconds. It now carries only the two cases where the
+   * words genuinely could not wait: an urgent kind (`waiting`, `failed`), which
+   * must reach him at once and is voiced when it can be, and any line whose
+   * synthesis overran the hold. Everything else arrives on `speak`, beside the
+   * words it belongs to.
    */
   audio: 'ganyu:audio',
 });
@@ -636,14 +650,23 @@ export function registerIpc({
   };
 
   /**
-   * Owner -> Ganyu. Always a string or null; never a rejection, never a hang.
+   * Owner -> Ganyu. Resolves `{text, audio}` for a real reply and plain `null`
+   * for no reply at all; never rejects.
    *
    * `onReply` is where a reply is *spoken*. It hangs here rather than in the
    * renderer because the synthesizer, its config and its socket all live in
-   * main, and it is called after the reply is settled rather than instead of
-   * returning it: the strip must show his answer at chat latency whatever the
-   * voice is doing. It is fire-and-forget for the same reason — a synthesizer
-   * that hangs must not hang the reply.
+   * main. It used to be fire-and-forget, and the answer went back to the strip
+   * the moment the words existed — which is precisely what put her voice one to
+   * four seconds behind her own bubble. Now the reply waits for its audio and
+   * the two cross the bridge together, so the strip can paint the words and play
+   * them in the same tick.
+   *
+   * **What that makes `onReply` responsible for.** It must always settle, and
+   * quickly enough that the pending dots read as thinking rather than as a hang:
+   * the deadline lives there (see `speakReply` in index.mjs), because that is
+   * where the synthesizer and the mute flag already are. Everything this handler
+   * can do about a broken one it does — a throw or a rejection costs the audio
+   * and never the answer.
    */
   const handleChat = async (_event, text) => {
     let chat = null;
@@ -656,14 +679,16 @@ export function registerIpc({
     try {
       const reply = await chat.send(String(text ?? ''));
       const line = typeof reply === 'string' && reply.trim() !== '' ? reply : null;
-      if (line && onReply) {
+      if (!line) return null;
+      let audio = null;
+      if (onReply) {
         try {
-          onReply(line);
+          audio = (await onReply(line)) ?? null;
         } catch {
           /* an unsayable reply is still a reply */
         }
       }
-      return line;
+      return { text: line, audio };
     } catch {
       return null;
     }

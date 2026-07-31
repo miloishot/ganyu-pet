@@ -53,6 +53,31 @@ export const FAILURE_STREAK_STEPS = Object.freeze([1, 3, 5]);
 
 /** How many of her own lines she remembers, and is reminded of, at a time. */
 export const RECENT_LINES = 3;
+
+/**
+ * How long a line waits for its own audio before giving up and showing itself
+ * unvoiced. The bubble and the voice are two halves of one utterance; shipping
+ * the words seconds ahead of the sound is what made her feel broken.
+ *
+ * **Why 3.5s and not the ~500ms the warm socket suggests.** Measured against the
+ * live Edge endpoint on 2026-07-31, twelve of her own lines on one reused socket:
+ * min 396ms, median 2327ms, p90 3090ms, max 4313ms (mean 2183ms). The variance is
+ * the endpoint's, not the connection's — time-to-first-audio-frame alone ranged
+ * 277–2311ms on that same socket. A 2s deadline would expire on roughly half of
+ * all lines, which is a feature that does not work; 3.5s clears p90, so about
+ * nine lines in ten land with their voice.
+ *
+ * **What it is actually protecting against.** Almost nothing waits this out. A
+ * refused socket, a dead endpoint, a socket that dies mid-sentence and a voice
+ * that is switched off all resolve `speak()` to null in milliseconds, so the
+ * common failures show the bubble immediately rather than at the deadline. The
+ * cases this bounds are the two hangs: a connect that never completes
+ * (CONNECT_TIMEOUT_MS, 5s) and a socket that accepts the request and never
+ * answers (SPEAK_TIMEOUT_MS, 10s). Sitting well under both is the point — it is
+ * a floor on how long she may be silent *and* invisible, not a latency budget.
+ */
+export const AUDIO_HOLD_MS = 3_500;
+
 export const INTERRUPT_KINDS = new Set(['waiting', 'failed']);
 
 /** Kinds that are always worth a line: the moments the owner asked to always see. */
@@ -167,8 +192,11 @@ export const projectName = projectFromCwd;
  * createSpeech({clock, onLine, isMuted, random, brain})
  *
  * clock    — {now()} or a () => ms function.
- * onLine   — called synchronously with {text, kind, mode, source, summary};
- *            `text` matches the ganyu:speak payload.
+ * onLine   — called with {text, kind, mode, source, summary, audio?}, which is
+ *            the ganyu:speak payload. Synchronous when there is no voice to wait
+ *            for, and otherwise up to `audioHoldMs` later, carrying the audio it
+ *            waited for — see `show()`. The *decision* to show is always
+ *            synchronous; only the call is deferred.
  * isMuted  — () => bool. Muted means no line at all.
  * random   — injectable for deterministic variant choice in tests.
  * brain    — optional {requestLine({detail, summary})} -> Promise<string|null>.
@@ -180,8 +208,13 @@ export const projectName = projectFromCwd;
  *            original behaviour: she reacts and forgets.
  * voice    — optional {speak(text, {kind})} -> Promise<audio|null> (voice.mjs).
  *            Absent is the original behaviour: she is read, not heard.
- * onAudio  — where that audio goes (module A sends it to the renderer). Called
- *            with {mime, base64, kind, text} some seconds after `onLine`.
+ * onAudio  — where late audio goes (module A sends it to the renderer) for the
+ *            lines that are shown before their sound exists: urgent kinds, and
+ *            any line whose synthesis overran AUDIO_HOLD_MS. Called with
+ *            {mime, base64, kind, text}. Audio that arrives in time does not
+ *            come through here at all — it rides on `onLine` instead.
+ * audioHoldMs — how long a held line waits for its audio. See AUDIO_HOLD_MS.
+ * schedule/cancel — the hold's timer, injectable so tests need no real clock.
  */
 export function createSpeech({
   clock = { now: () => Date.now() },
@@ -193,6 +226,9 @@ export function createSpeech({
   ledger = null,
   voice = null,
   onAudio = () => {},
+  audioHoldMs = AUDIO_HOLD_MS,
+  schedule = (fn, ms) => setTimeout(fn, ms),
+  cancel = (handle) => clearTimeout(handle),
 } = {}) {
   const now = () => (typeof clock === 'function' ? clock() : clock.now());
   const muted = () => (typeof isMuted === 'function' ? Boolean(isMuted()) : Boolean(isMuted));
@@ -207,6 +243,13 @@ export function createSpeech({
   let shownCount = 0; // bumped on every emitted line; a brain reply for an older one is stale
   let failStreak = 0; // consecutive failures; only some of them are worth a line
   let lastNotableAt = null; // when she last remarked on a pattern
+  /**
+   * The one line waiting for its own audio, or null. A slot rather than a queue,
+   * and the reason ordering holds: a line that has decided to show cancels
+   * whatever was waiting, so two lines can never arrive out of order and a stale
+   * one can never overwrite the line that displaced it.
+   */
+  let held = null;
   const toolClasses = new Map(); // sessionId -> last tool class
   // What the last PATTERN_WINDOW_MS looked like, kept only as far as the four
   // patterns below need: one small record per event, pruned by age. This is not
@@ -350,34 +393,102 @@ export function createSpeech({
   }
 
   /**
-   * Say it out loud. Deliberately hung off `show()` and nowhere else: whatever
-   * the salience gate, the mute check and the throttle let into the bubble is
-   * exactly what she says, so giving her a voice cannot make her talk *more*.
+   * Audio for a line that is already on screen — an urgent kind, or one whose
+   * synthesis overran the hold. This is the old behaviour, kept for exactly the
+   * cases where the words genuinely could not wait for the sound.
    *
-   * Fire-and-forget. Nothing waits on it, nothing is retried, and a synthesizer
-   * that is down costs her the sound and not the line — `voice.speak` already
-   * promises never to reject, and the catch here is the belt to that brace.
-   *
-   * Two things are re-checked when the audio arrives rather than when it was
-   * asked for, for the same reason `awaitBrain` re-checks them: synthesis takes
-   * a second or so, and in that time he may have muted her, or a newer line may
-   * have taken the bubble — in which case this one is about old news and playing
-   * it would put her voice out of step with what he is reading.
+   * Two things are re-checked here rather than when the audio was asked for, for
+   * the same reason `awaitBrain` re-checks them: synthesis takes a second or
+   * more, and in that time he may have muted her, or a newer line may have taken
+   * the bubble — in which case this one is about old news and playing it would
+   * put her voice out of step with what he is reading.
+   */
+  function deliverLate({ seq, kind, text }, audio) {
+    if (!audio || shownCount !== seq || muted()) return;
+    try {
+      onAudio({ ...audio, kind, text });
+    } catch {
+      /* the same promise the line listener gets */
+    }
+  }
+
+  /**
+   * Synthesize without holding anything back. Fire-and-forget: nothing waits on
+   * it, nothing is retried, and a synthesizer that is down costs her the sound
+   * and not the line.
    */
   function speakAloud(kind, text, seq) {
     if (!talker) return;
     Promise.resolve()
       .then(() => talker.speak(text, { kind }))
-      .then((audio) => {
-        if (!audio || shownCount !== seq || muted()) return;
-        try {
-          onAudio({ ...audio, kind, text });
-        } catch {
-          /* the same promise the line listener gets */
-        }
-      })
+      .then((audio) => deliverLate({ seq, kind, text }, audio))
       .catch(() => {
         /* speak() is contracted not to reject; a pet who cannot speak still writes */
+      });
+  }
+
+  /** Put a held line into the bubble, with its audio if the audio made it. */
+  function release(pending, audio) {
+    if (pending.done || pending.dropped) return;
+    pending.done = true;
+    if (pending.timer !== null) cancel(pending.timer);
+    pending.timer = null;
+    if (held === pending) held = null;
+    // Muted somewhere between the decision and now: she still shows the line she
+    // had already decided to show, and simply does not say it. Swallowing the
+    // bubble too would make muting her look like turning her off.
+    emit(audio && !muted() ? { ...pending.line, audio } : pending.line);
+  }
+
+  /**
+   * A newer line has taken the bubble, so this one is abandoned: it is never
+   * shown and its audio is never played. Dropped rather than shown late because
+   * a bubble that appears only to be replaced a moment later is worse than one
+   * that never appeared, and because showing it after the newer line would be
+   * the reordering this slot exists to prevent.
+   */
+  function dropHold() {
+    if (!held) return;
+    const pending = held;
+    held = null;
+    pending.dropped = true;
+    if (pending.timer !== null) cancel(pending.timer);
+    pending.timer = null;
+  }
+
+  /**
+   * Hold one line back until its audio is ready, then show and play it in the
+   * same tick. This is the whole of the fix: synthesis takes seconds, so a line
+   * emitted the instant it was decided is a line he reads in silence and then
+   * hears narrated after he has moved on.
+   *
+   * Nothing here can leave her permanently quiet. The deadline shows the line
+   * unvoiced; a failed synthesis resolves null and shows it immediately; and a
+   * newer line drops this one outright.
+   */
+  function holdFor(line, kind, text, seq) {
+    const pending = { seq, line, kind, text, timer: null, done: false, dropped: false };
+    held = pending;
+    pending.timer = schedule(() => {
+      pending.timer = null;
+      release(pending, null);
+    }, audioHoldMs);
+
+    Promise.resolve()
+      .then(() => talker.speak(text, { kind }))
+      .then((audio) => {
+        if (pending.dropped) return;
+        if (!pending.done) {
+          release(pending, audio);
+          return;
+        }
+        // The deadline already put the words up. The sound still belongs to
+        // them, so it is played late rather than thrown away — a slow endpoint
+        // should cost her the sync, not the voice.
+        deliverLate(pending, audio);
+      })
+      .catch(() => {
+        if (!pending.dropped) release(pending, null);
       });
   }
 
@@ -395,6 +506,18 @@ export function createSpeech({
    * the staleness check still apply — `awaitBrain` has already proved nothing
    * else took the bubble meanwhile.
    */
+  /**
+   * Deciding and showing are deliberately two different moments now. Everything
+   * that makes this a *decision* — the throttle, `lastSpokeAt`, `shownCount`,
+   * the recent-lines memory, the descriptor this returns — happens synchronously,
+   * exactly as it always did. Only the emit may be deferred, and only to let the
+   * line's audio catch up with it.
+   *
+   * That split is what keeps the rest of the module honest: `waitFor` still sees
+   * a line as spoken the instant it was allowed through, so a held line still
+   * blocks the next one, and `awaitBrain`'s staleness check still compares
+   * against a count that moves at decision time rather than at paint time.
+   */
   function show(kind, text, ev, summary, { fromTable = true, level = 'always', replacing = false } = {}) {
     if (!text) return { spoken: false, reason: 'no-line', kind, summary };
     if (muted()) return { spoken: false, reason: 'muted', kind, summary };
@@ -411,8 +534,33 @@ export function createSpeech({
     lastSpokeAt = t;
     lastKind = kind;
     shownCount += 1;
-    emit({ text, kind, mode: ev.mode ?? null, source: ev.source, summary });
-    speakAloud(kind, text, shownCount);
+    const seq = shownCount;
+    const line = { text, kind, mode: ev.mode ?? null, source: ev.source, summary };
+
+    // This line has the bubble now, so anything still waiting for its audio has
+    // been overtaken and is abandoned.
+    dropHold();
+
+    // Two kinds of line are never held.
+    //
+    // **Urgent ones**, because their whole value is latency: `waiting` and
+    // `failed` are why the pet exists at all, and holding "Claude needs your
+    // approval" for three seconds to wait on a synthesizer would trade the one
+    // thing this bubble is for against the polish of hearing it in sync. They
+    // show at once and are voiced when the audio lands, which is what every line
+    // did before this hold existed.
+    //
+    // **And any line at all when there is no voice** — muted, `GANYU_VOICE=off`,
+    // ambient speech turned off — because then there is nothing to wait for, and
+    // a pet whose bubbles got slower the moment he silenced her would be a
+    // strange way to honour the request.
+    if (!talker || INTERRUPT_KINDS.has(kind)) {
+      emit(line);
+      speakAloud(kind, text, seq);
+      return { spoken: true, reason: 'spoken', kind, text, summary };
+    }
+
+    holdFor(line, kind, text, seq);
     return { spoken: true, reason: 'spoken', kind, text, summary };
   }
 
@@ -591,9 +739,10 @@ export function createSpeech({
     },
     /** Introspection for tests and debugging. */
     stats() {
-      return { lastSpokeAt, lastMode, lastKind, failStreak, lastNotableAt };
+      return { lastSpokeAt, lastMode, lastKind, failStreak, lastNotableAt, holding: Boolean(held) };
     },
     dispose() {
+      dropHold(); // never leave a timer holding a line nobody will ever see
       toolClasses.clear();
       recentLines.length = 0;
       trail.length = 0;

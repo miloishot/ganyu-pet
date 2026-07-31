@@ -33,7 +33,7 @@ import {
   loadVoiceConfig,
   secMsGec,
 } from '../src/main/voice.mjs';
-import { createSpeech, QUIET_THROTTLE_MS } from '../src/main/speech.mjs';
+import { AUDIO_HOLD_MS, createSpeech, QUIET_THROTTLE_MS } from '../src/main/speech.mjs';
 import { CHANNELS, registerIpc } from '../src/main/window.mjs';
 import { createVoicePlayer } from '../src/renderer/pet.mjs';
 
@@ -588,21 +588,43 @@ test('local mode never opens a socket', async () => {
 
 // ------------------------------------------------- the gate: audio follows the bubble
 
-/** Speech with a voice attached, and everything it emitted, on a manual clock. */
-function speechHarness({ muted = false } = {}) {
+const EDGE_AUDIO = { mime: AUDIO_MIME, base64: 'AAAA', bytes: 3, ms: 5, source: 'edge' };
+
+/**
+ * Speech with a voice attached, and everything it emitted, on a manual clock and
+ * a manual timer queue.
+ *
+ * The timers matter as much as the clock now: a non-urgent line is held back
+ * until its audio is ready, and the hold's deadline is the only thing that can
+ * end that wait when the synthesizer never answers. `expire()` is a test firing
+ * that deadline by hand, so nothing here waits on a real 3.5 seconds.
+ *
+ * `speak` overrides what the synthesizer returns — a promise the test holds open
+ * is how "audio still in flight" is expressed.
+ */
+function speechHarness({ muted = false, speak = null } = {}) {
   let t = 1_000_000;
   const lines = [];
   const audio = [];
   const spoken = [];
+  const timers = [];
   const speech = createSpeech({
     clock: { now: () => t },
     onLine: (line) => lines.push(line),
     isMuted: () => muted,
     random: () => 0,
+    schedule: (fn, ms) => {
+      const timer = { fn, ms, cancelled: false, fired: false };
+      timers.push(timer);
+      return timer;
+    },
+    cancel: (timer) => {
+      if (timer) timer.cancelled = true;
+    },
     voice: {
-      async speak(text, opts) {
+      speak(text, opts) {
         spoken.push({ text, kind: opts?.kind ?? null });
-        return { mime: AUDIO_MIME, base64: 'AAAA', bytes: 3, ms: 5, source: 'edge' };
+        return Promise.resolve(speak ? speak(text, opts) : EDGE_AUDIO);
       },
     },
     onAudio: (payload) => audio.push(payload),
@@ -612,11 +634,25 @@ function speechHarness({ muted = false } = {}) {
     lines,
     audio,
     spoken,
+    timers,
     mute(value) {
       muted = value;
     },
     advance(ms) {
       t += ms;
+    },
+    /** Fire every hold deadline still armed. Returns how many there were. */
+    expire() {
+      const due = timers.filter((x) => !x.cancelled && !x.fired);
+      for (const timer of due) {
+        timer.fired = true;
+        timer.fn();
+      }
+      return due.length;
+    },
+    /** True while a line is still waiting on its audio. */
+    get holding() {
+      return timers.some((x) => !x.cancelled && !x.fired);
     },
   };
 }
@@ -626,17 +662,70 @@ const stop = { source: 'codex', event: 'Stop', sessionId: 's1', cwd: 'C:\\dev\\g
 const readPre = { source: 'codex', event: 'PreToolUse', sessionId: 's1', toolName: 'Read', cwd: 'C:\\dev\\ganyu-pet' };
 const bashPre = { source: 'codex', event: 'PreToolUse', sessionId: 's1', toolName: 'Bash', cwd: 'C:\\dev\\ganyu-pet' };
 
-test('a line that reaches the bubble is also spoken aloud', async () => {
+test('a line and its audio reach the renderer in the same message', async () => {
   const h = speechHarness();
   const shown = h.speech.notify(sessionStart);
+  // The decision is still synchronous — only the paint waits for the sound.
   assert.equal(shown.spoken, true);
+  assert.equal(h.lines.length, 0, 'nothing is shown while the audio is in flight');
+  assert.equal(h.speech.stats().holding, true);
+
   await tick();
 
   assert.equal(h.lines.length, 1);
-  assert.equal(h.audio.length, 1);
-  assert.equal(h.audio[0].text, h.lines[0].text, 'the same words she is showing');
+  assert.equal(h.lines[0].kind, 'greeting');
+  assert.deepEqual(h.lines[0].audio, EDGE_AUDIO, 'the words carry their own sound');
+  assert.deepEqual(h.audio, [], 'and nothing trails behind on the late channel');
+  assert.equal(h.speech.stats().holding, false, 'the hold is released with the line');
+  assert.equal(h.holding, false, 'and its deadline is cancelled, not left to fire');
+});
+
+test('the bubble still waits no longer than the deadline for audio that never comes', async () => {
+  // The synthesizer accepts the line and never answers — the socket hang that
+  // SPEAK_TIMEOUT_MS bounds at ten seconds, which is far too long to stare at an
+  // empty bubble. The hold's own deadline is what cuts it short.
+  const h = speechHarness({ speak: () => new Promise(() => {}) });
+  h.speech.notify(sessionStart);
+  await tick();
+
+  assert.deepEqual(h.lines, [], 'still held');
+  assert.equal(h.timers.length, 1);
+  assert.equal(h.timers[0].ms, AUDIO_HOLD_MS, 'and held for exactly the deadline');
+
+  assert.equal(h.expire(), 1);
+  assert.equal(h.lines.length, 1, 'the deadline shows her anyway');
+  assert.equal(h.lines[0].audio, undefined, 'unvoiced, rather than silent and invisible');
+  assert.equal(h.speech.stats().holding, false);
+});
+
+test('audio that lands after the deadline is played late rather than thrown away', async () => {
+  let answer = null;
+  const h = speechHarness({ speak: () => new Promise((resolve) => { answer = resolve; }) });
+  h.speech.notify(sessionStart);
+  await tick();
+  h.expire();
+  assert.equal(h.lines.length, 1, 'the words are up, unvoiced');
+
+  answer(EDGE_AUDIO); // the endpoint finally came back
+  await tick();
+
+  assert.equal(h.lines.length, 1, 'and are not shown a second time');
+  assert.equal(h.audio.length, 1, 'the sound follows on the late channel');
   assert.equal(h.audio[0].kind, 'greeting');
-  assert.equal(h.audio[0].mime, AUDIO_MIME);
+  assert.equal(h.audio[0].text, h.lines[0].text);
+});
+
+test('a synthesizer that fails shows the line at once, not at the deadline', async () => {
+  // Every ordinary failure — refused socket, dead endpoint, voice switched off —
+  // resolves null in milliseconds, so the deadline is not what she waits out.
+  const h = speechHarness({ speak: () => null });
+  h.speech.notify(sessionStart);
+  await tick();
+
+  assert.equal(h.lines.length, 1, 'shown as soon as the failure is known');
+  assert.equal(h.lines[0].audio, undefined);
+  assert.deepEqual(h.audio, []);
+  assert.equal(h.holding, false, 'the deadline was cancelled, never reached');
 });
 
 test('mute silences the audio as well as the bubble', async () => {
@@ -654,6 +743,25 @@ test('muting while a line is being synthesized still silences it', async () => {
   await tick();
   assert.equal(h.spoken.length, 1, 'it was already in flight');
   assert.deepEqual(h.audio, [], 'and it is dropped rather than played');
+  assert.equal(h.lines.length, 1, 'the line she had already decided to show still shows');
+  assert.equal(h.lines[0].audio, undefined, 'without its sound');
+});
+
+test('a muted pet is a quiet pet, not a slow one', async () => {
+  // Mute is checked before anything is synthesized, so there is no hold, no
+  // deadline and nothing to wait for: her bubbles must not get slower because
+  // he asked for silence. (For an ambient line mute means no bubble at all —
+  // the chat path is where muting still leaves words on screen.)
+  const h = speechHarness({ muted: true });
+  assert.equal(h.speech.notify(sessionStart).reason, 'muted');
+  assert.deepEqual(h.timers, [], 'nothing was ever scheduled');
+
+  h.mute(false);
+  h.advance(QUIET_THROTTLE_MS + 1);
+  const shown = h.speech.notify(stop);
+  assert.equal(shown.spoken, true, 'and she is audible again immediately after');
+  await tick();
+  assert.deepEqual(h.lines[0].audio, EDGE_AUDIO);
 });
 
 test('a non-salient line makes no sound, because it makes no bubble', async () => {
@@ -667,7 +775,8 @@ test('a non-salient line makes no sound, because it makes no bubble', async () =
   assert.equal(routine.spoken, false);
   await tick();
 
-  assert.equal(h.audio.length, 1, 'still only the greeting');
+  assert.equal(h.lines.length, 1, 'still only the greeting');
+  assert.equal(h.spoken.length, 1, 'and only the greeting was ever synthesized');
 });
 
 test('a throttled line makes no sound', async () => {
@@ -679,8 +788,20 @@ test('a throttled line makes no sound', async () => {
   assert.equal(throttled.reason, 'throttled');
   await tick();
 
-  assert.equal(h.audio.length, 1);
+  assert.equal(h.lines.length, 1);
   assert.equal(h.spoken.length, 1, 'a line she did not show is a line she did not synthesize');
+});
+
+test('a held line still blocks the next one, exactly as a shown one does', async () => {
+  // The throttle reads the moment a line was *decided*, not the moment it was
+  // painted. If holding one reset that, a burst would hold several at once and
+  // then paint them all.
+  const h = speechHarness({ speak: () => new Promise(() => {}) });
+  assert.equal(h.speech.notify(sessionStart).spoken, true);
+  h.advance(1000);
+  assert.equal(h.speech.notify(stop).reason, 'throttled', 'still throttled while held');
+  assert.deepEqual(h.lines, []);
+  assert.equal(h.timers.filter((x) => !x.cancelled).length, 1, 'one hold, not two');
 });
 
 test('a newer line drops the audio of the one it replaced', async () => {
@@ -715,6 +836,90 @@ test('a newer line drops the audio of the one it replaced', async () => {
   assert.equal(audio[0].kind, 'waiting', 'the stale greeting audio is dropped');
 });
 
+test('an urgent line is never held for its audio', async () => {
+  // `waiting` and `failed` are why the pet exists: a permission prompt held back
+  // three seconds to wait on a synthesizer is a regression, whatever it buys.
+  const h = speechHarness({ speak: () => new Promise(() => {}) });
+  const shown = h.speech.notify({ source: 'claude', event: 'Notification', sessionId: 's2', mode: 'waiting' });
+
+  assert.equal(shown.spoken, true);
+  assert.equal(h.lines.length, 1, 'on screen synchronously, before any await');
+  assert.equal(h.lines[0].kind, 'waiting');
+  assert.equal(h.lines[0].audio, undefined, 'and unvoiced for now');
+  assert.deepEqual(h.timers, [], 'no hold, so no deadline either');
+});
+
+test('an urgent line is voiced late rather than not at all', async () => {
+  let answer = null;
+  const h = speechHarness({ speak: () => new Promise((resolve) => { answer = resolve; }) });
+  h.speech.notify({ source: 'claude', event: 'Notification', sessionId: 's2', mode: 'waiting' });
+  await tick();
+  assert.deepEqual(h.audio, []);
+
+  answer(EDGE_AUDIO);
+  await tick();
+
+  assert.equal(h.audio.length, 1, 'the sound catches up with the words');
+  assert.equal(h.audio[0].kind, 'waiting');
+});
+
+test('a second line cannot overtake the first one out of order', async () => {
+  // A held line and an urgent one that arrives mid-flight. B must not appear
+  // before A, and A — now stale — must never overwrite B.
+  const answers = [];
+  const h = speechHarness({
+    speak: (text) => new Promise((resolve) => answers.push({ text, resolve })),
+  });
+
+  h.speech.notify(sessionStart); // A: held, waiting on its audio
+  await tick();
+  assert.deepEqual(h.lines, [], 'A is still waiting');
+
+  h.advance(1);
+  h.speech.notify({ source: 'claude', event: 'Notification', sessionId: 's2', mode: 'waiting' }); // B
+  await tick();
+
+  assert.deepEqual(h.lines.map((l) => l.kind), ['waiting'], 'B alone, and B first');
+  assert.equal(h.speech.stats().holding, false, 'A released the slot it was holding');
+  assert.equal(h.timers[0].cancelled, true, "and A's deadline was cancelled with it");
+
+  // A's audio arrives after all that. It belongs to a line that was never shown.
+  answers[0].resolve(EDGE_AUDIO);
+  await tick();
+  assert.deepEqual(h.lines.map((l) => l.kind), ['waiting'], 'A never appears behind B');
+  assert.deepEqual(h.audio, [], 'and is not heard either');
+
+  // B's own audio still lands normally.
+  answers[1].resolve(EDGE_AUDIO);
+  await tick();
+  assert.deepEqual(h.audio.map((a) => a.kind), ['waiting']);
+});
+
+test("a superseded line's deadline cannot fire behind the line that replaced it", async () => {
+  const h = speechHarness({ speak: () => new Promise(() => {}) });
+  h.speech.notify(sessionStart);
+  await tick();
+  h.advance(1);
+  h.speech.notify({ source: 'claude', event: 'Notification', sessionId: 's2', mode: 'waiting' });
+  await tick();
+
+  assert.equal(h.expire(), 0, 'nothing is left armed to fire');
+  assert.deepEqual(h.lines.map((l) => l.kind), ['waiting']);
+});
+
+test('dispose() lets go of a line that was waiting on its audio', async () => {
+  const h = speechHarness({ speak: () => new Promise(() => {}) });
+  h.speech.notify(sessionStart);
+  await tick();
+  assert.equal(h.speech.stats().holding, true);
+
+  h.speech.dispose();
+
+  assert.equal(h.speech.stats().holding, false);
+  assert.equal(h.expire(), 0, 'no timer survives the teardown');
+  assert.deepEqual(h.lines, []);
+});
+
 test('a voice that fails costs her nothing at all', async () => {
   const lines = [];
   const speech = createSpeech({
@@ -734,68 +939,75 @@ test('a voice that fails costs her nothing at all', async () => {
 
 // --------------------------------------------------------------- chat replies
 
-test('a chat reply is handed to the voice after it is returned to the strip', async () => {
+/** registerIpc wired to nothing but the chat channel, which is all these need. */
+function chatChannel({ send, onReply = null }) {
   const handlers = new Map();
-  const ipcMain = {
-    on: (channel, fn) => handlers.set(channel, fn),
-    handle: (channel, fn) => handlers.set(channel, fn),
-    removeListener: () => {},
-    removeHandler: () => {},
-  };
-  const said = [];
   registerIpc({
-    ipcMain,
+    ipcMain: {
+      on: (channel, fn) => handlers.set(channel, fn),
+      handle: (channel, fn) => handlers.set(channel, fn),
+      removeListener: () => {},
+      removeHandler: () => {},
+    },
     getWindow: () => null,
     getFlags: () => ({}),
     onMenuAction: () => {},
-    getChat: () => ({ send: async () => 'Of course, Kahweng.' }),
-    onReply: (line) => said.push(line),
+    getChat: () => ({ send }),
+    onReply,
+  });
+  return (text) => handlers.get('ganyu:chat')({}, text);
+}
+
+test('a chat reply comes back with its own audio, so the strip can do both at once', async () => {
+  const said = [];
+  const ask = chatChannel({
+    send: async () => 'Of course, Kahweng.',
+    onReply: async (line) => {
+      said.push(line);
+      return { mime: AUDIO_MIME, base64: 'QUJD' };
+    },
   });
 
-  const reply = await handlers.get('ganyu:chat')({}, 'are you there?');
-  assert.equal(reply, 'Of course, Kahweng.', 'the strip still gets its answer');
-  assert.deepEqual(said, ['Of course, Kahweng.']);
+  const reply = await ask('are you there?');
+  assert.deepEqual(reply, {
+    text: 'Of course, Kahweng.',
+    audio: { mime: AUDIO_MIME, base64: 'QUJD' },
+  });
+  assert.deepEqual(said, ['Of course, Kahweng.'], 'and the words are what was synthesized');
+});
+
+test('a reply whose audio did not arrive in time is still a reply', async () => {
+  // `onReply` resolving null is main saying "the deadline beat the synthesizer".
+  // The words must not wait for a second chance.
+  const ask = chatChannel({ send: async () => 'Almost done.', onReply: async () => null });
+  assert.deepEqual(await ask('hi'), { text: 'Almost done.', audio: null });
 });
 
 test('an unsayable reply is still a reply', async () => {
-  const handlers = new Map();
-  const ipcMain = {
-    on: (channel, fn) => handlers.set(channel, fn),
-    handle: (channel, fn) => handlers.set(channel, fn),
-    removeListener: () => {},
-    removeHandler: () => {},
-  };
-  registerIpc({
-    ipcMain,
-    getWindow: () => null,
-    getFlags: () => ({}),
-    onMenuAction: () => {},
-    getChat: () => ({ send: async () => 'Almost done.' }),
+  const thrower = chatChannel({
+    send: async () => 'Almost done.',
     onReply: () => {
       throw new Error('no sound card');
     },
   });
-  assert.equal(await handlers.get('ganyu:chat')({}, 'hi'), 'Almost done.');
+  assert.deepEqual(await thrower('hi'), { text: 'Almost done.', audio: null });
+
+  const rejecter = chatChannel({
+    send: async () => 'Almost done.',
+    onReply: () => Promise.reject(new Error('the endpoint is on fire')),
+  });
+  assert.deepEqual(await rejecter('hi'), { text: 'Almost done.', audio: null });
+});
+
+test('a reply with no voice behind it at all is returned unchanged', async () => {
+  const ask = chatChannel({ send: async () => 'Almost done.' });
+  assert.deepEqual(await ask('hi'), { text: 'Almost done.', audio: null });
 });
 
 test('a null reply is never spoken', async () => {
-  const handlers = new Map();
-  const ipcMain = {
-    on: (channel, fn) => handlers.set(channel, fn),
-    handle: (channel, fn) => handlers.set(channel, fn),
-    removeListener: () => {},
-    removeHandler: () => {},
-  };
   const said = [];
-  registerIpc({
-    ipcMain,
-    getWindow: () => null,
-    getFlags: () => ({}),
-    onMenuAction: () => {},
-    getChat: () => ({ send: async () => '   ' }),
-    onReply: (line) => said.push(line),
-  });
-  assert.equal(await handlers.get('ganyu:chat')({}, 'hi'), null);
+  const ask = chatChannel({ send: async () => '   ', onReply: (line) => said.push(line) });
+  assert.equal(await ask('hi'), null, 'no reply at all is still a plain null');
   assert.deepEqual(said, []);
 });
 

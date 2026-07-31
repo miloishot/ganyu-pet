@@ -478,11 +478,19 @@ export async function boot({
   });
   ganyu.onSpeak((payload) => {
     // Ambient priority: a hook line yields to a reply he is still reading.
-    bubbles.show(payload && payload.text, { priority: BUBBLE_PRIORITY.ambient });
+    const shown = bubbles.show(payload && payload.text, { priority: BUBBLE_PRIORITY.ambient });
+    // Her voice, arriving with her words rather than seconds behind them — main
+    // holds the line back until the audio exists (see AUDIO_HOLD_MS).
+    //
+    // Only when the bubble actually took the line: a hook line refused because a
+    // reply he is still reading holds the bubble is a line he will never see, and
+    // hearing her say something that is not on screen is worse than silence.
+    if (shown && payload && payload.audio) voice.play(payload.audio);
   });
-  // The audio for a line already shown. Main sends this only for lines that
-  // passed the mute and salience gates, so there is nothing left to decide here
-  // beyond interrupting whatever she was mid-sentence on.
+  // The audio for a line already shown — an urgent kind, or one whose synthesis
+  // overran the hold. Main sends this only for lines that passed the mute and
+  // salience gates, so there is nothing left to decide here beyond interrupting
+  // whatever she was mid-sentence on.
   if (typeof ganyu.onAudio === 'function') ganyu.onAudio((payload) => voice.play(payload));
 
   const flags = (await ganyu.getFlags()) || {};
@@ -596,6 +604,11 @@ export async function boot({
     chatPending = true;
     // Dots, not a sentence — she heard him and something is happening, without
     // her saying the same words before every answer she ever gives.
+    //
+    // They now cover two waits rather than one: the brain writing the reply, and
+    // the synthesizer giving it a voice. Deliberately the same dots for both —
+    // they already say the only thing that needs saying, and a second kind of
+    // waiting would just be a second thing to explain.
     bubbles.thinking();
 
     let reply = null;
@@ -607,9 +620,15 @@ export async function boot({
       chatPending = false;
     }
 
+    // `{text, audio}` — the words and the sound of them, so the dots come down
+    // onto both at once. A bare string is still accepted: it is what the channel
+    // answered before she had a voice, and a null reply still means the failure
+    // line below.
+    const said = typeof reply === 'string' ? { text: reply, audio: null } : (reply || {});
     // Whatever happened, the dots are not allowed to be her last word.
-    const line = typeof reply === 'string' && reply.trim() !== '' ? reply : CHAT_FAILED_LINE;
+    const line = typeof said.text === 'string' && said.text.trim() !== '' ? said.text : CHAT_FAILED_LINE;
     bubbles.show(line, { priority: BUBBLE_PRIORITY.chat });
+    if (said.audio) voice.play(said.audio);
     return true;
   }
 

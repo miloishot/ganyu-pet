@@ -366,7 +366,10 @@ test('ganyu:chat answers null before the chat module exists, then relays the rep
   assert.equal(await send('hello?'), null, 'composeRuntime has not run yet');
 
   chat = createChat({ brain: { requestChat: ({ text }) => Promise.resolve(`re: ${text}`) } });
-  assert.equal(await send('are you there?'), 're: are you there?');
+  // `{text, audio}`, not a bare string: the reply and the sound of it travel
+  // together so the strip can show and play them in the same tick. With no
+  // `onReply` wired there is no voice to wait for, and `audio` is simply null.
+  assert.deepEqual(await send('are you there?'), { text: 're: are you there?', audio: null });
 
   // No brain is not a broken chat — it is one whose every send resolves null,
   // which is exactly what the renderer's in-character fallback is for.

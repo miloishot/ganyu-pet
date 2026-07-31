@@ -142,6 +142,13 @@ export function normalizeEvent(source, payload, at = Date.now()) {
     toolInput: body.tool_input ?? body.toolInput ?? null,
     agentType: body.agent_type ?? body.agentType ?? null,
     cwd: body.cwd ?? body.workspace ?? null,
+    // The **path** to the session's transcript, never its contents. Every Claude
+    // Code hook payload carries it and it was being dropped here, so the one
+    // thing that knows what the work was actually about never reached the rest
+    // of the app. Reading it is sessions.mjs's job and sessions.mjs's allowlist;
+    // this only stops the address being thrown away. It is a path, so it is the
+    // same class of fact as `cwd` directly above.
+    transcriptPath: body.transcript_path ?? body.transcriptPath ?? null,
     message: typeof message === 'string' ? message : null,
     permission: /permission|approve|approval|confirm/i.test(
       `${canonical} ${typeof message === 'string' ? message : ''}`,
