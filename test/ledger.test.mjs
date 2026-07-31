@@ -16,11 +16,13 @@ import assert from 'node:assert/strict';
 
 import {
   DEFAULT_MAX_ENTRIES,
+  DEFAULT_SEARCH_LIMIT,
   DIGEST_WINDOW_MS,
   ENTRY_KEYS,
   LEDGER_KINDS,
   MAX_DETAIL_CHARS,
   MAX_DIGEST_CHARS,
+  MAX_SEARCH_LIMIT,
   createLedger,
   describeAgo,
   describeSpan,
@@ -706,8 +708,211 @@ test('with no path or no fs every call still answers, and nothing is written', (
     assert.deepEqual(ledger.recent(5), []);
     assert.deepEqual(ledger.since(0), []);
     assert.deepEqual(ledger.forProject('ganyu-pet'), []);
+    assert.deepEqual(ledger.search({ query: 'anything' }), []);
     assert.equal(ledger.digest({ now: NOW }), null);
     assert.equal(ledger.stats().enabled, false);
   }
   assert.deepEqual(fs.calls, [], 'a disabled ledger never touches the fs it was given');
+});
+
+// ---------------------------------------------------------------------------
+// search — the other half of recall
+//
+// `digest()` hands her a summary of the last six hours unasked. This is the path
+// where she goes and *looks*, which is what makes the other 494 entries in the
+// file reachable at all. Keyword plus structured filters, no index, no
+// dependency: the corpus is a few hundred lines of six short fields.
+// ---------------------------------------------------------------------------
+
+/** An evening's worth of entries, spread over three days and two projects. */
+function corpus() {
+  const at = (hoursAgo) => NOW - hoursAgo * HOUR;
+  return makeLedger({
+    files: {
+      [FILE]: jsonl(
+        { at: at(50), kind: 'failed', project: 'GolfCRM', tool: 'Bash', detail: 'running `npm test`' },
+        { at: at(30), kind: 'waiting', project: 'ganyu-pet', tool: 'Edit', detail: 'editing index.ts' },
+        { at: at(26), kind: 'failed', project: 'ganyu-pet', tool: 'Bash', detail: 'running `npm run build`' },
+        { at: at(5), kind: 'failed', project: 'ganyu-pet', tool: 'Bash', detail: 'running `npm test`' },
+        { at: at(3), kind: 'recovered', project: 'ganyu-pet', tool: 'Bash', detail: 'running `npm test`' },
+        { at: at(2), kind: 'celebrate', project: 'GolfCRM', tool: null, detail: null },
+        { at: at(1), kind: 'notable', project: 'ganyu-pet', tool: null, detail: 'repeat-file' },
+      ),
+    },
+  });
+}
+
+test('search with no arguments at all is simply the newest entries', () => {
+  const { ledger } = corpus();
+  const all = ledger.search();
+  assert.equal(all.length, 7);
+  assert.equal(all[0].kind, 'notable', 'newest first, like every read in this module');
+  assert.equal(all.at(-1).project, 'GolfCRM');
+  assert.deepEqual(ledger.search(), ledger.recent(DEFAULT_SEARCH_LIMIT));
+});
+
+test('query matches case-insensitively across detail, tool and project', () => {
+  const { ledger } = corpus();
+
+  assert.equal(ledger.search({ query: 'npm test' }).length, 3);
+  assert.equal(ledger.search({ query: 'NPM TEST' }).length, 3, 'case-insensitive');
+  assert.equal(ledger.search({ query: 'bash' }).length, 4, 'the tool name is in the haystack');
+  assert.equal(ledger.search({ query: 'GOLFCRM' }).length, 2, 'and so is the project');
+  assert.equal(ledger.search({ query: 'index.ts' })[0].tool, 'Edit');
+
+  // Every word must appear, so a phrase narrows instead of matching nothing.
+  assert.equal(ledger.search({ query: 'npm test ganyu-pet' }).length, 2);
+  assert.equal(ledger.search({ query: 'npm build' }).length, 1, 'words, not one long substring');
+  assert.deepEqual(ledger.search({ query: 'nothing like this' }), []);
+
+  // A blank query is no filter, not a filter matching nothing.
+  assert.equal(ledger.search({ query: '   ' }).length, 7);
+  assert.equal(ledger.search({ query: null }).length, 7);
+
+  // `kind` is deliberately NOT in the haystack: a file called failed.ts must not
+  // drag in every failure. It has its own parameter for that.
+  assert.equal(ledger.search({ query: 'celebrate' }).length, 0);
+});
+
+test('the structured filters compose, and they compose as AND', () => {
+  const { ledger } = corpus();
+
+  assert.equal(ledger.search({ kind: 'failed' }).length, 3);
+  assert.equal(ledger.search({ project: 'ganyu-pet' }).length, 5);
+  assert.equal(ledger.search({ tool: 'Bash' }).length, 4);
+
+  assert.equal(ledger.search({ kind: 'failed', project: 'ganyu-pet' }).length, 2, 'AND, not OR');
+  assert.equal(ledger.search({ kind: 'failed', project: 'ganyu-pet', query: 'npm test' }).length, 1);
+  assert.deepEqual(ledger.search({ kind: 'celebrate', tool: 'Bash' }), [], 'no entry satisfies both');
+
+  // Names are matched case-insensitively, as forProject already does.
+  assert.equal(ledger.search({ project: 'GANYU-PET' }).length, 5);
+  assert.equal(ledger.search({ tool: 'bash' }).length, 4);
+
+  // A list of kinds is an OR *within* the one filter.
+  assert.equal(ledger.search({ kind: ['failed', 'recovered'] }).length, 4);
+});
+
+test('an unrecognised kind costs precision, never her whole memory', () => {
+  const { ledger } = corpus();
+  // A pet who answers "I have nothing" because the model typed `error` instead
+  // of `failed` reads as amnesia. Degrade to a broader search; the query narrows.
+  assert.equal(ledger.search({ kind: 'error' }).length, 7);
+  assert.equal(ledger.search({ kind: 'busy' }).length, 7, 'and `busy` is not a ledger kind at all');
+  assert.equal(ledger.search({ kind: ['failed', 'error'] }).length, 3, 'the good one still filters');
+  assert.equal(ledger.search({ kind: 42 }).length, 7);
+});
+
+test('since and until bound the search, and an unusable bound is no bound', () => {
+  const { ledger } = corpus();
+  const at = (hoursAgo) => NOW - hoursAgo * HOUR;
+
+  assert.equal(ledger.search({ since: at(6) }).length, 4, 'the last six hours');
+  assert.equal(ledger.search({ since: at(28) }).length, 5, 'yesterday as well — no code change needed');
+  assert.equal(ledger.search({ until: at(28) }).length, 2, 'and only what came before it');
+  assert.equal(ledger.search({ since: at(28), until: at(4) }).length, 2, 'a window from both ends');
+
+  // Inclusive at both ends, so an entry exactly on the boundary is not lost.
+  assert.equal(ledger.search({ since: at(5), until: at(5) }).length, 1);
+
+  for (const bad of [null, undefined, '', NaN, 'yesterday']) {
+    assert.equal(ledger.search({ since: bad }).length, 7, `since=${String(bad)} is no bound`);
+    assert.equal(ledger.search({ until: bad }).length, 7, `until=${String(bad)} is no bound`);
+  }
+});
+
+test('limit is respected, bounded, and always takes the newest', () => {
+  const { ledger } = corpus();
+
+  assert.equal(ledger.search({ limit: 2 }).length, 2);
+  assert.equal(ledger.search({ limit: 2 })[0].kind, 'notable', 'the newest two, not the oldest');
+  assert.equal(ledger.search({ kind: 'failed', limit: 1 })[0].detail, 'running `npm test`');
+
+  assert.equal(ledger.search().length, 7, `and the default is ${DEFAULT_SEARCH_LIMIT}`);
+  assert.equal(ledger.search({ limit: 999 }).length, 7, 'nothing to cap here, but the cap exists');
+  for (const bad of [0, -1, NaN, 'lots', null]) {
+    assert.equal(ledger.search({ limit: bad }).length, 7, `limit=${String(bad)} falls back to the default`);
+  }
+});
+
+test('the hard cap holds however large a limit is asked for', () => {
+  const many = Array.from({ length: 120 }, (_, i) => ({
+    at: NOW - i * MIN,
+    kind: 'failed',
+    project: 'ganyu-pet',
+    tool: 'Bash',
+    detail: `attempt ${i}`,
+  }));
+  const { ledger } = makeLedger({ files: { [FILE]: jsonl(...many) }, maxEntries: 200 });
+
+  assert.equal(ledger.search({ limit: MAX_SEARCH_LIMIT }).length, MAX_SEARCH_LIMIT);
+  assert.equal(ledger.search({ limit: 10_000 }).length, MAX_SEARCH_LIMIT, 'never more, whatever is asked');
+  assert.equal(ledger.search({ limit: 10_000 })[0].detail, 'attempt 0', 'and still the newest');
+});
+
+test('search results are sanitized on the way out, exactly as every other read is', () => {
+  const { ledger } = makeLedger({
+    files: {
+      [FILE]: jsonl({
+        at: NOW - MIN,
+        kind: 'failed',
+        project: 'ganyu-pet',
+        tool: 'Edit',
+        detail: 'editing index.ts',
+        old_string: 'const KEY = "sk-live-not-a-real-key"',
+        content: 'the whole file',
+      }),
+    },
+  });
+
+  const [found] = ledger.search({ query: 'index.ts' });
+  assert.deepEqual(Object.keys(found).sort(), ['at', 'detail', 'kind', 'project', 'tool']);
+  assert.equal(found.old_string, undefined, 'a hand-edited file cannot smuggle a field back through search');
+  assert.equal(found.content, undefined);
+});
+
+test('search degrades to empty on an unreadable or corrupt file, never throwing', () => {
+  const unreadable = makeLedger({ files: { [FILE]: 'x' }, fail: { readFileSync: true } });
+  assert.deepEqual(unreadable.ledger.search({ query: 'anything' }), []);
+
+  const corrupt = makeLedger({
+    files: { [FILE]: `garbage\n${JSON.stringify({ at: NOW, kind: 'failed', detail: 'running \`npm test\`' })}\n{"at":1,"kind":"fai` },
+  });
+  assert.equal(corrupt.ledger.search({ query: 'npm' }).length, 1, 'the good line is still found');
+
+  assert.deepEqual(makeLedger().ledger.search({ query: 'anything' }), [], 'a missing file is an empty search');
+});
+
+// ---------------------------------------------------------------------------
+// the digest window is a parameter, not a constant
+// ---------------------------------------------------------------------------
+
+test('the digest window can be moved without a code change, from either end', () => {
+  const { ledger } = corpus();
+
+  // Unchanged by default: six hours, so yesterday is not reported as news.
+  // Only one of the three failures is inside that window.
+  assert.match(ledger.digest({ now: NOW }), /one failure/);
+
+  // Per call, which is what lets a caller ask about "yesterday" — and this was
+  // already reachable; what was hardcoded was the *default* behind it.
+  assert.match(ledger.digest({ now: NOW, windowMs: 72 * HOUR }), /3 failures/);
+
+  // And the default itself is injectable, for a caller who wants a wider ambient
+  // window everywhere rather than at one call site.
+  const wide = createLedger({
+    filePath: FILE,
+    fs: corpus().fs,
+    now: () => NOW,
+    digestWindowMs: 72 * HOUR,
+  });
+  assert.match(wide.digest({ now: NOW }), /3 failures/);
+  assert.match(wide.digest({ now: NOW, windowMs: HOUR }), /you noticed/, 'and a call still overrides it');
+
+  // A nonsense value falls back rather than making the window infinite or zero.
+  for (const bad of [0, -1, NaN, 'wide']) {
+    const odd = createLedger({ filePath: FILE, fs: corpus().fs, now: () => NOW, digestWindowMs: bad });
+    assert.match(odd.digest({ now: NOW }), /one failure/, `digestWindowMs=${String(bad)}`);
+    assert.equal(odd.stats().maxEntries, DEFAULT_MAX_ENTRIES, 'and nothing else moved with it');
+  }
 });

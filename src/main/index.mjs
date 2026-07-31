@@ -45,6 +45,27 @@ const ENV_FILE = path.join(HERE, '..', '..', '.env.local');
 const LEDGER_FILE = 'ledger.jsonl';
 
 /**
+ * And the conversation, beside it and for the same reasons. Everything he has
+ * ever said to her used to live in an array and nowhere else, so quitting the
+ * pet erased it — see the note at the top of chat.mjs.
+ */
+const CHAT_FILE = 'chat.jsonl';
+
+/**
+ * `app.getPath('userData')` is only dependable once the app is ready, so this is
+ * called from inside `composeRuntime` and never at module scope. Its failure is
+ * contained: the pet loses its memory of that one thing, not its window.
+ */
+function userDataFile(name) {
+  try {
+    return path.join(app.getPath('userData'), name);
+  } catch (err) {
+    console.warn(`[ganyu] no userData path for ${name} (${err?.message}) — she will not remember`);
+    return null;
+  }
+}
+
+/**
  * The owner's Obsidian vault and the repo→project map his shell hooks read.
  * Both **read-only**, and only ever a note's title, date and `Left open`
  * bullets — see the privacy note in vault.mjs. Absent on any other machine,
@@ -508,17 +529,9 @@ async function composeRuntime() {
   let ledger = null;
   const ledgerMod = await tryImport('./ledger.mjs');
   if (ledgerMod?.createLedger) {
-    // Resolved here rather than at module scope: `getPath` is only dependable
-    // once the app is ready, and composeRuntime runs inside whenReady(). Its
-    // own failure is contained, because everything below this line — the
-    // server, speech, wander — is worth more than her diary.
-    let ledgerPath = null;
-    try {
-      ledgerPath = path.join(app.getPath('userData'), LEDGER_FILE);
-    } catch (err) {
-      console.warn(`[ganyu] ledger: no userData path (${err?.message}) — she will not remember`);
-    }
-    ledger = ledgerMod.createLedger({ filePath: ledgerPath, fs });
+    // Everything below this line — the server, speech, wander — is worth more
+    // than her diary, so a missing path costs the ledger and nothing else.
+    ledger = ledgerMod.createLedger({ filePath: userDataFile(LEDGER_FILE), fs });
     console.log(`[ganyu] ledger: ${ledger.enabled ? ledger.path : 'disabled'}`);
   }
 
@@ -569,8 +582,20 @@ async function composeRuntime() {
         }),
         // Chat only — brain.mjs reads this on `requestChat` and nowhere else.
         getMemory: readMemory,
+        // Her one tool, also chat-only: the difference between being handed a
+        // digest and being able to go and look. A function rather than the
+        // ledger itself, so brain.mjs never imports ledger.mjs. Read-only, and
+        // absent when the ledger has no file to read.
+        searchMemory: ledger?.enabled && typeof ledger.search === 'function'
+          ? (args) => ledger.search(args)
+          : null,
       });
       console.log(`[ganyu] brain: enabled (model ${brainConfig.model})`);
+      console.log(
+        brain.stats().memorySearch
+          ? '[ganyu] memory search: on — she can look things up in her ledger'
+          : '[ganyu] memory search: off — she has only the digest',
+      );
     } else {
       console.log(`[ganyu] brain: disabled (${brainConfig.reason}) — canned lines only`);
     }
@@ -582,11 +607,18 @@ async function composeRuntime() {
   // `ganyu:chat` promises and what the renderer already draws its in-character
   // fallback from. Guarding the construction instead would only move the null
   // one layer out and add a way for the channel to hang.
-  chat = createChat({ brain });
+  chat = createChat({ brain, filePath: userDataFile(CHAT_FILE), fs });
   console.log(
     brain
       ? '[ganyu] chat: enabled'
       : '[ganyu] chat: disabled (no brain) — she cannot answer, the bubble says so',
+  );
+  // Separate from the line above, because they are separate facts: she can be
+  // able to answer and unable to remember it, or the reverse.
+  console.log(
+    chat.enabled
+      ? `[ganyu] conversation: ${chat.path} (${chat.stats().exchanges} exchanges remembered)`
+      : '[ganyu] conversation: not saved — she will not remember this past a restart',
   );
 
   const speechMod = await tryImport('./speech.mjs');

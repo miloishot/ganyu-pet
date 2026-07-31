@@ -9,11 +9,14 @@
 // owner asked how she does that, which was the right question, and the honest
 // answer was that she doesn't. So: make it true.
 //
-// Append-only JSONL, one notable event per line, read back as a short digest she
-// can be handed when she needs to remember something. It is her memory, not a
-// log file — routine tool traffic never reaches it, because a ledger holding
-// every Read is one nothing can be recalled from, and it would spend maxEntries
-// in minutes. The caller has already decided what is notable (speech.mjs owns
+// Append-only JSONL, one notable event per line, read back two ways: `digest()`
+// hands her a short summary of the recent past unasked, and `search()` lets her
+// go and look. Both matter, and for a while only the first existed — the file
+// kept 500 entries and the digest could reach six hours of them, so the rest sat
+// on the disk with no caller able to name them. It is her memory, not a log
+// file — routine tool traffic never reaches it, because a ledger holding every
+// Read is one nothing can be recalled from, and it would spend maxEntries in
+// minutes. The caller has already decided what is notable (speech.mjs owns
 // salience); this module only decides what is *storable*.
 //
 // PRIVACY — the same line context.mjs holds, enforced the same way: by
@@ -34,8 +37,24 @@ export const DEFAULT_MAX_ENTRIES = 500;
 /**
  * How far back `digest()` looks by default. Long enough to cover an evening's
  * work, short enough that this morning's failures are not reported as news.
+ *
+ * A **default**, and reachable from both ends: `digest({windowMs})` overrides it
+ * per call, and `createLedger({digestWindowMs})` moves the default itself. It
+ * used to be the only window there was, which meant the file held 500 entries
+ * and six hours of them could be reached — the rest were on the disk and
+ * unreachable by any caller. `search()` below is the other half of that fix.
  */
 export const DIGEST_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+/** What `search()` returns when the caller does not say. A recall, not a dump. */
+export const DEFAULT_SEARCH_LIMIT = 10;
+
+/**
+ * And the most it will ever return, whatever it is asked for. Results are read
+ * by a model with a few hundred characters to answer in, so an unbounded search
+ * would not be a better answer — it would be a worse one, more slowly.
+ */
+export const MAX_SEARCH_LIMIT = 50;
 
 /**
  * The only kinds that may be written. They are speech.mjs's trigger kinds minus
@@ -209,6 +228,7 @@ const countPhrase = (n, one, many = `${one}s`) => (n === 1 ? `one ${one}` : `${n
  *              platform has them (the prune degrades gracefully without them).
  * now        — () => ms, injected so the digest's relative phrasing is testable.
  * maxEntries — the file is pruned back to this many, newest kept.
+ * digestWindowMs — how far back `digest()` looks when the call does not say.
  *
  * Every read hits the file. It is at most `maxEntries` short lines and notable
  * events are minutes apart, so a cache would buy nothing and would go stale the
@@ -222,6 +242,7 @@ export function createLedger({
   fs = null,
   now = Date.now,
   maxEntries = DEFAULT_MAX_ENTRIES,
+  digestWindowMs = DIGEST_WINDOW_MS,
 } = {}) {
   const clock = () => {
     const t = Number(typeof now === 'function' ? now() : now);
@@ -230,6 +251,9 @@ export function createLedger({
 
   const capRaw = Number(maxEntries);
   const cap = Number.isFinite(capRaw) && capRaw > 0 ? Math.floor(capRaw) : DEFAULT_MAX_ENTRIES;
+
+  const windowRaw = Number(digestWindowMs);
+  const defaultWindowMs = Number.isFinite(windowRaw) && windowRaw > 0 ? windowRaw : DIGEST_WINDOW_MS;
 
   const usable = Boolean(filePath)
     && Boolean(fs)
@@ -245,6 +269,7 @@ export function createLedger({
       recent: () => [],
       since: () => [],
       forProject: () => [],
+      search: () => [],
       digest: () => null,
       stats: () => ({ path: filePath ?? null, enabled: false, entries: 0, oldest: null, newest: null, maxEntries: cap }),
     };
@@ -361,6 +386,13 @@ export function createLedger({
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
   };
 
+  /**
+   * How a project or tool name is matched: case-insensitively, because Windows
+   * hands the same directory back in whatever case it was typed in and
+   * `ganyu-pet` and `Ganyu-Pet` are not two projects. Empty means "no filter".
+   */
+  const nameKey = (value) => (typeof value === 'string' ? value.trim().toLowerCase() : '');
+
   /** The newest `n`, newest first. Every read in this module is newest first. */
   function recent(n = 10) {
     return readAll().slice(-limitOf(n, 10)).reverse();
@@ -373,17 +405,74 @@ export function createLedger({
     return (from === null ? all : all.filter((e) => e.at >= from)).reverse();
   }
 
-  /**
-   * Recall scoped to one project, newest first. Matched case-insensitively —
-   * Windows hands the same directory back in whatever case it was typed in, and
-   * `ganyu-pet` and `Ganyu-Pet` are not two projects.
-   */
+  /** Recall scoped to one project, newest first. Matched by `nameKey` above. */
   function forProject(name, n = 10) {
-    const key = typeof name === 'string' ? name.trim().toLowerCase() : '';
+    const key = nameKey(name);
     if (key === '') return [];
     return readAll()
       .filter((e) => (e.project ?? '').toLowerCase() === key)
       .slice(-limitOf(n, 10))
+      .reverse();
+  }
+
+  /**
+   * `search({query, kind, project, tool, since, until, limit})` — look something
+   * up, rather than be handed a summary of the last six hours.
+   *
+   * Everything is optional and the filters compose (AND); with no arguments at
+   * all this is `recent()`. Newest first, like every read in this module, and
+   * bounded by `limit` (default DEFAULT_SEARCH_LIMIT, hard cap MAX_SEARCH_LIMIT).
+   *
+   * **Keyword, not semantic, and that is the right call at this scale.** The
+   * corpus is a few hundred entries of six short fields — an embedding index
+   * would cost a dependency, a build step and a model round trip to do worse
+   * than `includes()` on "npm test". `query` is split on whitespace and *every*
+   * term must appear somewhere in the entry's detail, tool or project text, so
+   * "npm test failed" narrows instead of matching nothing the way one long
+   * substring would. The command string lives inside `detail` (context.
+   * describeAction wrote it there), which is why there is no separate field for
+   * it; `kind` has its own parameter and is deliberately **not** in the haystack,
+   * so a file called `failed.ts` does not drag in every failure.
+   *
+   * `kind` takes one name or a list. An unrecognised one is dropped, and a
+   * filter left with nothing recognisable in it is dropped entirely rather than
+   * matching zero rows: a caller's typo should cost precision, not turn a pet
+   * who remembers the evening into one who says she remembers nothing.
+   */
+  function search({
+    query = null,
+    kind = null,
+    project = null,
+    tool = null,
+    since = null,
+    until = null,
+    limit = DEFAULT_SEARCH_LIMIT,
+  } = {}) {
+    const terms = String(query ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+
+    const asked = (Array.isArray(kind) ? kind : [kind])
+      .map((k) => (typeof k === 'string' ? k.trim().toLowerCase() : ''))
+      .filter((k) => LEDGER_KINDS.includes(k));
+    const kinds = asked.length ? new Set(asked) : null;
+
+    const wantProject = nameKey(project);
+    const wantTool = nameKey(tool);
+    const from = finiteMs(since);
+    const to = finiteMs(until);
+    const take = Math.min(limitOf(limit, DEFAULT_SEARCH_LIMIT), MAX_SEARCH_LIMIT);
+
+    return readAll()
+      .filter((entry) => {
+        if (kinds && !kinds.has(entry.kind)) return false;
+        if (wantProject && (entry.project ?? '').toLowerCase() !== wantProject) return false;
+        if (wantTool && (entry.tool ?? '').toLowerCase() !== wantTool) return false;
+        if (from !== null && entry.at < from) return false;
+        if (to !== null && entry.at > to) return false;
+        if (terms.length === 0) return true;
+        const hay = `${entry.detail ?? ''} ${entry.tool ?? ''} ${entry.project ?? ''}`.toLowerCase();
+        return terms.every((term) => hay.includes(term));
+      })
+      .slice(-take)
       .reverse();
   }
 
@@ -399,7 +488,7 @@ export function createLedger({
    *   ago; 3 sessions started.
    *   Projects: ganyu-pet, GolfCRM/bay-daily-codes.
    */
-  function digest({ now: at = null, windowMs = DIGEST_WINDOW_MS } = {}) {
+  function digest({ now: at = null, windowMs = defaultWindowMs } = {}) {
     const t = finiteMs(at) ?? clock();
     const win = finiteMs(windowMs);
     const cutoff = win === null ? -Infinity : t - win;
@@ -489,6 +578,7 @@ export function createLedger({
     recent,
     since,
     forProject,
+    search,
     digest,
     /** Introspection for tests and debugging, in the shape speech/brain use. */
     stats() {
