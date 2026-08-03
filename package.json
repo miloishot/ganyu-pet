@@ -1,8 +1,12 @@
 {
   "name": "ganyu-pet",
   "version": "0.1.0",
-  "private": true,
-  "description": "Desktop pet overlay: Ganyu reacts to codex + Claude Code lifecycle hooks, chats via Haiku, and wanders when idle.",
+  "description": "Desktop pet overlay: reacts to Codex + Claude Code lifecycle hooks, chats, and wanders when idle.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/miloishot/ganyu-pet.git"
+  },
   "type": "module",
   "main": "src/main/index.mjs",
   "scripts": {
