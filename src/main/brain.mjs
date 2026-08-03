@@ -49,8 +49,7 @@
 import fs from 'node:fs';
 
 import {
-  BRAIN_INSTRUCTIONS,
-  CHAT_INSTRUCTIONS,
+  BUILTIN_PERSONA,
   buildBrainInput,
   buildChatInput,
   clampLine,
@@ -58,6 +57,23 @@ import {
 
 /** Long enough for a slow first token, short enough that a stale line never lands. */
 export const REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * The same deadline for a chat reply, and deliberately not the same number —
+ * the second time this pair of paths has needed two values for one idea (see
+ * MAX_BRAIN_LINE_CHARS / MAX_CHAT_LINE_CHARS below).
+ *
+ * **Measured 2026-08-03: a chat reply with both tools available takes 7.8s
+ * against a 10s deadline.** It was losing that race often enough that the
+ * symptom read as a crash: the message goes up, the dots spin, and nothing ever
+ * comes back, because an aborted request resolves null and null is silence.
+ *
+ * The asymmetry is the point. An ambient line is *unasked for*, so a stale one
+ * is worse than none and 10s is generous. A chat reply is a question he is
+ * sitting in front of waiting for — thirty seconds of waiting beats an answer
+ * that never arrives, and he can always close the strip.
+ */
+export const CHAT_TIMEOUT_MS = 45_000;
 
 /** Hard cap on a generated line. The prompt asks for 120; this is the backstop. */
 export const MAX_BRAIN_LINE_CHARS = 140;
@@ -726,11 +742,16 @@ export function createBrain({
   now = Date.now,
   log = null,
   timeoutMs = REQUEST_TIMEOUT_MS,
+  chatTimeoutMs = CHAT_TIMEOUT_MS,
   toolTimeoutMs = TOOL_TIMEOUT_MS,
   getContext = null,
   getMemory = null,
   searchMemory = null,
   readSession = null,
+  // Which pet is speaking. Injected rather than imported: a module that reaches
+  // for the built-in persona is one that quietly ignores the config the owner
+  // actually loaded, and the failure looks like "my custom pet sounds like Ganyu".
+  persona = BUILTIN_PERSONA,
 } = {}) {
   const baseUrl = String(config?.baseUrl ?? '').replace(/\/+$/, '');
   const model = String(config?.model ?? '');
@@ -739,6 +760,10 @@ export function createBrain({
   // Absent means on: a brain constructed from a hand-built config in a test, or
   // from a `.env.local` written before the key existed, behaves as he asked.
   const seePrompts = config?.seePrompts !== false;
+  // The two paths' room, assembled once. Token cap and deadline together,
+  // because both answer the same question for the same path.
+  const ambientLimits = Object.freeze({ ...AMBIENT_LIMITS, timeoutMs });
+  const chatLimits = Object.freeze({ ...CHAT_LIMITS, timeoutMs: chatTimeoutMs });
   // And this one absent means off, for the opposite reason: `loadBrainConfig`
   // has already turned the key into a boolean, so anything else reaching here —
   // a hand-built config, a `.env.local` written before the key existed — is a
@@ -854,7 +879,9 @@ export function createBrain({
    */
   async function attempt(kind, instructions, input, limits, tools = null) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    // The deadline rides on `limits` beside the token cap, because it is the
+    // same kind of fact: how much room this particular path is allowed.
+    const timer = setTimeout(() => controller.abort(), limits?.timeoutMs ?? timeoutMs);
     try {
       const res = await fetchImpl(`${baseUrl}${ROUTES[kind]}`, {
         method: 'POST',
@@ -1075,7 +1102,7 @@ export function createBrain({
       const context = readContext();
       const input = buildBrainInput(context ? { ...detail, context } : detail, summary);
       // No tools, deliberately: see MEMORY_SEARCH_TOOL. One call, one line.
-      return await textOf(BRAIN_INSTRUCTIONS, input, AMBIENT_LIMITS);
+      return await textOf(persona.brainInstructions, input, ambientLimits);
     } catch {
       return null; // requestLine is a promise of a line or null, never a rejection
     } finally {
@@ -1117,8 +1144,10 @@ export function createBrain({
     const started = now();
     try {
       const context = readContext();
-      const input = buildChatInput({ text: message, history, context, memory: readMemory() });
-      if (!chatTools) return await textOf(CHAT_INSTRUCTIONS, input, CHAT_LIMITS);
+      const input = buildChatInput({
+        text: message, history, context, memory: readMemory(), speakers: persona.chatSpeakers,
+      });
+      if (!chatTools) return await textOf(persona.chatInstructions, input, chatLimits);
 
       // `items` stays null until a tool result forces the array form, so the
       // first request carries the plain string exactly as it always has — which
@@ -1126,7 +1155,7 @@ export function createBrain({
       let items = null;
       let carried = null;
       for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-        const out = await exchange(CHAT_INSTRUCTIONS, items ?? input, CHAT_LIMITS, { tools: chatTools });
+        const out = await exchange(persona.chatInstructions, items ?? input, chatLimits, { tools: chatTools });
         if (!out) return carried; // transport gave up; whatever we already had
         if (out.text) carried = out.text;
         if (out.calls.length === 0) return out.text ?? carried;

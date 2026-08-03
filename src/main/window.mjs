@@ -14,9 +14,51 @@ import { pathToFileURL } from 'node:url';
 // channel names are defined there rather than duplicated into CHANNELS below,
 // because two frozen tables of the same strings is exactly how they drift.
 import { CHAT_CHANNELS } from './chat.mjs';
+import { DEFAULT_PET_CONFIG } from './petconfig.mjs';
 
 /** Sprite frame is 192x208; the extra headroom is for the speech bubble. */
-export const WINDOW_SIZE = Object.freeze({ width: 256, height: 320 });
+export const WINDOW_SIZE = Object.freeze({
+  width: DEFAULT_PET_CONFIG.presentation.windowWidth,
+  height: DEFAULT_PET_CONFIG.presentation.windowHeight,
+});
+
+/**
+ * The pet this module is currently bound to. Module-level mutable state, which
+ * this repo otherwise avoids — and the alternative is worse: `size` is a default
+ * parameter on six exported functions and is read at a dozen call sites, so
+ * threading it through would put a config object in every signature to express
+ * a value that is fixed once at boot and never changes again. `usePetConfig` is
+ * called before the first window exists and nothing rebinds it afterwards.
+ */
+let activeSize = WINDOW_SIZE;
+let activePetId = DEFAULT_PET_CONFIG.id;
+let activePetDisplayName = DEFAULT_PET_CONFIG.displayName;
+
+/** Bind this module to a loaded pet. Returns what it bound, for the log line. */
+export function usePetConfig(config) {
+  const presentation = config?.presentation;
+  if (presentation) {
+    activeSize = Object.freeze({
+      width: presentation.windowWidth,
+      height: presentation.windowHeight,
+    });
+  }
+  if (typeof config?.id === 'string' && config.id.trim() !== '') activePetId = config.id;
+  if (typeof config?.displayName === 'string' && config.displayName.trim() !== '') {
+    activePetDisplayName = config.displayName;
+  }
+  return { size: activeSize, petId: activePetId, displayName: activePetDisplayName };
+}
+
+/** The bound pet's window size. Every `size =` default below reads this. */
+export function windowSize() {
+  return activeSize;
+}
+
+/** The bound pet's id — which directory under `pets/` holds its spritesheet. */
+export function petId() {
+  return activePetId;
+}
 
 /** Flags asserted by `npm run smoke`; kept beside the BrowserWindow options. */
 export const WINDOW_FLAGS = Object.freeze({ transparent: true, frame: false });
@@ -89,7 +131,7 @@ export const SIZE_DRIFT_TOLERANCE = 8;
  * every move is what stops it compounding, so do not "simplify" this back to
  * `setPosition`. One `setBounds` also fully recovers an already-inflated window.
  */
-export function moveWindowPinned(win, x, y, size = WINDOW_SIZE) {
+export function moveWindowPinned(win, x, y, size = windowSize()) {
   if (!win) return null;
   const bounds = { x: Math.round(x), y: Math.round(y), width: size.width, height: size.height };
   win.setBounds(bounds);
@@ -106,7 +148,7 @@ export function moveWindowPinned(win, x, y, size = WINDOW_SIZE) {
  * is the one `moveWindowPinned` actually sets. Outside it, the reading is either
  * drift or a genuinely different window, and the caller should act on it.
  */
-export function sizeWithinTolerance(measured, size = WINDOW_SIZE, tolerance = SIZE_DRIFT_TOLERANCE) {
+export function sizeWithinTolerance(measured, size = windowSize(), tolerance = SIZE_DRIFT_TOLERANCE) {
   if (!measured || !Number.isFinite(measured.width) || !Number.isFinite(measured.height)) return false;
   return Math.abs(measured.width - size.width) <= tolerance && Math.abs(measured.height - size.height) <= tolerance;
 }
@@ -118,7 +160,7 @@ export function sizeWithinTolerance(measured, size = WINDOW_SIZE, tolerance = SI
  * null when there was nothing to do — `moveWindowPinned` should mean this never
  * fires, and it firing is worth knowing about.
  */
-export function enforceWindowSize(win, { size = WINDOW_SIZE, tolerance = SIZE_DRIFT_TOLERANCE } = {}) {
+export function enforceWindowSize(win, { size = windowSize(), tolerance = SIZE_DRIFT_TOLERANCE } = {}) {
   if (!win) return null;
   const b = win.getBounds();
   if (!b || !Number.isFinite(b.width) || !Number.isFinite(b.height)) return null;
@@ -127,8 +169,12 @@ export function enforceWindowSize(win, { size = WINDOW_SIZE, tolerance = SIZE_DR
   return { width: b.width, height: b.height };
 }
 
-/** Codex pet id — see contracts.md "Machine facts". */
-export const PET_ID = 'ganyu--chenxin-dlut';
+/**
+ * The built-in pet's id — see contracts.md "Machine facts". Kept as a named
+ * constant because it is what `usePetConfig` starts bound to; read `petId()`
+ * for the pet actually loaded.
+ */
+export const PET_ID = DEFAULT_PET_CONFIG.id;
 
 /**
  * Channels this module owns. Nothing outside this list — and CHAT_CHANNELS,
@@ -214,7 +260,7 @@ export const MENU_ACTIONS = Object.freeze(['toggle-mute', 'toggle-pin', 'home', 
  * Electron adds invisible frame padding on Windows, so WINDOW_SIZE lands the
  * bottom edge a few pixels below the work area.
  */
-export function computeInitialBounds(workArea, size = WINDOW_SIZE) {
+export function computeInitialBounds(workArea, size = windowSize()) {
   const wa = { x: 0, y: 0, width: 1920, height: 1080, ...(workArea || {}) };
   const margin = 24;
   return {
@@ -231,7 +277,7 @@ export function computeInitialBounds(workArea, size = WINDOW_SIZE) {
  * is ever hoverable.
  */
 export function spriteBox(bounds, sprite = SPRITE_SIZE) {
-  const b = { x: 0, y: 0, width: WINDOW_SIZE.width, height: WINDOW_SIZE.height, ...(bounds || {}) };
+  const b = { x: 0, y: 0, width: windowSize().width, height: windowSize().height, ...(bounds || {}) };
   const width = Math.min(sprite.width, b.width);
   const height = Math.min(sprite.height, b.height);
   return {
@@ -635,11 +681,11 @@ export function createDragTracker({
  *   3. `spritesheetPath` from `pet.json` in that directory (relative or absolute)
  * Returns an absolute path, or null when nothing is found.
  */
-export function resolveSpritePath({ env = process.env, home = os.homedir(), exists = fs.existsSync, read = fs.readFileSync } = {}) {
+export function resolveSpritePath({ id = null, env = process.env, home = os.homedir(), exists = fs.existsSync, read = fs.readFileSync } = {}) {
   const codexHome = env.CODEX_HOME && String(env.CODEX_HOME).trim()
     ? String(env.CODEX_HOME).trim()
     : path.join(home, '.codex');
-  const petDir = path.join(codexHome, 'pets', PET_ID);
+  const petDir = path.join(codexHome, 'pets', id ?? petId());
 
   const direct = path.join(petDir, 'spritesheet.webp');
   if (exists(direct)) return direct;
@@ -677,14 +723,16 @@ const EFFECTIVE_OPTIONS = new WeakMap();
  * Click-through is ON by default; the hover watch and the renderer flip it on
  * sprite hover.
  */
-export function createPetWindow({ BrowserWindow, workArea, preloadPath, size = WINDOW_SIZE, options = {} }) {
+export function createPetWindow({ BrowserWindow, workArea, preloadPath, size = windowSize(), options = {} }) {
   const bounds = computeInitialBounds(workArea, size);
   const winOptions = {
     x: bounds.x,
     y: bounds.y,
     width: bounds.width,
     height: bounds.height,
-    title: 'Ganyu',
+    // The pet's own name, so two pets are two entries in the task switcher
+    // rather than two windows called Ganyu.
+    title: activePetDisplayName,
     frame: WINDOW_FLAGS.frame,
     transparent: WINDOW_FLAGS.transparent,
     alwaysOnTop: true,

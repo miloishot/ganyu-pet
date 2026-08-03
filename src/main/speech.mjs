@@ -13,7 +13,7 @@
 
 import { RECENT_WINDOW_MS, basename, describeAction, pickToolInput, projectFromCwd } from './context.mjs';
 import { LEDGER_KINDS } from './ledger.mjs';
-import { buildSummary, createMentionMemory, messageFor } from './persona.mjs';
+import { BUILTIN_PERSONA, buildSummary, createMentionMemory, messageFor } from './persona.mjs';
 
 /**
  * Floor between two lines of the *same* urgent kind. Urgent lines are otherwise
@@ -229,6 +229,8 @@ export function createSpeech({
   audioHoldMs = AUDIO_HOLD_MS,
   schedule = (fn, ms) => setTimeout(fn, ms),
   cancel = (handle) => clearTimeout(handle),
+  // See createBrain: injected, never imported, for the same reason.
+  persona = BUILTIN_PERSONA,
 } = {}) {
   const now = () => (typeof clock === 'function' ? clock() : clock.now());
   const muted = () => (typeof isMuted === 'function' ? Boolean(isMuted()) : Boolean(isMuted));
@@ -709,6 +711,7 @@ export function createSpeech({
       project: ev.project,
       random,
       avoid: avoidFor(kind),
+      persona,
     });
 
     if (!askBrain) return show(kind, canned, ev, summary, { level });

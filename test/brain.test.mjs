@@ -13,6 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  CHAT_TIMEOUT_MS,
   DEFAULT_REASONING_EFFORT,
   MAX_BRAIN_LINE_CHARS,
   MAX_CHAT_LINE_CHARS,
@@ -21,6 +22,7 @@ import {
   MEMORY_FENCE_OPEN,
   MEMORY_SEARCH_TOOL,
   READ_SESSION_TOOL,
+  REQUEST_TIMEOUT_MS,
   REQUIRED_KEYS,
   ROUTES,
   SESSION_FENCE_CLOSE,
@@ -31,24 +33,29 @@ import {
   fenceSessionDigest,
   loadBrainConfig,
   memorySearchFrom,
-  searchArgsFrom,
-  sessionArgsFrom,
-  sessionReadingFrom,
-  seePromptsFrom,
   parseEnvFile,
   postProcess,
+  searchArgsFrom,
+  seePromptsFrom,
+  sessionArgsFrom,
+  sessionReadingFrom,
 } from '../src/main/brain.mjs';
 import { buildContext } from '../src/main/context.mjs';
 import {
-  BRAIN_INSTRUCTIONS,
   BRAIN_LINE_TARGET_CHARS,
-  CHAT_INSTRUCTIONS,
+  BUILTIN_PERSONA,
   CHAT_LINE_TARGET_CHARS,
-  OWNER_NAME,
-  VOICE_EXAMPLES,
   buildBrainInput,
   buildChatInput,
 } from '../src/main/persona.mjs';
+
+// See test/speech.test.mjs for why these are destructured rather than imported.
+const {
+  brainInstructions: BRAIN_INSTRUCTIONS,
+  chatInstructions: CHAT_INSTRUCTIONS,
+  ownerName: OWNER_NAME,
+  voiceExamples: VOICE_EXAMPLES,
+} = BUILTIN_PERSONA;
 
 const CONFIG = Object.freeze({
   enabled: true,
@@ -1720,4 +1727,51 @@ test('GANYU_READ_SESSIONS is off only when it is spelled off', () => {
   for (const on of [undefined, null, '1', 'true', 'yes', 'anything at all']) {
     assert.equal(sessionReadingFrom(on), true, `${JSON.stringify(on)} should leave it on`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// The two deadlines
+//
+// Measured 2026-08-03: a chat reply with both tools available takes ~7.8s
+// against the ambient path's 10s abort, and lost that race often enough that
+// the symptom read as a crash — the message goes up, the dots spin, and nothing
+// comes back, because an aborted request resolves null and null is silence.
+// ---------------------------------------------------------------------------
+
+test('a chat reply gets a longer deadline than an ambient line', async () => {
+  const deadlines = [];
+  // A fetch that never settles, so the only thing that can end either request is
+  // the abort — which makes the recorded delay the deadline itself.
+  const fetchImpl = (_url, init) => new Promise((_resolve, reject) => {
+    const started = Date.now();
+    init.signal.addEventListener('abort', () => {
+      deadlines.push(Date.now() - started);
+      const err = new Error('aborted');
+      err.name = 'AbortError';
+      reject(err);
+    });
+  });
+
+  const brain = createBrain({
+    config: CONFIG,
+    fetchImpl,
+    timeoutMs: 20,
+    chatTimeoutMs: 200,
+    log: { info() {}, warn() {}, error() {} },
+  });
+
+  await brain.requestLine({ source: 'codex', event: 'Stop', project: 'p' });
+  await brain.requestChat({ text: 'are you there', history: [] });
+
+  assert.equal(deadlines.length, 2, 'both paths aborted');
+  assert.ok(deadlines[0] < 120, `ambient aborted at ${deadlines[0]}ms, expected ~20`);
+  assert.ok(deadlines[1] >= 180, `chat aborted at ${deadlines[1]}ms, expected >=200`);
+  assert.ok(deadlines[1] > deadlines[0], 'and the asked-for answer waits longer than the volunteered one');
+});
+
+test('the shipped chat deadline is well clear of a real tool-using reply', () => {
+  // 7.8s measured; anything under ~15s is a deadline that will lose the race
+  // again the first time the endpoint has a slow day.
+  assert.ok(CHAT_TIMEOUT_MS >= 30_000, `CHAT_TIMEOUT_MS is ${CHAT_TIMEOUT_MS}`);
+  assert.ok(CHAT_TIMEOUT_MS > REQUEST_TIMEOUT_MS, 'and longer than the ambient one');
 });

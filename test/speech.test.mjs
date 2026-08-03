@@ -26,15 +26,21 @@ import {
 import { createState } from '../src/main/state.mjs';
 import { toSpeechDetail } from '../src/main/window.mjs';
 import {
-  BRAIN_INSTRUCTIONS,
   BRAIN_LINE_TARGET_CHARS,
+  BUILTIN_PERSONA,
   MAX_LINE_CHARS,
-  MESSAGES,
-  VOICE_EXAMPLES,
   buildSummary,
   messageFor,
   sourceLabel,
 } from '../src/main/persona.mjs';
+
+// The built-in pet's own words. They used to be module-level exports; they now
+// come from DEFAULT_PET_CONFIG through createPersona, so these three names mean
+// exactly what they always did and every assertion below is unchanged. What the
+// move buys is that the *rules* they encode are validation now (petconfig.mjs)
+// rather than assertions about one character's strings — so a pet nobody has
+// written yet inherits them.
+const { brainInstructions: BRAIN_INSTRUCTIONS, messages: MESSAGES, voiceExamples: VOICE_EXAMPLES } = BUILTIN_PERSONA;
 
 /**
  * A ledger, shrunk to the one method speech calls. `entries` is what reached

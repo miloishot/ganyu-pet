@@ -127,13 +127,18 @@ const VOICE_LOCAL = new Set(['local', 'sapi', 'offline', 'system']);
 const FALSEY = new Set(['0', 'false', 'no', 'off', 'never', '']);
 
 /**
- * `loadVoiceConfig({envPath, fs})` -> `{enabled, mode, voice, ambient, reason}`
+ * `loadVoiceConfig({envPath, fs, pet})` -> `{enabled, mode, voice, rate, pitch, ambient, reason}`
  *
  * Never throws and has no required keys: a machine with no `.env.local` at all
  * gets the default voice on the default endpoint, which is the whole point —
  * unlike the brain, this needs no credentials from him.
+ *
+ * **Two sources, and the order between them is deliberate.** `pet.voice` says
+ * how this character sounds and travels with the pet; `.env.local` is one
+ * person's machine, and it wins. A shared config that could override a local
+ * mute would mean installing someone's pet could turn your speakers on.
  */
-export function loadVoiceConfig({ envPath = null, fs = null } = {}) {
+export function loadVoiceConfig({ envPath = null, fs = null, pet = null } = {}) {
   let env = {};
   if (envPath && fs && typeof fs.readFileSync === 'function') {
     try {
@@ -143,15 +148,34 @@ export function loadVoiceConfig({ envPath = null, fs = null } = {}) {
     }
   }
 
+  const petVoice = pet?.voice ?? null;
+  const petName = String(petVoice?.name ?? '').trim();
+  const petMode = petVoice?.provider === 'local' ? 'local' : 'edge';
+  const baseVoice = petName === '' ? DEFAULT_VOICE : petName;
+
   const raw = String(env.GANYU_VOICE ?? '').trim().toLowerCase();
   if (raw !== '' && VOICE_OFF.has(raw)) {
-    return { enabled: false, mode: 'edge', voice: DEFAULT_VOICE, ambient: false, reason: 'GANYU_VOICE is off' };
+    return {
+      enabled: false, mode: petMode, voice: baseVoice, rate: VOICE_RATE, pitch: VOICE_PITCH,
+      ambient: false, reason: 'GANYU_VOICE is off',
+    };
+  }
+  // A pet that declares no voice is a silent pet by design, not a broken one.
+  if (petVoice && petVoice.provider === 'none') {
+    return {
+      enabled: false, mode: 'edge', voice: DEFAULT_VOICE, rate: VOICE_RATE, pitch: VOICE_PITCH,
+      ambient: false, reason: 'this pet has no voice',
+    };
   }
   const name = String(env.GANYU_VOICE_NAME ?? '').trim();
   return {
     enabled: true,
-    mode: VOICE_LOCAL.has(raw) ? 'local' : 'edge',
-    voice: name === '' ? DEFAULT_VOICE : name,
+    mode: raw === '' ? petMode : (VOICE_LOCAL.has(raw) ? 'local' : 'edge'),
+    voice: name === '' ? baseVoice : name,
+    // Prosody has no env override: it is part of how a character sounds, not a
+    // machine preference, and a half-overridden voice is nobody's voice.
+    rate: typeof petVoice?.rate === 'string' ? petVoice.rate : VOICE_RATE,
+    pitch: typeof petVoice?.pitch === 'string' ? petVoice.pitch : VOICE_PITCH,
     // `GANYU_VOICE_AMBIENT=off` leaves her answering when spoken to and silent
     // the rest of the time — the one half of this feature someone might
     // reasonably not want, since ambient lines arrive unprompted. A key he has

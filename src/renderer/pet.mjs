@@ -9,18 +9,42 @@
 
 import { createBubbles, BUBBLE_PRIORITY } from './bubbles.mjs';
 
-export const FRAME_W = 192;
-export const FRAME_H = 208;
-export const FRAMES_PER_ROW = 8;
-export const ROW_COUNT = 9;
-export const SHEET_W = FRAME_W * FRAMES_PER_ROW; // 1536
-export const SHEET_H = FRAME_H * ROW_COUNT; // 1872
+// ---------------------------------------------------------------------------
+// Sheet geometry and row semantics
+//
+// **These are `let`, not `const`, and that is the whole mechanism.** Which pet
+// is loaded is not known until main reads its config and pushes it down through
+// `ganyu.getFlags()`, and ESM live bindings mean `useSpriteConfig` can rebind
+// them once at boot and every importer — this file's own 30-odd references and
+// the renderer tests alike — sees the new values with no call-site churn.
+//
+// Nothing rebinds them after boot. Treat them as constants that are chosen late
+// rather than as state.
+//
+// The values written here are the built-in pet's, duplicated from
+// `DEFAULT_PET_CONFIG` in `src/main/petconfig.mjs` because the renderer cannot
+// import that file — it pulls in `node:path`, and this module has to load in a
+// context with no node built-ins at all. `test/renderer.test.mjs` asserts the
+// two copies agree, which is the only honest way to keep a necessary duplicate.
+// ---------------------------------------------------------------------------
+
+export let FRAME_W = 192;
+export let FRAME_H = 208;
+export let FRAMES_PER_ROW = 8;
+export let ROW_COUNT = 9;
+export let SHEET_W = FRAME_W * FRAMES_PER_ROW; // 1536
+export let SHEET_H = FRAME_H * ROW_COUNT; // 1872
 
 // Measured real (non-transparent) frame count per row — the grid is 8 wide but
 // most rows stop short and their trailing cells are fully transparent. Drawing
 // those blanks is a visible blink, so animation must wrap here, not at 8.
-export const ROW_FRAMES = Object.freeze([6, 8, 8, 4, 5, 8, 6, 6, 6]);
+export let ROW_FRAMES = Object.freeze([6, 8, 8, 4, 5, 8, 6, 6, 6]);
 
+/**
+ * The built-in sheet's rows by name. Only used to write the maps below
+ * readably; a loaded config supplies row *indices* directly, because a second
+ * pet's sheet has its own order and no reason to share these names.
+ */
 export const ROW = {
   IDLE: 0,
   RUN_RIGHT: 1,
@@ -34,7 +58,7 @@ export const ROW = {
 };
 
 /** Aggregate mode -> row. Unknown modes fall back to idle. */
-export const MODE_ROW = {
+export let MODE_ROW = {
   idle: ROW.IDLE,
   // Row 7 (BUSY) is a run-in-place sprite and must never play while stationary —
   // REVIEW is the standing working pose, so busy maps there instead.
@@ -44,19 +68,62 @@ export const MODE_ROW = {
 };
 
 /** walk.dir -> row. */
-export const WALK_ROW = {
+export let WALK_ROW = {
   right: ROW.RUN_RIGHT,
   left: ROW.RUN_LEFT,
 };
 
 /** celebrate pulse: jump once, then wave once, then back to the base row. */
-export const CELEBRATE_PULSE = [ROW.JUMP, ROW.WAVE];
+export let CELEBRATE_PULSE = [ROW.JUMP, ROW.WAVE];
 
-export const DEFAULT_FPS = 8;
-export const WALK_FPS = 6;
+/** Held in the cursor or mid-throw — the one pose that is not a stance. */
+export let AIRBORNE_ROW = ROW.JUMP;
+
+/** The row every fallback lands on. Config-chosen, because row 0 need not be idle. */
+export let IDLE_ROW = ROW.IDLE;
+
+export let DEFAULT_FPS = 8;
+export let WALK_FPS = 6;
+
+/** row index -> fps override, for rows the config gives their own rate. */
+let ROW_FPS = { [ROW.RUN_RIGHT]: WALK_FPS, [ROW.RUN_LEFT]: WALK_FPS };
+
+/**
+ * Bind this module to a loaded pet. Called once, from `boot`, with the sprite
+ * block `ganyu.getFlags()` carries; called with nothing it leaves the built-in
+ * pet in place, which is what a failed or absent config falls back to.
+ *
+ * Every field is optional and validated on the main side already
+ * (`validatePetConfig`), so this only has to be tolerant of *absence*, not of
+ * garbage — a config that reached here has been checked.
+ */
+export function useSpriteConfig(sprite) {
+  if (!sprite || typeof sprite !== 'object') return false;
+  const g = sprite.geometry ?? {};
+  if (Number.isInteger(g.frameW)) FRAME_W = g.frameW;
+  if (Number.isInteger(g.frameH)) FRAME_H = g.frameH;
+  if (Number.isInteger(g.columns)) FRAMES_PER_ROW = g.columns;
+  if (Number.isInteger(g.rows)) ROW_COUNT = g.rows;
+  SHEET_W = FRAME_W * FRAMES_PER_ROW;
+  SHEET_H = FRAME_H * ROW_COUNT;
+
+  const a = sprite.animation ?? {};
+  if (Array.isArray(a.rowFrames)) ROW_FRAMES = Object.freeze([...a.rowFrames]);
+  if (Number.isFinite(a.defaultFps) && a.defaultFps > 0) DEFAULT_FPS = a.defaultFps;
+  if (a.rowFps && typeof a.rowFps === 'object') ROW_FPS = { ...a.rowFps };
+  if (a.modes && typeof a.modes === 'object') {
+    MODE_ROW = { ...a.modes };
+    if (Number.isInteger(a.modes.idle)) IDLE_ROW = a.modes.idle;
+  }
+  if (a.walk && typeof a.walk === 'object') WALK_ROW = { ...a.walk };
+  if (Array.isArray(a.celebrate)) CELEBRATE_PULSE = [...a.celebrate];
+  if (Number.isInteger(a.airborne)) AIRBORNE_ROW = a.airborne;
+  return true;
+}
 
 export function fpsForRow(row) {
-  return row === ROW.RUN_RIGHT || row === ROW.RUN_LEFT ? WALK_FPS : DEFAULT_FPS;
+  const override = ROW_FPS[row];
+  return Number.isFinite(override) && override > 0 ? override : DEFAULT_FPS;
 }
 
 export function framesForRow(row) {
@@ -75,12 +142,12 @@ export function framesForRow(row) {
  * thrown alike — from the sprite's point of view they are the same situation.
  */
 export function baseRowFor(state) {
-  if (state && state.airborne) return ROW.JUMP;
+  if (state && state.airborne) return AIRBORNE_ROW;
   const dir = state && state.walk && state.walk.dir;
   if (dir && Object.prototype.hasOwnProperty.call(WALK_ROW, dir)) return WALK_ROW[dir];
   const mode = state && state.mode;
   if (mode && Object.prototype.hasOwnProperty.call(MODE_ROW, mode)) return MODE_ROW[mode];
-  return ROW.IDLE;
+  return IDLE_ROW;
 }
 
 /**
@@ -89,8 +156,8 @@ export function baseRowFor(state) {
  * repeated pushes during the 10s celebrate window do not restart it.
  */
 export function createAnimator({ now = () => Date.now() } = {}) {
-  let baseRow = ROW.IDLE;
-  let row = ROW.IDLE;
+  let baseRow = IDLE_ROW;
+  let row = IDLE_ROW;
   let frame = 0;
   let lastAdvance = now();
   let pulseIndex = -1; // -1 = not pulsing
@@ -536,6 +603,19 @@ export async function boot({
   }
 
   const flags = (await ganyu.getFlags()) || {};
+  // Before anything measures or draws a frame. Every geometry constant in this
+  // module is a live binding for exactly this call, and the canvas below is
+  // sized from FRAME_W/FRAME_H — rebinding after that would leave the pet drawn
+  // at one pet's scale on another pet's canvas.
+  useSpriteConfig(flags.sprite);
+  // The stylesheet sizes #pet for the built-in pet, and a stylesheet cannot know
+  // which pet loaded. Without this a 64px sheet is stretched to 192px by CSS —
+  // and worse, a frame wider than the pet's own window overflows the flex column
+  // and takes the sprite off-screen entirely, which reads as "it didn't load".
+  if (canvas?.style) {
+    canvas.style.width = `${FRAME_W}px`;
+    canvas.style.height = `${FRAME_H}px`;
+  }
   let muted = Boolean(flags.muted);
   let pinned = Boolean(flags.pinned);
 

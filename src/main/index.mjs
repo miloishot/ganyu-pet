@@ -32,7 +32,10 @@ import {
   spriteFileUrl,
   toSpeechDetail,
   toStatePayload,
+  usePetConfig,
 } from './window.mjs';
+import { DEFAULT_PET_CONFIG, loadPetConfig, resolveSheetPath } from './petconfig.mjs';
+import { createPersona } from './persona.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PRELOAD = path.join(HERE, 'preload.cjs');
@@ -107,6 +110,15 @@ if (process.env.GANYU_NO_GPU === '1') app.disableHardwareAcceleration();
 let win = null;
 const flags = { muted: false, pinned: false };
 let spriteUrl = null;
+
+/**
+ * The pet the app is running as, and its voice. Resolved once in `bootPet`
+ * before any window exists, because `usePetConfig` binds window.mjs's geometry
+ * and the renderer is handed the sprite block on its first `getFlags()`.
+ */
+let petConfig = DEFAULT_PET_CONFIG;
+let persona = createPersona(DEFAULT_PET_CONFIG);
+let petConfigPath = null;
 
 let state = null;
 let server = null;
@@ -739,6 +751,7 @@ async function composeRuntime() {
     if (brainConfig.enabled) {
       brain = brainMod.createBrain({
         config: brainConfig,
+        persona,
         log: console,
         // Read fresh per request, and lazily: the server that owns the ring is
         // created further down this same function.
@@ -802,11 +815,13 @@ async function composeRuntime() {
   let ambientVoice = null;
   const voiceMod = await tryImport('./voice.mjs');
   if (voiceMod?.createVoice && !SMOKE) {
-    const voiceConfig = voiceMod.loadVoiceConfig({ envPath: ENV_FILE, fs });
+    const voiceConfig = voiceMod.loadVoiceConfig({ envPath: ENV_FILE, fs, pet: petConfig });
     if (voiceConfig.enabled) {
       voice = voiceMod.createVoice({
         voice: voiceConfig.voice,
         mode: voiceConfig.mode,
+        rate: voiceConfig.rate,
+        pitch: voiceConfig.pitch,
         log: console,
         // Ships with the feature, not after it. On this machine (Windows 11
         // 21H2 / build 22000) the natural voices cannot be installed at all, so
@@ -832,6 +847,7 @@ async function composeRuntime() {
   if (speechMod?.createSpeech) {
     const speech = speechMod.createSpeech({
       clock,
+      persona,
       onLine: sendSpeak,
       // Smoke is a startup check: keep stray bubbles out of the stdout it parses.
       isMuted: () => flags.muted || SMOKE,
@@ -954,7 +970,79 @@ async function composeRuntime() {
 // ---------------------------------------------------------------------------
 
 function getFlags() {
-  return { muted: flags.muted, pinned: flags.pinned, spritePath: spriteUrl };
+  return {
+    muted: flags.muted,
+    pinned: flags.pinned,
+    spritePath: spriteUrl,
+    sprite: spriteBlock(),
+  };
+}
+
+/**
+ * Everything the renderer needs in order to draw *this* pet — see
+ * `useSpriteConfig` in `src/renderer/pet.mjs`. Sent on the existing
+ * `ganyu:get-flags` reply rather than on a channel of its own: it is read once,
+ * at boot, by the same call that already fetches the sprite path, and a second
+ * channel would be a second thing that can arrive in the wrong order.
+ *
+ * `rowFps` is flattened out of `animation.rows` here rather than in the
+ * renderer, so the renderer never has to know that a row is a record.
+ */
+function spriteBlock() {
+  const anim = petConfig.animation;
+  const rowFps = {};
+  anim.rows.forEach((row, i) => {
+    if (Number.isFinite(row.fps) && row.fps > 0) rowFps[i] = row.fps;
+  });
+  return {
+    geometry: { ...petConfig.geometry },
+    animation: {
+      rowFrames: anim.rows.map((row) => row.frames),
+      defaultFps: anim.defaultFps,
+      rowFps,
+      modes: { ...anim.modes },
+      walk: { ...anim.walk },
+      airborne: anim.airborne,
+      celebrate: [...anim.celebrate],
+    },
+  };
+}
+
+/**
+ * Which pet, and from where. `--pet <id>` beats `GANYU_PET`, which beats the
+ * built-in — a flag is for one run, an env var for one machine.
+ *
+ * A named pet whose file is missing or invalid is a **hard** failure: he asked
+ * for that pet by name, and quietly running Ganyu instead would look like the
+ * config was ignored. Falling back is only right when nobody named anything.
+ */
+function bootPet() {
+  const flagIndex = process.argv.indexOf('--pet');
+  const named = flagIndex >= 0 && process.argv[flagIndex + 1]
+    ? String(process.argv[flagIndex + 1]).trim()
+    : String(process.env.GANYU_PET ?? '').trim();
+
+  if (named !== '') {
+    const filePath = path.join(HERE, '..', '..', 'pets', `${named}.json`);
+    const result = loadPetConfig({ fs, filePath });
+    if (result.ok) {
+      petConfig = result.config;
+      petConfigPath = filePath;
+    } else {
+      console.error(`[ganyu] pet "${named}" could not be loaded:`);
+      for (const err of result.errors) console.error(`  ${err}`);
+      console.error('[ganyu] refusing to start as a different pet than the one you asked for.');
+      app.exit(1);
+      return;
+    }
+  }
+
+  persona = createPersona(petConfig);
+  const bound = usePetConfig(petConfig);
+  console.log(
+    `[ganyu] pet: ${petConfig.displayName} (${petConfig.id}) `
+      + `${bound.size.width}x${bound.size.height}, ${petConfig.animation.rows.length} rows`,
+  );
 }
 
 /**
@@ -1030,7 +1118,13 @@ function handleMenuAction(action) {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  spriteUrl = spriteFileUrl(resolveSpritePath());
+  bootPet();
+  // A config that declares its own sheet path wins; otherwise the installed
+  // Codex pet directory is searched exactly as it always was.
+  const declared = petConfigPath ? resolveSheetPath(petConfig, petConfigPath) : null;
+  spriteUrl = spriteFileUrl(
+    declared && fs.existsSync(declared) ? declared : resolveSpritePath({ id: petConfig.id }),
+  );
   if (!spriteUrl) console.warn('[ganyu] spritesheet not found — renderer will have no sprite');
 
   win = createPetWindow({

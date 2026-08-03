@@ -70,6 +70,9 @@ export const VOICE_PROVIDERS = Object.freeze(['edge', 'local', 'none']);
 // silently dropped is the worst failure this file can have: `fsp: 6` on a walk
 // row animates at the default forever and looks like a sheet problem.
 const TOP_KEYS = Object.freeze([
+  // JSON has no comments and this is a file people edit by hand, so one is
+  // allowed by name. Ignored entirely — it is not read, validated or passed on.
+  '$comment',
   'schemaVersion',
   'id',
   'displayName',
