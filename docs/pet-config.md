@@ -133,8 +133,14 @@ Optional, and separate from the animation. `validatePersonaConfig` in
 "persona": {
   "characterName": "…",
   "ownerName": "…",
-  "instructions": "…",
-  "voiceExamples": [["a session starts", "…"], ["something failed", "…"]],
+  "identity": "Who they are, in a paragraph. At least 80 characters.",
+  "register": ["soft", "unhurried", "plain warm words"],
+  "voiceExamples": [
+    ["a session starts", "…"],
+    ["something failed", "…"],
+    ["a task finished", "…"],
+    ["a quiet moment", "…"]
+  ],
   "messages": {
     "greeting": ["…"], "busy": ["…"], "waiting": ["…"],
     "failed": ["…"], "recovered": ["…"], "celebrate": ["…"]
@@ -142,17 +148,45 @@ Optional, and separate from the animation. `validatePersonaConfig` in
 }
 ```
 
-**`voiceExamples` cannot be empty, and that is enforced.** Instructions alone reliably
-produce a generic corporate assistant no matter how the character is described in the
-abstract — the labelled examples are what actually move the register. `persona.mjs` records
-what that failure looked like in practice, at length, and it is worth reading before writing
-a new one.
+**You supply the character. You do not supply the prompt.** There is no field for the
+system prompt, and that is deliberate. What reads as "the Ganyu prompt" in `persona.mjs`
+is nine blocks, and only two of them are about Ganyu — her identity and her examples.
+The other seven are rules that hold for any pet: react to the specific thing, never
+invent a detail, talk about the work rather than the machinery that carried it out, not
+everything deserves a remark, how to read the owner's own wording, and what a pet can
+honestly claim to have done. Each of those blocks exists because something went wrong
+once and took a day to find. `identity` and `register` are interpolated into them; they
+cannot replace them.
+
+#### What the validator refuses, and why
+
+| Rejected | The bug it prevents |
+|---|---|
+| `identity` under 80 characters | "You are a helpful cat" gives the model nothing to generalise from, so it falls back on its assistant defaults with a name on top. This is the corporate-assistant bug. |
+| a missing or one-word `register` | Same failure, from the other end. |
+| fewer than 4 `voiceExamples` | Too few to show a range; the model reads them as one mood and says everything in it. |
+| two examples sharing a situation label | Two answers to one question — the model blends them instead of reading a range. |
+| any line claiming an action the pet cannot take | The pet watches, remembers and comments. It cannot fix, file, handle, postpone or fetch anything. A line saying otherwise teaches the model it can — this is exactly how "I've set that page aside for you" happened. |
+| more than a quarter of examples about keeping notes | Writing things down is the one thing a pet really does, and over-representing it makes it the only thing it ever says. |
+| a `{tool}` in a voice example | Examples are shown as finished speech, so a template token teaches the model to say the braces out loud. `{owner}` is the one exception, substituted before the prompt is built. |
+| an unknown `{slot}` in a canned message | It would be spoken exactly as written: "Running {file}…" |
 
 `messages` is the canned fallback used whenever the LLM is unavailable, so every kind needs
-at least one line.
+at least one line. Its slots are `{tool}`, `{project}` and `{owner}`.
 
-> Ganyu's own persona text still lives in `src/main/persona.mjs`, not in a config file. The
-> schema here defines the shape a *new* pet's persona would travel in.
+### 4b. Give it a voice
+
+Optional. Omit the block entirely for a silent pet.
+
+```json
+"voice": { "provider": "edge", "name": "en-US-AvaMultilingualNeural", "rate": "-5%", "pitch": "+0Hz" }
+```
+
+`provider` is `edge` (Microsoft neural voices, no key, no dependency), `local` (Windows
+SAPI, whatever is installed) or `none`. Only `edge` takes a `name`. `rate` and `pitch` go
+into SSML as written, so they are checked against the shapes SSML accepts — a malformed
+prosody value does not raise an error, it renders as silence with nothing in any log to
+say why.
 
 ### 5. Validate it
 
@@ -331,7 +365,8 @@ moment either file moves.
 | `animation.airborne` | row index | Required. Outranks everything. |
 | `animation.celebrate` | row index[] | May be `[]`. |
 | `presentation.windowWidth` / `windowHeight` | int > 0 | Must be at least the frame size, or the sprite is cropped. Ganyu's 256×320 is a 192×208 frame plus bubble headroom. |
-| `persona` | object | Optional. See step 4. |
+| `persona` | object | Optional. See step 4. `identity` + `register` + `voiceExamples` + `messages`; there is no field for the system prompt. |
+| `voice` | object | Optional. See step 4b. Omit for a silent pet. |
 
 Unknown keys are **rejected**, not ignored. A mistyped `"fsp": 6` on a walk row would
 otherwise animate at the default rate forever and look like a problem with the sheet.

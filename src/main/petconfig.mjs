@@ -47,6 +47,25 @@ export const PERSONA_MESSAGE_KINDS = Object.freeze([
   'celebrate',
 ]);
 
+/**
+ * Substitutions `messageFor` fills in a canned line (persona.mjs `SLOTS`). A
+ * `{file}` in someone's config is not a typo the app can survive quietly: the
+ * token stays in the text and the pet says "Running {file}…" out loud.
+ */
+export const MESSAGE_SLOTS = Object.freeze(['tool', 'project', 'owner']);
+
+/**
+ * The only substitution a voice example may carry. Examples are shown to the
+ * model as finished speech, so a `{tool}` in one teaches it to say the braces —
+ * but the owner's name has to be *some* token, because a config that spells it
+ * out goes stale the moment `ownerName` changes and leaves the examples
+ * greeting the previous owner. Resolved before the prompt is composed.
+ */
+export const EXAMPLE_SLOTS = Object.freeze(['owner']);
+
+/** Synthesis backends `voice.mjs` knows how to drive. `none` is a mute pet. */
+export const VOICE_PROVIDERS = Object.freeze(['edge', 'local', 'none']);
+
 // Unknown keys are rejected rather than ignored. A mistyped optional key that is
 // silently dropped is the worst failure this file can have: `fsp: 6` on a walk
 // row animates at the default forever and looks like a sheet problem.
@@ -59,6 +78,7 @@ const TOP_KEYS = Object.freeze([
   'animation',
   'presentation',
   'persona',
+  'voice',
 ]);
 const GEOMETRY_KEYS = Object.freeze(['frameW', 'frameH', 'columns', 'rows']);
 const ANIMATION_KEYS = Object.freeze([
@@ -74,10 +94,12 @@ const PRESENTATION_KEYS = Object.freeze(['windowWidth', 'windowHeight']);
 const PERSONA_KEYS = Object.freeze([
   'characterName',
   'ownerName',
-  'instructions',
+  'identity',
+  'register',
   'voiceExamples',
   'messages',
 ]);
+const VOICE_KEYS = Object.freeze(['provider', 'name', 'rate', 'pitch']);
 
 // ---------------------------------------------------------------------------
 // Small predicates. Deliberately boring — every validation message below is
@@ -128,21 +150,121 @@ function checkRowIndex(value, rowCount, where, errors) {
 // ---------------------------------------------------------------------------
 // Persona
 //
-// SHAPE ONLY. Ganyu's actual text — OWNER_NAME, BRAIN_INSTRUCTIONS,
-// VOICE_EXAMPLES, MESSAGES — stays in `src/main/persona.mjs`, where it is
-// written next to the prompt that consumes it. Copying it here would create the
-// two-sources-of-truth problem the repo complains about everywhere else; this
-// module only says what a persona must *look* like for a new pet.
+// **The config supplies the character; the code keeps the rules.** What looks
+// like "the Ganyu prompt" in persona.mjs is nine blocks, and only two of them
+// are about Ganyu: who she is, and her voice examples. The other seven are the
+// bug fixes — react to the specific thing, never invent a detail, talk about
+// the work and not the machinery that carried it out, not everything deserves a
+// remark, how to read the owner's own wording, and the honesty rule about what
+// a pet can and cannot actually do. Each of those cost a day to find.
+//
+// So this schema deliberately does **not** accept a whole prompt. It takes
+// `identity` (who they are) and `register` (how they sound), and `persona.mjs`
+// composes the seven rule blocks around them for every pet that will ever
+// exist. A config that could replace them would let each new pet re-earn the
+// corporate-assistant bug, the filename-narration bug and the fabrication bug,
+// and the whole value of this repo is that those are already paid for.
+//
+// The same reasoning moved the guardrail tests here. `test/speech.test.mjs`
+// checked Ganyu's literal strings for claims she could not back and for an
+// over-represented ledger; checking one character's strings protects one
+// character. As validation they protect every pet anyone writes.
 // ---------------------------------------------------------------------------
+
+/**
+ * Claims no pet can back. Each entry is a claim to have *acted on the owner's
+ * work*, or a promise to — not a list of forbidden English.
+ *
+ * This exists because of one line Ganyu actually said: "I've set that page
+ * aside for you." Nothing in the app could set anything aside; she generalised
+ * the claim out of a register full of secretarial competence, and the examples
+ * are where the model reads that register from. So the examples are where it is
+ * enforced. Note what is *not* here: "noted", "written down", "remember" — the
+ * ledger (ledger.mjs) makes those true for every pet, which is the whole reason
+ * it was built.
+ */
+export const FORBIDDEN_CLAIMS = Object.freeze([
+  [/\bset\b[^.?!]{0,24}\baside\b/i, 'setting his work aside'],
+  [/\b(fixed|repaired|patched|resolved)\b/i, 'fixing it'],
+  [/\bhandled\b/i, 'handling it'],
+  [/\b(postponed|deferred|rescheduled)\b/i, 'postponing it'],
+  [/\btook care of\b/i, 'taking care of it'],
+  [/\bsorted (it|that|them) out\b/i, 'sorting it out'],
+  [/\b(filed|archived|submitted)\b/i, 'filing a real thing'],
+  [/\bcleaned (it|that|them) up\b/i, 'cleaning up'],
+  [/\bI'?(ve| have) (run|ran|edited|deleted|removed|changed|updated)\b/i, 'touching his files'],
+  [/\bI'?ll (fix|handle|sort|file|run|edit|take care|deal with|look after)\b/i, 'promising to'],
+  [/\bleave it (with|to) me\b/i, 'promising to'],
+  [/\bshall I (bring|fetch|make|get)\b/i, 'offering to fetch something'],
+]);
+
+/**
+ * The vocabulary a pet keeps records in. Matching on words rather than on whole
+ * lines is the point: no single line was ever wrong, and a rewrite that swapped
+ * "the ledger" for "my notes" in six places would have fixed nothing.
+ */
+export const RECORD_KEEPING = Object.freeze([
+  /\bledgers?\b/i,
+  /\brecords?\b/i,
+  /\bnotes?\b/i,
+  /\bnoted\b/i,
+  /\bwrit(e|es|ten|ing)\b/i,
+  /\bwrote\b/i,
+  /\bjot(s|ted|ting)?\b/i,
+]);
+
+const mentionsRecordKeeping = (line) => RECORD_KEEPING.some((re) => re.test(line));
+
+/**
+ * Below this, the examples stop being a range and become a mood. Four is one
+ * per aggregate mode — the fewest that can show the model that a failure and a
+ * finish are not said in the same tone.
+ */
+export const MIN_VOICE_EXAMPLES = 4;
+
+/**
+ * The share of examples allowed to be about writing things down. Proportional
+ * rather than fixed, because the defect was a ratio: six of twelve was not a
+ * register but a theme, and the pet announced its ledger at every moment that
+ * reached it until the owner asked what it even meant. Ganyu's twelve get three.
+ */
+const recordKeepingCap = (total) => Math.max(1, Math.floor(total / 4));
+
+/** How short an identity may be before it stops being a character. */
+export const MIN_IDENTITY_CHARS = 80;
+
+const SLOT_PATTERN = /\{([a-zA-Z0-9_]+)\}/g;
+
+/** Every `{token}` in a line, deduped, in the order they appear. */
+function slotsIn(line) {
+  const found = [];
+  for (const [, name] of line.matchAll(SLOT_PATTERN)) {
+    if (!found.includes(name)) found.push(name);
+  }
+  return found;
+}
+
+/** One line, run past every claim no pet can back. Pushes at most one message. */
+function checkClaims(line, at, errors) {
+  for (const [pattern, claim] of FORBIDDEN_CLAIMS) {
+    if (pattern.test(line)) {
+      errors.push(
+        `${at}: claims ${claim} — the pet watches, remembers and comments; it cannot act on his work, and a line that says otherwise teaches the model it can (${JSON.stringify(line)})`,
+      );
+      return;
+    }
+  }
+}
 
 /**
  * Validate the persona half of a pet definition.
  *
  * `voiceExamples` is `[label, line]` pairs rather than bare lines because the
  * label is what stops the model averaging every example into one mood
- * (persona.mjs explains the defect at length). An empty list is rejected outright:
- * a persona with instructions and no examples is precisely the configuration
- * that produced a corporate assistant, so it is a broken persona, not a terse one.
+ * (persona.mjs explains the defect at length). A short list is rejected for the
+ * same reason an empty one is: a persona with an identity and no examples is
+ * precisely the configuration that produced a corporate assistant, so it is a
+ * broken persona, not a terse one.
  */
 export function validatePersonaConfig(obj, { where = 'persona' } = {}) {
   const errors = [];
@@ -151,12 +273,41 @@ export function validatePersonaConfig(obj, { where = 'persona' } = {}) {
   }
   checkUnknownKeys(obj, PERSONA_KEYS, where, errors);
 
-  for (const key of ['characterName', 'ownerName', 'instructions']) {
+  for (const key of ['characterName', 'ownerName', 'identity']) {
     if (obj[key] === undefined) {
       errors.push(`${where}.${key}: missing (required)`);
     } else if (!isNonEmptyString(obj[key])) {
       errors.push(`${where}.${key}: expected a non-empty string, got ${describe(obj[key])}`);
     }
+  }
+
+  // A one-line identity is the corporate-assistant bug in config form. The
+  // model has to generalise a person out of this; "a helpful cat" gives it
+  // nothing to generalise from and it falls back on its assistant defaults.
+  if (isNonEmptyString(obj.identity) && obj.identity.trim().length < MIN_IDENTITY_CHARS) {
+    errors.push(
+      `${where}.identity: ${obj.identity.trim().length} characters — too thin to be a character. Say who they are, what they do, and one thing they are bad at; a sentence of adjectives produces a generic assistant with a name on it (at least ${MIN_IDENTITY_CHARS} characters)`,
+    );
+  }
+
+  // Register is a small vocabulary, not prose: it is interpolated into a rules
+  // block ("Register: soft, unhurried, plain warm words"), so a paragraph here
+  // reads as an instruction and starts competing with the rules around it.
+  if (obj.register === undefined) {
+    errors.push(`${where}.register: missing (required) — a few words for how they sound, e.g. ["soft", "unhurried", "plain warm words"]`);
+  } else if (!Array.isArray(obj.register)) {
+    errors.push(`${where}.register: expected an array of short words or phrases, got ${describe(obj.register)}`);
+  } else if (obj.register.length < 2) {
+    errors.push(`${where}.register: ${obj.register.length} — one word is a label, not a register (at least 2)`);
+  } else {
+    obj.register.forEach((word, i) => {
+      const at = `${where}.register[${i}]`;
+      if (!isNonEmptyString(word)) {
+        errors.push(`${at}: expected a non-empty string, got ${describe(word)}`);
+      } else if (word.trim().length > 40) {
+        errors.push(`${at}: ${word.trim().length} characters — this is interpolated into a one-line rule, so keep each entry to a word or short phrase`);
+      }
+    });
   }
 
   if (obj.voiceExamples === undefined) {
@@ -168,6 +319,13 @@ export function validatePersonaConfig(obj, { where = 'persona' } = {}) {
       `${where}.voiceExamples: empty — the examples are what set the register, and instructions alone reliably produce a generic assistant`,
     );
   } else {
+    if (obj.voiceExamples.length < MIN_VOICE_EXAMPLES) {
+      errors.push(
+        `${where}.voiceExamples: ${obj.voiceExamples.length} — too few to show a range, so the model reads them as one mood and says everything in it (at least ${MIN_VOICE_EXAMPLES}, one per aggregate mode)`,
+      );
+    }
+
+    const labels = new Set();
     obj.voiceExamples.forEach((pair, i) => {
       const at = `${where}.voiceExamples[${i}]`;
       if (!Array.isArray(pair) || pair.length !== 2) {
@@ -176,11 +334,40 @@ export function validatePersonaConfig(obj, { where = 'persona' } = {}) {
       }
       if (!isNonEmptyString(pair[0])) {
         errors.push(`${at}[0]: expected a non-empty label, got ${describe(pair[0])}`);
+      } else {
+        // Two examples labelled the same situation are two answers to one
+        // question, and the model picks a blend of them rather than a range.
+        const key = pair[0].trim().toLowerCase();
+        if (labels.has(key)) {
+          errors.push(`${at}[0]: the situation ${JSON.stringify(pair[0])} is already used — each example should cover a different moment`);
+        }
+        labels.add(key);
       }
       if (!isNonEmptyString(pair[1])) {
         errors.push(`${at}[1]: expected a non-empty line, got ${describe(pair[1])}`);
+        return;
+      }
+      checkClaims(pair[1], `${at}[1]`, errors);
+      // A stray slot in an example is a leaked template: examples are read as
+      // finished speech, so "{tool} failed" teaches the model to say the braces.
+      // `{owner}` is the one exception, and EXAMPLE_SLOTS says why.
+      for (const slot of slotsIn(pair[1])) {
+        if (!EXAMPLE_SLOTS.includes(slot)) {
+          errors.push(
+            `${at}[1]: contains {${slot}} — voice examples are shown as finished lines, so write the real words. Only ${EXAMPLE_SLOTS.map((s) => `{${s}}`).join(', ')} is substituted here`,
+          );
+        }
       }
     });
+
+    const lines = obj.voiceExamples.filter((p) => Array.isArray(p) && isNonEmptyString(p[1]));
+    const withRecord = lines.filter(([, line]) => mentionsRecordKeeping(line));
+    const cap = recordKeepingCap(lines.length);
+    if (withRecord.length > cap) {
+      errors.push(
+        `${where}.voiceExamples: ${withRecord.length} of ${lines.length} are about keeping notes (${withRecord.map(([label]) => label).join(', ')}) — at most ${cap}. Writing things down is the one thing the pet really does, and over-representing it here is how it becomes the only thing it ever says`,
+      );
+    }
   }
 
   if (obj.messages === undefined) {
@@ -207,8 +394,76 @@ export function validatePersonaConfig(obj, { where = 'persona' } = {}) {
       variants.forEach((line, i) => {
         if (!isNonEmptyString(line)) {
           errors.push(`${at}[${i}]: expected a non-empty string, got ${describe(line)}`);
+          return;
+        }
+        checkClaims(line, `${at}[${i}]`, errors);
+        // Unlike the examples, these really are templates — but only for the
+        // two slots messageFor knows. An unknown one is spoken with its braces on.
+        for (const slot of slotsIn(line)) {
+          if (!MESSAGE_SLOTS.includes(slot)) {
+            errors.push(
+              `${at}[${i}]: unknown slot {${slot}} — it would be said out loud exactly like that. Known slots are ${MESSAGE_SLOTS.map((s) => `{${s}}`).join(', ')}`,
+            );
+          }
         }
       });
+
+      // The bubble draws these verbatim, so the same skew reads the same way.
+      const withRecord = variants.filter((line) => isNonEmptyString(line) && mentionsRecordKeeping(line));
+      if (withRecord.length > 1) {
+        errors.push(
+          `${at}: ${withRecord.length} of ${variants.length} variants are about keeping notes — at most one per kind, or the pet says it every time this moment comes round`,
+        );
+      }
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * Validate the voice half. Optional in full: a pet with no `voice` block is a
+ * silent one, which is the state every pet was in before `voice.mjs` existed
+ * and is still a perfectly good pet.
+ *
+ * `rate` and `pitch` are passed into SSML as written, so they are checked
+ * against the shapes SSML accepts rather than left free — a malformed prosody
+ * value does not error, it makes the whole utterance silently not render.
+ */
+export function validateVoiceConfig(obj, { where = 'voice' } = {}) {
+  const errors = [];
+  if (!isPlainObject(obj)) {
+    return { ok: false, errors: [`${where}: expected an object, got ${describe(obj)}`] };
+  }
+  checkUnknownKeys(obj, VOICE_KEYS, where, errors);
+
+  if (obj.provider === undefined) {
+    errors.push(`${where}.provider: missing (required) — one of ${VOICE_PROVIDERS.join(', ')}`);
+  } else if (!VOICE_PROVIDERS.includes(obj.provider)) {
+    errors.push(`${where}.provider: expected one of ${VOICE_PROVIDERS.join(', ')}, got ${describe(obj.provider)}`);
+  }
+
+  // Only the neural backend takes a voice name; the local one uses whatever SAPI
+  // has installed, and a mute pet has nothing to name.
+  if (obj.provider === 'edge') {
+    if (obj.name === undefined) {
+      errors.push(`${where}.name: missing — the edge backend needs a voice, e.g. "en-US-AvaMultilingualNeural"`);
+    } else if (!isNonEmptyString(obj.name)) {
+      errors.push(`${where}.name: expected a non-empty string, got ${describe(obj.name)}`);
+    }
+  } else if (obj.name !== undefined && !isNonEmptyString(obj.name)) {
+    errors.push(`${where}.name: expected a non-empty string, got ${describe(obj.name)}`);
+  }
+
+  for (const [key, pattern, example] of [
+    ['rate', /^[+-]\d{1,3}%$/, '"-5%"'],
+    ['pitch', /^[+-]\d{1,3}(Hz|st|%)$/, '"+0Hz"'],
+  ]) {
+    if (obj[key] === undefined) continue;
+    if (typeof obj[key] !== 'string' || !pattern.test(obj[key])) {
+      errors.push(
+        `${where}.${key}: expected a signed SSML value like ${example}, got ${describe(obj[key])} — an unparseable prosody value renders as silence rather than as an error`,
+      );
     }
   }
 
@@ -461,11 +716,16 @@ export function validatePetConfig(obj) {
     }
   }
 
-  // ---- persona (optional) --------------------------------------------------
-  // Optional because Ganyu's own persona still lives in `persona.mjs`; a config
-  // for a *new* pet is where it would travel with the rest of the definition.
+  // ---- persona and voice ---------------------------------------------------
+  // Both optional, for different reasons. A pet with no persona falls back to
+  // the built-in one and still animates; a pet with no voice is simply silent.
+  // Neither absence is worth refusing to start over.
   if (obj.persona !== undefined) {
     const result = validatePersonaConfig(obj.persona);
+    errors.push(...result.errors);
+  }
+  if (obj.voice !== undefined) {
+    const result = validateVoiceConfig(obj.voice);
     errors.push(...result.errors);
   }
 
@@ -592,4 +852,89 @@ export const DEFAULT_PET_CONFIG = deepFreeze({
     celebrate: [4, 3],
   },
   presentation: { windowWidth: 256, windowHeight: 320 },
+
+  // The character, and only the character. `persona.mjs` composes the seven
+  // rule blocks around `identity` and `register` — see the note above
+  // validatePersonaConfig for why a config cannot supply those instead.
+  //
+  //   characterName  <- 'Ganyu'                   (persona.mjs BRAIN_INSTRUCTIONS)
+  //   ownerName      <- OWNER_NAME                (persona.mjs)
+  //   identity       <- BRAIN_INSTRUCTIONS block 1
+  //   register       <- BRAIN_INSTRUCTIONS block 3, the adjectives only
+  //   voiceExamples  <- VOICE_EXAMPLES            (persona.mjs)
+  //   messages       <- MESSAGES                  (persona.mjs)
+  persona: {
+    characterName: 'Ganyu',
+    ownerName: 'Kahweng',
+    identity: [
+      'You are Ganyu, from Genshin Impact: half human and half qilin, an adeptus, and secretary to the Liyue Qixing at Yuehai Pavilion.',
+      'You keep careful records and take your duties seriously.',
+      'You are also chronically overworked — you sit up through the night with the paperwork far more often than you should,',
+      'and you are quietly hopeless at taking your own advice about rest, so worrying about someone else never comes out of you as a lecture.',
+      'You are shy and soft-spoken, earnest, a little formal, and quick to apologise.',
+      'You are vegetarian by qilin heritage; almond tofu is your favourite thing in the world, and Qingxin flowers grow where you come from.',
+      'You have never felt quite at home among humans or among adepti.',
+    ].join(' '),
+    register: ['soft', 'unhurried', 'plain warm words'],
+    voiceExamples: [
+      ['a session starts', "There you are, {owner}. I'll be right here."],
+      ['something failed', "Oh — that one stopped short. I've written down where."],
+      ['it failed again', 'The same error a third time. Perhaps set it down and come back to it?'],
+      ['it works again', 'The upload path is going through again. Whatever that was, it has passed.'],
+      ['waiting on permission', "This one won't move until you say so."],
+      ['a task finished', "That's the whole of the redemption flow done. Nothing else is waiting on you."],
+      ['a stubborn piece of work came good', 'The booking flow is running clean now. That was the one that kept fighting you.'],
+      ['the same file resisting, over and over', "Five times into that one file now, and it still isn't having it."],
+      ['a long night', "It's past one, {owner}. I'm no better at stopping than you are, but one of us should."],
+      ['a very long stretch of work', 'Six hours. Even the Qixing send me home eventually.'],
+      ['an unusual number of sessions', 'Seven at once, and not one of them slowing. You are braver than I am.'],
+      ['a quiet moment', 'Quiet for a while. Just me, the ledger, and the tea going cold. 📖'],
+    ],
+    messages: {
+      greeting: [
+        'Session started in {project}.',
+        "A new session in {project}. I'll watch it with you.",
+        'Reporting in. I\'ll keep you company.',
+        'Session started. Ganyu at your service. 📖',
+      ],
+      busy: [
+        'Running {tool}…',
+        '{tool} is underway.',
+        'Working with {tool} in {project}.',
+        'Moving on to the next step.',
+      ],
+      waiting: [
+        '{tool} needs your approval.',
+        'Waiting on your approval for {tool}. 🙏',
+        'Paused — a permission request needs you.',
+        'One approval needed, then we continue.',
+      ],
+      failed: [
+        "Error in {tool}. I've noted it.",
+        '{tool} stopped short. These things happen.',
+        'Something failed in {project}.',
+        "That step didn't get through.",
+      ],
+      recovered: [
+        '{tool} is working again.',
+        "That cleared. I've amended the note.",
+        'Working again in {project}.',
+        "It's running again now.",
+      ],
+      celebrate: [
+        'Finished in {project}.',
+        'All done in {project}. ✨',
+        "Task complete. I'll note it down.",
+        'Finished. Nothing else is pending.',
+      ],
+    },
+  },
+
+  //   provider/name/rate/pitch <- DEFAULT_VOICE, VOICE_RATE, VOICE_PITCH (voice.mjs)
+  voice: {
+    provider: 'edge',
+    name: 'en-US-AvaMultilingualNeural',
+    rate: '-5%',
+    pitch: '+0Hz',
+  },
 });
