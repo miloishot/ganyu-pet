@@ -231,6 +231,49 @@ test('unknown source is 404 and never ingested', async (t) => {
   assert.equal((await getState(base)).sessionCount, 0);
 });
 
+// The OpenCode plugin (hooks/opencode/ganyu.js) posts this exact shape.
+const oc = (event, extra = {}) => ({ hook_event_name: event, session_id: 'ses_oc1', cwd: 'C:\\work\\demo', ...extra });
+
+test('opencode: PreToolUse -> busy session with source opencode', async (t) => {
+  const { base } = await startServer(t);
+  const res = await postJson(base, 'opencode', oc('PreToolUse', { tool_name: 'bash' }));
+  assert.equal(res.status, 200);
+  const snap = await getState(base);
+  assert.equal(snap.mode, 'busy');
+  assert.equal(snap.sessionCount, 1);
+  assert.equal(snap.sessions[0].source, 'opencode');
+  assert.equal(snap.sessions[0].id, 'ses_oc1');
+  assert.equal(snap.sessions[0].mode, 'busy');
+});
+
+test('opencode: PermissionRequest -> waiting, Stop -> idle + celebrate', async (t) => {
+  const { base } = await startServer(t);
+  await postJson(base, 'opencode', oc('PermissionRequest', { tool_name: 'bash' }));
+  assert.equal((await getState(base)).mode, 'waiting');
+  await postJson(base, 'opencode', oc('Stop'));
+  const snap = await getState(base);
+  assert.equal(snap.mode, 'idle');
+  assert.equal(snap.celebrate, true);
+});
+
+test('opencode: a session error is failed, not a celebration', async (t) => {
+  const { base } = await startServer(t);
+  await postJson(base, 'opencode', oc('Stop', { error: 'ProviderAuthError' }));
+  const snap = await getState(base);
+  assert.equal(snap.mode, 'failed');
+  assert.equal(snap.celebrate, false);
+});
+
+test('opencode sessions never merge with a claude session of the same id', async (t) => {
+  const { base } = await startServer(t);
+  await postJson(base, 'claude', { session_id: 'same', hook_event_name: 'PermissionRequest' });
+  await postJson(base, 'opencode', oc('Stop', { session_id: 'same' }));
+  const snap = await getState(base);
+  assert.equal(snap.sessionCount, 2);
+  assert.deepEqual(snap.sessions.map((s) => s.source).sort(), ['claude', 'opencode']);
+  assert.equal(snap.mode, 'waiting');
+});
+
 test('unparseable body is 400 and lands in the debug ring', async (t) => {
   const { base } = await startServer(t);
   const res = await fetch(`${base}/event/claude`, {

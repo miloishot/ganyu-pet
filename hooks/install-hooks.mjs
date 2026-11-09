@@ -52,6 +52,10 @@ const CLAUDE_MATCHER_EVENTS = new Set(['PreToolUse', 'PostToolUse']);
 /** Seconds. The forwarder itself caps out at ~1.5s; this is the outer belt. */
 const HOOK_TIMEOUT = 5;
 
+/** The OpenCode plugin the opencode target copies into `<config dir>/plugins/`. */
+export const OPENCODE_PLUGIN_PATH = path.join(HERE, 'opencode', 'ganyu.js');
+const OPENCODE_PLUGIN_NAME = 'ganyu.js';
+
 // ---------------------------------------------------------------------------
 // command strings
 // ---------------------------------------------------------------------------
@@ -94,6 +98,42 @@ export function defaultCodexFile(env = process.env) {
 
 export function defaultClaudeFile() {
   return path.join(os.homedir(), '.claude', 'settings.json');
+}
+
+/**
+ * OpenCode 1.18 reads its global config from `$XDG_CONFIG_HOME/opencode`, else
+ * `<home>/.config/opencode` — on Windows too (no %APPDATA% branch).
+ */
+export function defaultOpencodeDir(env = process.env) {
+  const base = env.XDG_CONFIG_HOME ? env.XDG_CONFIG_HOME : path.join(os.homedir(), '.config');
+  return path.join(base, 'opencode');
+}
+
+/** `<config dir>/plugins/ganyu.js`, after checking the config dir is sane. Throws otherwise. */
+export function opencodeTargetFile(configDir) {
+  const kind = (p) => {
+    try {
+      const st = fs.statSync(p);
+      return st.isDirectory() ? 'dir' : 'file';
+    } catch {
+      return 'missing';
+    }
+  };
+  if (kind(configDir) === 'missing') {
+    throw new Error(`${configDir}: OpenCode config dir not found. Is OpenCode installed? Pass --opencode-dir <path>. Nothing written.`);
+  }
+  if (kind(configDir) !== 'dir') {
+    throw new Error(`${configDir}: expected the OpenCode config directory, found a file. Refusing to touch it.`);
+  }
+  const plugins = path.join(configDir, 'plugins');
+  if (kind(plugins) === 'file') {
+    throw new Error(`${plugins}: expected a directory, found a file. Refusing to touch it.`);
+  }
+  const file = path.join(plugins, OPENCODE_PLUGIN_NAME);
+  if (kind(file) === 'dir') {
+    throw new Error(`${file}: is a directory, not a plugin file. Refusing to touch it.`);
+  }
+  return file;
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +183,8 @@ function commandsOf(groups) {
  * Plan the merge for one target file. Pure: reads the file, returns what would
  * be written. Never writes.
  */
-export function planTarget({ kind, file, hookPath = HOOK_CMD_PATH }) {
+export function planTarget({ kind, file, hookPath = HOOK_CMD_PATH, pluginPath = OPENCODE_PLUGIN_PATH }) {
+  if (kind === 'opencode') return planOpencode({ file, pluginPath });
   const { exists, text, json } = readTarget(file);
   const before = json;
   const next = clone(before);
@@ -209,8 +250,50 @@ export function planTarget({ kind, file, hookPath = HOOK_CMD_PATH }) {
   };
 }
 
+/**
+ * The opencode target is one whole file, not a JSON merge: the plan is "make
+ * `<config dir>/plugins/ganyu.js` byte-identical to hooks/opencode/ganyu.js".
+ * Only that one file is ever read or written; sibling plugins are not opened.
+ */
+function planOpencode({ file, pluginPath }) {
+  const nextText = fs.readFileSync(pluginPath, 'utf8');
+  const exists = fs.existsSync(file);
+  const beforeText = exists ? fs.readFileSync(file, 'utf8') : '';
+  const changed = beforeText !== nextText;
+  const warnings = exists && changed
+    ? [`${file} differs from ${pluginPath} — it will be backed up, then replaced`]
+    : [];
+  if (changed) validatePlan({ kind: 'opencode', file, nextText, source: pluginPath });
+  return {
+    kind: 'opencode',
+    file,
+    exists,
+    command: `copy ${pluginPath}`,
+    added: changed ? [OPENCODE_PLUGIN_NAME] : [],
+    skipped: changed ? [] : [OPENCODE_PLUGIN_NAME],
+    createdEvents: [],
+    warnings,
+    changed,
+    beforeText,
+    nextText,
+    nextJson: null,
+  };
+}
+
 /** Round-trip + append-only assertions. Throws instead of returning false. */
-export function validatePlan({ file, before, next, nextText }) {
+export function validatePlan({ kind, file, before, next, nextText, source }) {
+  if (kind === 'opencode') {
+    if (path.basename(file) !== OPENCODE_PLUGIN_NAME || path.basename(path.dirname(file)) !== 'plugins') {
+      throw new Error(`${file}: the opencode target must be plugins/${OPENCODE_PLUGIN_NAME}. Aborting.`);
+    }
+    if (nextText !== fs.readFileSync(source, 'utf8')) {
+      throw new Error(`${file}: planned bytes differ from ${source}. Aborting.`);
+    }
+    if (!/export const GanyuPlugin\b/.test(nextText)) {
+      throw new Error(`${source}: does not look like the ganyu OpenCode plugin. Aborting.`);
+    }
+    return true;
+  }
   let reparsed;
   try {
     reparsed = JSON.parse(nextText);
@@ -338,9 +421,9 @@ function applyPlan(plan) {
     fs.mkdirSync(path.dirname(plan.file), { recursive: true });
   }
   fs.writeFileSync(plan.file, plan.nextText, 'utf8');
-  // Read back and parse what actually landed on disk.
+  // Read back (and, for JSON targets, parse) what actually landed on disk.
   const written = fs.readFileSync(plan.file, 'utf8');
-  JSON.parse(written);
+  if (plan.kind !== 'opencode') JSON.parse(written);
   if (written !== plan.nextText) {
     throw new Error(`${plan.file}: written bytes differ from the plan.`);
   }
@@ -361,6 +444,9 @@ const USAGE = `ganyu-pet hook installer (dry run unless --apply)
   --hook-path <path>   override the ganyu-hook.cmd path written into the configs
   --no-codex           skip the codex target
   --no-claude          skip the Claude target
+  --opencode           also install the OpenCode plugin (opt-in) into
+                       $XDG_CONFIG_HOME/opencode, else ~/.config/opencode
+  --opencode-dir <dir> the OpenCode config dir to install into (implies --opencode)
   --quiet              summary only, no diff
   -h, --help           this text
 `;
@@ -375,6 +461,8 @@ export function parseArgs(argv = []) {
     hookPath: HOOK_CMD_PATH,
     codex: true,
     claude: true,
+    opencode: false,
+    opencodeDir: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -392,6 +480,8 @@ export function parseArgs(argv = []) {
       case '--hook-path': opts.hookPath = value(); break;
       case '--no-codex': opts.codex = false; break;
       case '--no-claude': opts.claude = false; break;
+      case '--opencode': opts.opencode = true; break;
+      case '--opencode-dir': opts.opencodeDir = value(); opts.opencode = true; break;
       default: throw new Error(`unknown option: ${arg}\n\n${USAGE}`);
     }
   }
@@ -412,6 +502,9 @@ export function run(argv = [], { log = console.log } = {}) {
   const targets = [];
   if (opts.codex) targets.push({ kind: 'codex', file: opts.codexFile ?? defaultCodexFile() });
   if (opts.claude) targets.push({ kind: 'claude', file: opts.claudeFile ?? defaultClaudeFile() });
+  if (opts.opencode) {
+    targets.push({ kind: 'opencode', file: opencodeTargetFile(opts.opencodeDir ?? defaultOpencodeDir()) });
+  }
 
   // Plan and validate everything before touching anything.
   const plans = targets.map((t) => planTarget({ ...t, hookPath: opts.hookPath }));

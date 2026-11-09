@@ -41,6 +41,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 | G chat | builder-G | `src/main/chat.mjs`, `test/chat.test.mjs` |
 | V voice | builder-V | `src/main/voice.mjs`, `test/voice.test.mjs` |
 | F hooks | builder-F | `hooks/ganyu-hook.cmd`, `hooks/install-hooks.mjs`, `test/install-hooks.test.mjs`, `hooks/fixtures/*` |
+| F hooks — OpenCode | builder-F | `hooks/opencode/ganyu.js`, `test/opencode-plugin.test.mjs`, `hooks/fixtures/opencode/**`, `.gitattributes` (fixtures check out LF) |
 | integrator | integrator | `package.json`, `scripts/smoke.mjs`, plus minimal cross-module wiring fixes |
 
 ESM everywhere (`"type": "module"`); the preload is CommonJS (`.cjs`) because Electron preloads with contextIsolation are CJS.
@@ -51,7 +52,7 @@ Electron main process runs: HTTP hook server (module B) → state aggregator (B)
 
 ### HTTP contract (module B)
 
-- `POST /event/:source` where `:source` ∈ `codex|claude`. Body: the raw hook JSON (may arrive URL-encoded as `payload=<json>` form data — accept both raw JSON body and `application/x-www-form-urlencoded` with a `payload` field, mirroring how Orca's hook forwards stdin).
+- `POST /event/:source` where `:source` ∈ `codex|claude|opencode`. Body: the raw hook JSON (may arrive URL-encoded as `payload=<json>` form data — accept both raw JSON body and `application/x-www-form-urlencoded` with a `payload` field, mirroring how Orca's hook forwards stdin).
 - `GET /state` → `{ mode, sessionCount, sessions: [{id, source, mode, lastSeen}], celebrate: bool, wandering: bool }`.
 - `GET /healthz` → 200 `ok`.
 - Port **47821** (env `GANYU_PORT` overrides). Bind `127.0.0.1` only. If the port is taken: log a clear error and exit 1 (hook scripts hardcode the port).
@@ -550,6 +551,35 @@ She says her lines out loud. `createVoice({WebSocketImpl, now, voice, rate, pitc
 - Targets: `~/.codex/hooks.json` (events: SessionStart, UserPromptSubmit, Stop, PreToolUse, PostToolUse, PermissionRequest, SubagentStart, SubagentStop — same envelope shape as the existing entries in that file) and `~/.claude/settings.json` `hooks` key (events: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Notification, Stop, SubagentStop, SessionEnd; PreToolUse/PostToolUse get `"matcher": "*"`).
 - **Append-only merge**: never remove or reorder existing entries (Orca + Superset hooks live there). Skip any event where our exact command already exists (idempotent). Write `<file>.bak-ganyu-N` backup first. Round-trip parse the result before writing; abort on any parse failure.
 - Default is dry-run printing a unified-diff-style preview. `--apply` writes. `--codex-file <path> --claude-file <path>` override targets (used by tests against fixtures in `hooks/fixtures/`).
+
+
+#### OpenCode
+
+Verified against **OpenCode 1.18.26** (`opencode --version`, 2026-11-10) — the event and hook names were read out of the installed binary, which wins over the docs where they differ — and the plugin docs at <https://opencode.ai/docs/plugins/>.
+
+OpenCode has no stdin hook commands; its extension point is a JS plugin. `hooks/opencode/ganyu.js` is that plugin. It exports exactly one function, `GanyuPlugin` (OpenCode 1.18 calls every exported function as a plugin), and POSTs to `http://127.0.0.1:<port>/event/opencode`, port = `GANYU_PORT` else 47821 — the same rule as `ganyu-hook.cmd`.
+
+| OpenCode signal | `hook_event_name` sent | Mode |
+|---|---|---|
+| hook `tool.execute.before` | `PreToolUse` (+ `tool_name`) | busy |
+| event `message.part.updated`, tool part `completed` or `error` | `PostToolUse` (+ `tool_name`) | busy |
+| hook `chat.message` | `UserPromptSubmit` | busy |
+| event `session.created` | `SessionStart` | busy |
+| event `permission.asked` (+ `tool_name` = the permission), `question.asked` | `PermissionRequest` | waiting |
+| event `permission.replied`, `question.replied`, `question.rejected` | `PostToolUse` | busy |
+| event `session.idle` | `Stop` | idle + celebrate |
+| event `session.error` (except `MessageAbortedError`, which is the owner pressing abort) | `Stop` + `error: <error.name>` | failed (sticky 30s), no celebrate |
+| event `session.deleted` | `SessionEnd` | idle |
+
+Known edges: an abort (`MessageAbortedError`) posts nothing, so the `session.idle` that follows it is an ordinary `Stop` and she celebrates. A subagent's `session.deleted` posts nothing, so it never ends the root session. A subagent's `session.error` arrives as `SubagentStop` + `error` and still flags the root `failed`. A finished tool part is reported once per `callID`, so a late re-publish cannot turn an idle session back to busy.
+
+Everything else (`session.status`, `message.updated`, text parts, …) posts nothing. `session.status` is deliberately ignored because OpenCode publishes it immediately before `session.idle`, and handling both would celebrate twice. The `permission.ask` hook has no call site in 1.18.26, so the `permission.asked` event is used instead. `tool.execute.after` fires only on success, so tool-end comes from `message.part.updated`. A subagent session (`info.parentID` set) reports under its root session's id, with `SessionStart`→`SubagentStart` and `Stop`→`SubagentStop`, so a finishing subagent keeps the pet busy rather than celebrating.
+
+**Body — the complete field list:** `hook_event_name`, `session_id` (OpenCode's `ses_…` id; sessions are keyed `source::sessionId` in state, so no prefix is needed to avoid colliding with codex/Claude), `tool_name` (optional), `cwd` (the plugin context's `directory`), `error` (`session.error` only: the error's `name`, e.g. `APIError`). Every string except `cwd` must be a short identifier (`[\w.:\-/ ]`, ≤128 chars) or it is dropped. **Never sent:** prompt or message text, tool arguments, tool output, titles, permission patterns or metadata, error messages, file contents.
+
+**Never blocks OpenCode:** nothing is awaited — the `event` hook is not awaited by OpenCode, but `tool.execute.before` and `chat.message` are, so those return synchronously; each POST is fire-and-forget with a 1s `AbortSignal.timeout`; every throw and rejection is swallowed and nothing is printed.
+
+**Install:** `node hooks/install-hooks.mjs --opencode` (opt-in; `--opencode-dir <dir>` overrides the dir and implies it). OpenCode 1.18 loads `{plugin,plugins}/*.{js,ts}` from its global config dir, `$XDG_CONFIG_HOME/opencode` else `<home>/.config/opencode` — on Windows too, there is no `%APPDATA%` branch. The target is `<config dir>/plugins/ganyu.js`, planned through the same `planTarget` → `validatePlan` → `unifiedDiff` → apply path as the JSON targets, as a whole-file copy: dry run by default; `--apply` backs a differing `ganyu.js` up to `ganyu.js.bak-ganyu-N` (a name OpenCode's glob does not load) before replacing it; a second `--apply` changes nothing; no other plugin is opened. A missing config dir, a config dir that is a file, a `plugins` that is a file, or a `ganyu.js` that is a directory throws before anything is written.
 
 ## Conventions
 
