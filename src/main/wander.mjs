@@ -280,10 +280,10 @@ export function createWander({
     let list;
     try {
       list = getLedges();
+      if (!Array.isArray(list)) return []; // inside the try: a revoked Proxy throws here
     } catch {
       return [];
     }
-    if (!Array.isArray(list)) return [];
     const surfaces = [];
     for (const l of list) {
       // Per entry, so a hostile one (a throwing getter, a revoked Proxy) costs
