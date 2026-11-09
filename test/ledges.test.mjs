@@ -325,6 +325,13 @@ test('hwndFromBuffer reads the native handle Buffer, 8 or 4 bytes', () => {
   const four = Buffer.alloc(4);
   four.writeUInt32LE(0x00c0ffee, 0);
   assert.equal(hwndFromBuffer(four), 0x00c0ffee);
+  // A handle with bit 31 set, as IntPtr.ToInt64() reports it (sign-extended).
+  const high = Buffer.alloc(8);
+  high.writeBigInt64LE(-2147483000n, 0);
+  assert.equal(hwndFromBuffer(high), -2147483000);
+  const high4 = Buffer.alloc(4);
+  high4.writeInt32LE(-2147483000, 0);
+  assert.equal(hwndFromBuffer(high4), -2147483000);
   for (const bad of [Buffer.alloc(2), Buffer.alloc(0), null, undefined, 1234, 'abcd', new Uint8Array(8), {}]) {
     assert.equal(hwndFromBuffer(bad), null);
   }

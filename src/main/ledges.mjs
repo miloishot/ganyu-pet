@@ -22,9 +22,10 @@
 // also occlude her own ledge.) `getOwnHwnd` here is a second net under that.
 //
 // **Why the DWM extended frame bounds, not GetWindowRect.** On Windows 10/11
-// GetWindowRect includes the invisible ~7px resize border. A ledge taken from
-// it sits 7px above the visible edge, and she stands in mid-air above every
-// window on the screen. The extended frame bounds are the edge you can see.
+// GetWindowRect includes the invisible ~7px resize border on the left, right
+// and bottom (measured: the top edges agree, the sides differ by 5-7px). A ledge
+// taken from it is wider than the visible frame, so she could stand on air past
+// either end. The extended frame bounds are the edge you can see.
 //
 // **Why DIP conversion happens here.** The helper reports physical pixels: it
 // does not know the per-monitor scale and should not have to. Electron does,
@@ -284,13 +285,15 @@ export const perchEnabled = (value) =>
  * `win.getNativeWindowHandle()` -> hwnd as a number, or null.
  *
  * The handle is a Buffer holding the HWND in machine byte order: eight bytes on
- * 64-bit, four on 32-bit. An HWND only ever uses the low 32 bits, so the Number
- * conversion loses nothing, and it then compares equal to the helper's `hwnd`.
+ * 64-bit, four on 32-bit. Read **signed**, because the helper reports
+ * `IntPtr.ToInt64()`, which is signed: a handle with bit 31 set is
+ * sign-extended there, and an unsigned read here would never compare equal.
+ * Handles only use the low 32 bits, so the Number conversion is exact.
  */
 export function hwndFromBuffer(buf) {
   if (!Buffer.isBuffer(buf)) return null;
-  if (buf.length >= 8) return Number(buf.readBigUInt64LE(0));
-  if (buf.length >= 4) return buf.readUInt32LE(0);
+  if (buf.length >= 8) return Number(buf.readBigInt64LE(0));
+  if (buf.length >= 4) return buf.readInt32LE(0);
   return null;
 }
 

@@ -12,8 +12,8 @@
 #   DwmGetWindowAttribute 14 - DWMWA_CLOAKED: skip windows on other virtual desktops
 #                              and suspended store apps, which are "visible" but not shown
 #   DwmGetWindowAttribute 9  - DWMWA_EXTENDED_FRAME_BOUNDS: the edge you can see, in
-#                              physical px. GetWindowRect would include the invisible
-#                              ~7px resize border and put every ledge 7px in mid-air.
+#                              physical px. GetWindowRect includes the invisible ~7px
+#                              resize border on the left, right and bottom: too wide.
 # The only other two calls are on this process's own stdout, not on any window:
 #   GetStdHandle / WriteFile - write a line and learn when the reader has gone (see Emit)
 #
