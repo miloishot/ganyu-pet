@@ -41,6 +41,7 @@ It is not a status bar with a face. The design constraint throughout was that it
   focus stolen from your editor. Eight-turn rolling context.
 - **Listens**, optionally, via push-to-talk against any Whisper-compatible endpoint.
 - **Wanders** when idle, and gets out of the way when you drag it.
+- **Perches** on the title bars of your open windows, and falls off when you move them (`GANYU_PERCH=0` keeps her on the floor).
 
 ### Bring your own pet
 

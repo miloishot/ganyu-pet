@@ -3,7 +3,7 @@
 // production dependencies injected.
 
 import { app, BrowserWindow, globalShortcut, ipcMain, screen } from 'electron';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -517,6 +517,35 @@ let wanderContain = null;
 let wanderIsActive = null;
 /** `(x, y) => void` — put her down at a spot, through module E. See goHome. */
 let wanderPlace = null;
+/**
+ * The window-ledge source (ledges.mjs) — the one long-lived helper process this
+ * app owns. Null until composeRuntime builds it; stopped on every exit path.
+ */
+let ledgeSource = null;
+
+function stopLedges() {
+  if (!ledgeSource) return;
+  try {
+    ledgeSource.stop(); // kills the helper by the handle of the pid we spawned
+  } catch {
+    /* shutting down */
+  }
+}
+
+/**
+ * `GANYU_PERCH`: the process environment first (that is how `npm run smoke` is
+ * run with it off), then `.env.local`, through brain.mjs's parser — one format,
+ * one parser. Unset means on.
+ */
+function perchSetting(parseEnvFile) {
+  if (process.env.GANYU_PERCH !== undefined) return process.env.GANYU_PERCH;
+  if (typeof parseEnvFile !== 'function') return undefined;
+  try {
+    return parseEnvFile(fs.readFileSync(ENV_FILE, 'utf8')).GANYU_PERCH;
+  } catch {
+    return undefined; // no .env.local is the default, not an error
+  }
+}
 let speechTapped = false;
 
 /**
@@ -887,6 +916,10 @@ async function composeRuntime() {
       },
       isPinned: () => flags.pinned,
       random: Math.random,
+      // Window top edges she may stand on. `[]` until the helper's first line,
+      // while GANYU_PERCH is off, and after the helper gave up — and `[]` is
+      // exactly the floor-only pet.
+      getLedges: () => (ledgeSource ? ledgeSource.current() : []),
     });
     wanderSink = requireMethod('wander', wander, ['onState', 'update', 'setState', 'notify', 'setMode', 'onMode']);
     wanderStop = pickMethod(wander, ['cancel', 'stop', 'disarm', 'reset']);
@@ -923,6 +956,39 @@ async function composeRuntime() {
     } else {
       console.warn('[ganyu][wiring] wander has no grab() — the pet cannot be picked up');
     }
+  }
+
+  // Perching. Started, never awaited: the helper compiles its Win32 declarations
+  // before its first line, and nothing here waits for that. Each change of the
+  // ledge list goes through containNow(), which no-ops while she is still
+  // supported and starts the fall when the window under her went away.
+  const ledgesMod = wanderContain ? await tryImport('./ledges.mjs') : null;
+  if (ledgesMod?.createLedgeSource) {
+    const brainParser = (await tryImport('./brain.mjs'))?.parseEnvFile;
+    const enabled = ledgesMod.perchEnabled(perchSetting(brainParser));
+    ledgeSource = ledgesMod.createLedgeSource({
+      spawn,
+      scriptPath: path.join(HERE, 'ledges.ps1'),
+      parentPid: process.pid,
+      // Win32 rects are physical pixels; every position here is DIP.
+      toDip: (rect) => screen.screenToDipRect(null, rect),
+      getWorkArea: () => screen.getPrimaryDisplay().workArea,
+      getWindowSize: measuredWindowSize,
+      getOwnHwnd: () => {
+        try {
+          return win && !win.isDestroyed() ? ledgesMod.hwndFromBuffer(win.getNativeWindowHandle()) : null;
+        } catch {
+          return null;
+        }
+      },
+      schedule,
+      clock,
+      enabled,
+      log: console,
+    });
+    ledgeSource.onChange(() => containPet());
+    ledgeSource.start();
+    console.log(`[ganyu] perch: ${enabled ? 'on' : 'off (GANYU_PERCH)'}`);
   }
 
   if (typeof state.onChange === 'function') {
@@ -1244,6 +1310,7 @@ async function main() {
 }
 
 function cleanup() {
+  stopLedges();
   if (statePoll) clearInterval(statePoll);
   statePoll = null;
   if (hoverPoll) clearInterval(hoverPoll);
@@ -1312,6 +1379,9 @@ if (!gotLock) {
   });
   app.on('window-all-closed', () => app.quit());
   app.on('will-quit', cleanup);
+  // `app.exit()` (the fatal-startup and bad-pet paths) skips will-quit. The
+  // helper also exits by itself once this pid is gone, but it should not have to.
+  process.on('exit', stopLedges);
   app.whenReady().then(main).catch((err) => {
     // Without this, a throw in main() is an unhandled rejection and `npm run
     // smoke` reports a 20s timeout instead of the actual cause.

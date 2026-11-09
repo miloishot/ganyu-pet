@@ -1093,3 +1093,783 @@ test('release without a grab is inert, so a stray mouseup cannot launch her', ()
   assert.equal(h.wander.isFalling(), false);
   assert.equal(h.moves.length, 0);
 });
+
+// ---------------------------------------------------------- perching on ledges
+//
+// The top edges of other windows are surfaces too: she can be dropped onto one,
+// stroll along it, and fall off it when the window moves, shrinks or closes. These
+// cases bring their own harness because the one above can neither inject
+// getLedges nor count random() draws — and every test above must stay exactly as
+// it is, because together they are the proof that no ledges changes nothing.
+
+const TICK = WANDER_DEFAULTS.tickMs; // 50
+const MAX_X = FULL_HD.width - WIN_W; // 1664
+const FLOOR_Y = FULL_HD.height - WIN_H; // 720
+// The largest step physics may take in one tick: terminal velocity for the longest
+// dt the clamp lets through. Anything bigger between two frames is a teleport.
+const WORST_STEP = (WANDER_DEFAULTS.maxFallPxPerSec * WANDER_DEFAULTS.maxTickDtMs) / 1000; // 225
+
+/** A ledge as ledges.mjs reports it: an unoccluded top edge of a window, in DIP. */
+const ledge = (left, right, top, hwnd = 1) => ({ left, right, top, hwnd });
+// Her window stands at `top - 320` (its bottom edge is her feet), and her whole
+// 256px footprint has to be on the edge, so she can stand at x in [left, right - 256].
+const SHELF = ledge(400, 1000, 500, 11); // stands at y 180, x in [400, 744]
+const TABLE = ledge(300, 1200, 800, 22); // stands at y 480, x in [300, 944], under SHELF
+const SHELF_Y = 180;
+const TABLE_Y = 480;
+
+function perchHarness({ randoms = [0.5], pinned = false, startX, startY, ledges, getLedges } = {}) {
+  let now = 0;
+  let skew = 0;
+  let nextId = 1;
+  let draws = 0;
+  let pinnedFlag = pinned;
+  let area = { ...FULL_HD };
+  let current = (ledges || []).map((l) => ({ ...l }));
+  const pos = { x: startX, y: startY };
+  const timers = new Map();
+  const moves = [];
+  const walkStates = [];
+  const airborneStates = [];
+
+  const schedule = (fn, ms) => {
+    const id = nextId++;
+    timers.set(id, { at: now + ms, fn });
+    return () => timers.delete(id);
+  };
+
+  function advance(ms) {
+    const end = now + ms;
+    for (let guard = 0; ; guard++) {
+      if (guard > 500_000) throw new Error('advance: runaway timer loop');
+      let pick = null;
+      for (const [id, t] of timers) {
+        if (t.at > end) continue;
+        if (!pick || t.at < pick.timer.at || (t.at === pick.timer.at && id < pick.id)) {
+          pick = { id, timer: t };
+        }
+      }
+      if (!pick) break;
+      timers.delete(pick.id);
+      now = pick.timer.at;
+      pick.timer.fn();
+    }
+    now = end;
+  }
+
+  // `getLedges` is handed over verbatim (throwing, frozen, garbage...). `ledges`
+  // is a list the test can change, served as a fresh copy on every read the way
+  // the real ledge source serves it. Neither means no injection at all.
+  const injected =
+    getLedges !== undefined
+      ? { getLedges }
+      : ledges
+        ? { getLedges: () => current.map((l) => ({ ...l })) }
+        : {};
+
+  const wander = createWander({
+    clock: { now: () => now + skew },
+    schedule,
+    moveWindow: (x, y) => {
+      pos.x = x;
+      pos.y = y;
+      moves.push({ x, y, t: now });
+    },
+    getWorkArea: () => ({ ...area }),
+    onWalkState: (walk) => walkStates.push(walk ? { dir: walk.dir, t: now } : null),
+    onAirborne: (value) => airborneStates.push(value),
+    isPinned: () => pinnedFlag,
+    random: () => randoms[draws++ % randoms.length],
+    getPosition: () => ({ x: pos.x, y: pos.y }),
+    ...injected,
+  });
+
+  return {
+    wander,
+    advance,
+    moves,
+    walkStates,
+    airborneStates,
+    draws: () => draws,
+    pending: () => timers.size,
+    dirs: () => walkStates.map((s) => (s ? s.dir : null)),
+    place: (x, y) => {
+      pos.x = x;
+      pos.y = y;
+    },
+    setWorkArea: (next) => {
+      area = { ...next };
+    },
+    /** The window under her moved, shrank, was minimized or closed. */
+    setLedges: (next) => {
+      current = next.map((l) => ({ ...l }));
+    },
+    bump: (ms) => {
+      skew += ms;
+    },
+  };
+}
+
+/** The largest jump between consecutive frames, on either axis, starting from `from`. */
+function largestStep(from, moves) {
+  let prev = from;
+  let worst = 0;
+  for (const m of moves) {
+    worst = Math.max(worst, Math.abs(m.x - prev.x), Math.abs(m.y - prev.y));
+    prev = m;
+  }
+  return worst;
+}
+
+const at = (m) => ({ x: m.x, y: m.y });
+
+test('a fall lands on the ledge under her and settles exactly at its top minus her height', () => {
+  const cases = [
+    {
+      label: 'dropped by a display change',
+      act: (h) => {
+        h.place(600, 0);
+        assert.equal(h.wander.containNow(), false, 'inside the work area: nothing to clamp');
+      },
+    },
+    { label: 'starting above it at launch', startX: 600, startY: 40, act: (h) => h.wander.containNow() },
+    {
+      label: 'let go above it',
+      act: (h) => {
+        h.wander.grab();
+        h.wander.moveTo(600, 60);
+        h.wander.release({ vx: 0, vy: 0 });
+      },
+    },
+    {
+      label: 'thrown straight up from above it',
+      act: (h) => {
+        h.wander.grab();
+        h.wander.moveTo(600, 150);
+        h.wander.release({ vx: 0, vy: -600 });
+      },
+    },
+    // One-way, like a platform: rising from below she passes up through the
+    // edge, and on the way back down she lands on top of it.
+    {
+      label: 'thrown up through it from below',
+      act: (h) => {
+        h.wander.grab();
+        h.wander.moveTo(600, 400);
+        h.wander.release({ vx: 0, vy: -1000 });
+      },
+    },
+  ];
+
+  for (const { label, startX, startY, act } of cases) {
+    const h = perchHarness({ ledges: [SHELF, TABLE], startX, startY });
+    act(h);
+    assert.equal(h.wander.isFalling(), true, `${label}: in the air`);
+    h.advance(20_000);
+
+    assert.equal(h.wander.isFalling(), false, `${label}: settled`);
+    assert.deepEqual(at(h.moves.at(-1)), { x: 600, y: SHELF_Y }, `${label}: exactly on the shelf`);
+    assert.ok(h.moves.every((m) => m.x === 600), `${label}: the fall is vertical`);
+    assert.equal(h.airborneStates.at(-1), false, `${label}: and the renderer is told she is down`);
+
+    // Once above the shelf she never goes below it: no tunnelling through the
+    // edge, bounces included.
+    const above = h.moves.findIndex((m) => m.y < SHELF_Y);
+    assert.ok(above >= 0, `${label}: she was above the shelf`);
+    assert.ok(h.moves.slice(above).every((m) => m.y <= SHELF_Y), `${label}: and never fell through it`);
+    if (label.endsWith('from below')) assert.ok(above > 1, 'it took several frames to rise through the gap');
+
+    const settled = h.moves.length;
+    assert.equal(h.wander.containNow(), false, `${label}: the poll finds her standing`);
+    h.advance(10 * 60_000);
+    assert.equal(h.moves.length, settled, `${label}: and she stays there`);
+    assert.equal(h.wander.isFalling(), false);
+  }
+});
+
+test('a ledge that moves down, moves up or closes beneath her drops her to the next surface below, never teleporting', () => {
+  const cases = [
+    // [what happened to the shelf, the ledges afterwards, where she must end up]
+    ['moved down 100px', [ledge(400, 1000, 600, 11), TABLE], 280], // still the next surface below
+    ['moved up 50px', [ledge(400, 1000, 450, 11), TABLE], TABLE_Y], // rose past her feet: not hers
+    ['minimized', [TABLE], TABLE_Y],
+    ['closed, with nothing below it', [], FLOOR_Y],
+  ];
+  for (const [label, after, landsAt] of cases) {
+    const h = perchHarness({ ledges: [SHELF, TABLE], startX: 600, startY: SHELF_Y });
+    assert.equal(h.wander.containNow(), false, `${label}: resting on the shelf to begin with`);
+    assert.equal(h.wander.isFalling(), false, `${label}: and not falling`);
+
+    h.setLedges(after);
+    h.wander.containNow(); // production calls this from the ledge source's onChange
+    assert.equal(h.wander.isFalling(), true, `${label}: standing on air now`);
+    h.advance(100);
+    h.bump(10_000); // and the machine sleeps mid-fall: the next tick is 10s late
+    h.advance(20_000);
+
+    assert.equal(h.wander.isFalling(), false, `${label}: settled`);
+    assert.deepEqual(at(h.moves.at(-1)), { x: 600, y: landsAt }, `${label}: on the next surface down`);
+    assert.ok(h.moves.every((m) => m.y >= SHELF_Y), `${label}: never above where she stood: no snapping up`);
+    const worst = largestStep({ x: 600, y: SHELF_Y }, h.moves);
+    assert.ok(worst <= WORST_STEP, `${label}: largest frame-to-frame jump ${worst}px, capped at ${WORST_STEP}px`);
+    assert.deepEqual(h.airborneStates, [true, false], `${label}: one fall, edge-triggered`);
+  }
+});
+
+test('too-high, too-narrow and out-of-reach ledges are not surfaces, and each filter is exact', () => {
+  // Every ignored ledge sits next to the smallest change that makes it count,
+  // so each filter is shown to be the thing doing the ignoring.
+  const dropAt = (opts, x) => {
+    const h = perchHarness(opts);
+    h.place(x, 0);
+    h.wander.containNow();
+    h.advance(20_000);
+    return h.moves.length ? h.moves.at(-1).y : null;
+  };
+
+  // Too high: she would stand 0.3px above the top of the work area. Placed at the
+  // top she is within FLOOR_EPS of it, so only the filter stops it holding her.
+  const tooHigh = perchHarness({ ledges: [ledge(400, 1000, WIN_H - 0.3)] });
+  tooHigh.place(600, 0);
+  tooHigh.wander.containNow();
+  assert.equal(tooHigh.wander.isFalling(), true, 'a ledge above the work area is ignored');
+  tooHigh.advance(20_000);
+  assert.equal(tooHigh.moves.at(-1).y, FLOOR_Y, 'and she falls past it to the floor');
+  const atTop = perchHarness({ ledges: [ledge(400, 1000, WIN_H)] });
+  atTop.place(600, 0);
+  atTop.wander.containNow();
+  assert.equal(atTop.wander.isFalling(), false, 'control: standing exactly at the top of the work area holds');
+
+  // Too narrow: her whole footprint must be on the edge. 0.6px short leaves an
+  // empty standing range [400, 399.4]; x 399.7 is within the half-pixel slack of
+  // both of its ends, so only the empty-range filter keeps it from holding her.
+  assert.equal(dropAt({ ledges: [ledge(400, 400 + WIN_W - 1, 500)] }, 400), FLOOR_Y, '1px narrower than her');
+  assert.equal(dropAt({ ledges: [ledge(400, 400 + WIN_W - 0.6, 500)] }, 399.7), FLOOR_Y, '0.6px narrower than her');
+  assert.equal(dropAt({ ledges: [ledge(400, 400 + WIN_W, 500)] }, 400), SHELF_Y, 'control: exactly her width holds');
+  assert.equal(dropAt({ ledges: [ledge(400, 400 + WIN_W, 500)] }, 401), FLOOR_Y, '...at its one x only');
+
+  // Wide enough, but not where she is: part of her footprint would be over air.
+  for (const x of [399, 745]) assert.equal(dropAt({ ledges: [SHELF] }, x), FLOOR_Y, `x ${x} overhangs the shelf`);
+  for (const x of [400, 744]) assert.equal(dropAt({ ledges: [SHELF] }, x), SHELF_Y, `control: x ${x} is on it`);
+
+  // Clipped to the work area rather than discarded, and gone if nothing is left.
+  assert.equal(dropAt({ ledges: [ledge(1500, 2400, 500)] }, MAX_X), SHELF_Y, 'runs off-screen: clipped');
+  assert.equal(dropAt({ ledges: [ledge(1800, 2400, 500)] }, MAX_X), FLOOR_Y, 'nothing on-screen to stand on');
+
+  // Malformed entries are dropped one by one; the good one next to them survives.
+  const messy = [null, 'shelf', 7, ledge(NaN, 1000, 500), ledge(400, Infinity, 500), ledge(400, 1000, 500, NaN),
+    { left: 400, right: 1000, top: 500 }, SHELF];
+  assert.equal(dropAt({ getLedges: () => messy }, 600), SHELF_Y, 'the valid ledge still holds her');
+  assert.equal(dropAt({ getLedges: () => messy.slice(0, -1) }, 600), FLOOR_Y, 'and none of the junk does');
+  // A frozen list (the ledge source may hand out one shared array) is read, not rewritten.
+  const frozen = Object.freeze([Object.freeze({ ...SHELF })]);
+  assert.equal(dropAt({ getLedges: () => frozen }, 600), SHELF_Y, 'a frozen list works');
+});
+
+test('a stroll on a ledge picks its targets between the ledge ends and walks right up to them', () => {
+  // stroll 1: target fraction 0 (left end) / no pause / 45s gap
+  // stroll 2: target fraction 0.9999 (right end) / no pause / 45s gap
+  const h = perchHarness({
+    ledges: [SHELF, TABLE],
+    startX: 600,
+    startY: SHELF_Y,
+    randoms: [0, 0.9, 0, 0.9999, 0.9, 0],
+  });
+  h.wander.setMode('idle');
+  h.advance(ARM + 80_000); // 200px left, a 45s gap, 344px right
+
+  assert.deepEqual(h.dirs(), ['left', null, 'right', null], 'two strolls along the shelf');
+  assert.ok(h.moves.every((m) => m.y === SHELF_Y), 'both on the shelf');
+  assert.ok(h.moves.every((m) => m.x >= 400 && m.x <= 744), 'never past either end');
+  assert.ok(h.moves.some((m) => m.x === 400), 'walked to the left end');
+  assert.equal(h.moves.at(-1).x, 744, 'and then to the right end');
+  assert.deepEqual(h.airborneStates, [], 'never left the shelf');
+});
+
+test('the ledge shrinking mid-stroll turns her at its new end, and shrinking out from under her drops her', () => {
+  // target fraction 0.9999 (744, the right end) / no pause / turn-around roll 0.5
+  const h = perchHarness({ ledges: [SHELF], startX: 450, startY: SHELF_Y, randoms: [0.9999, 0.9, 0.5] });
+  h.wander.setMode('idle');
+  h.advance(ARM + 30 * TICK);
+  assert.deepEqual(at(h.moves.at(-1)), { x: 540, y: SHELF_Y }, '30 ticks right along the shelf');
+  assert.deepEqual(h.dirs(), ['right']);
+
+  // The window is resized narrower: the shelf now ends at x 600, short of her target.
+  h.setLedges([ledge(400, 856, 500, 11)]);
+  const shrunk = h.moves.length;
+  h.advance(60 * TICK);
+  const after = h.moves.slice(shrunk);
+  assert.ok(after.every((m) => m.y === SHELF_Y && m.x <= 600), 'never past the new end, never off the shelf');
+  assert.ok(after.some((m) => m.x === 600), 'walked up to the new end');
+  assert.deepEqual(h.dirs(), ['right', 'left', null], 'turned around there, then arrived');
+  // The fresh target is picked back along the *shelf*: 600 - between(1, 600 - 400)
+  // at roll 0.5 is 500. Measured against the floor it would have been 400.
+  assert.equal(h.moves.at(-1).x, 500, 'at a target picked inside the shrunken shelf');
+  assert.equal(h.wander.isWandering(), false);
+
+  // One step from her target when the shelf shrinks to end 2px short of it: the
+  // target cannot be arrived at any more, so she turns at the new end instead.
+  const near = perchHarness({ ledges: [SHELF], startX: 735, startY: SHELF_Y, randoms: [0.9999, 0.9, 0.5] });
+  near.wander.setMode('idle');
+  near.advance(ARM + 2 * TICK);
+  assert.equal(near.moves.at(-1).x, 741, '3px short of her 744 target');
+  near.setLedges([ledge(400, 998, 500, 11)]); // standing range [400, 742]
+  near.advance(TICK);
+  assert.deepEqual(at(near.moves.at(-1)), { x: 742, y: SHELF_Y }, 'stopped at the new end, not at the old target');
+  assert.deepEqual(near.dirs(), ['right', 'left']);
+  near.wander.containNow();
+  assert.equal(near.wander.isFalling(), false, 'and is still standing on the shelf');
+
+  // Narrower still, mid-stroll: the shelf no longer reaches where she is standing.
+  const d = perchHarness({ ledges: [SHELF], startX: 560, startY: SHELF_Y, randoms: [0.9999, 0.9, 0.5] });
+  d.wander.setMode('idle');
+  d.advance(ARM + 5 * TICK);
+  const standing = d.moves.at(-1);
+  assert.deepEqual(at(standing), { x: 575, y: SHELF_Y }, 'walking right along the shelf');
+  d.setLedges([ledge(400, 700, 500, 11)]); // standing range [400, 444]
+  const before = d.moves.length;
+  d.advance(20_000);
+  const fall = d.moves.slice(before);
+  assert.ok(fall.length > 0, 'she moved');
+  assert.ok(fall.every((m) => m.x === standing.x), 'straight down from where she stood: not walked over the edge');
+  assert.ok(fall[0].y > SHELF_Y, 'the very next frame is already a fall');
+  assert.equal(fall.at(-1).y, FLOOR_Y, 'and she lands on the floor');
+  assert.deepEqual(d.dirs(), ['right', null], 'the stroll was dropped');
+  assert.equal(d.wander.isWandering(), false);
+  assert.equal(d.wander.isFalling(), false);
+});
+
+test('a ledge running past the side of the work area is clipped: she strolls to the screen edge, not past it', () => {
+  // Right side: standing range [1500, 2144] clipped to [1500, 1664]; fraction 0.9999 is its right end.
+  const h = perchHarness({
+    ledges: [ledge(1500, 2400, 500, 55)],
+    startX: 1600,
+    startY: SHELF_Y,
+    randoms: [0.9999, 0.9, 0.5],
+  });
+  h.wander.setMode('idle');
+  h.advance(ARM + 60 * TICK);
+  assert.ok(h.moves.length > 0, 'she strolled');
+  assert.ok(h.moves.every((m) => m.x <= MAX_X && m.y === SHELF_Y), 'never past the edge of the screen');
+  assert.equal(h.moves.at(-1).x, MAX_X, 'the far end she walked to is the screen edge');
+
+  // Left side: standing range [-500, 344] clipped to [0, 344]; fraction 0 is its left end.
+  const l = perchHarness({ ledges: [ledge(-500, 600, 500, 66)], startX: 60, startY: SHELF_Y, randoms: [0, 0.9, 0.5] });
+  l.wander.setMode('idle');
+  l.advance(ARM + 60 * TICK);
+  assert.ok(l.moves.length > 0, 'she strolled');
+  assert.ok(l.moves.every((m) => m.x >= 0 && m.y === SHELF_Y), 'never past the left edge of the screen');
+  assert.equal(l.moves.at(-1).x, 0, 'the far end she walked to is the screen edge');
+});
+
+test('a ledge overhead changes nothing about a stroll along the floor', () => {
+  // target fraction 0 / pause roll 0.1 (pause) / pause at 50% / 3s breather
+  const run = (ledges) => {
+    const h = perchHarness({ ledges, randoms: [0, 0.1, 0.5, 0] });
+    h.wander.setMode('idle');
+    h.advance(ARM + 200_000);
+    return { moves: h.moves, walkStates: h.walkStates, airborneStates: h.airborneStates, draws: h.draws() };
+  };
+  const bare = run(undefined);
+  assert.ok(bare.moves.length > 500, 'a real stroll');
+  assert.ok(bare.moves.every((m) => m.y === FLOOR_Y), 'along the floor');
+  assert.deepEqual(run([SHELF, TABLE]), bare, 'same frames, same walk states, same random() draws');
+});
+
+test('a skid on a ledge decays on it like on the floor, and a skid past its end drops her off', () => {
+  const h = perchHarness({ ledges: [SHELF] });
+  h.wander.setMode('idle');
+  h.wander.grab();
+  h.wander.moveTo(500, SHELF_Y);
+  h.wander.release({ vx: 300, vy: 0 }); // flicked along the shelf
+  assert.equal(h.wander.isFalling(), true, 'a skid is physics, not a set-down');
+  h.advance(20_000);
+  const end = h.moves.at(-1);
+  assert.equal(end.y, SHELF_Y, 'she never left the shelf');
+  assert.ok(end.x > 500 && end.x < 744, `friction stopped her on it, at ${end.x}`);
+  assert.equal(h.wander.isFalling(), false);
+
+  const off = perchHarness({ ledges: [SHELF] });
+  off.wander.setMode('idle');
+  off.wander.grab();
+  off.wander.moveTo(720, SHELF_Y);
+  off.wander.release({ vx: 600, vy: 0 }); // 24px from the end, far too fast to stop in time
+  off.advance(20_000);
+  assert.equal(off.moves.at(-1).y, FLOOR_Y, 'she slid off the end and landed on the floor');
+  assert.ok(off.moves.at(-1).x > 744, 'beyond the shelf, carried by the skid');
+  assert.ok(
+    off.moves.filter((m) => m.y === SHELF_Y).every((m) => m.x <= 744),
+    'every frame at shelf height had her on the shelf',
+  );
+  assert.equal(off.wander.isFalling(), false);
+});
+
+test('with no ledges — none injected, empty, throwing or garbage — the trace is identical, draw for draw', () => {
+  // arm, stroll with a breather, a calm hop, a wall moving in and the floor rising
+  // under the stroll, a throw with the work area shrinking mid-flight, containment,
+  // a drag up and a fall, the `home` recall, another stroll, cancel, stop.
+  const script = (opts) => {
+    const h = perchHarness({ randoms: [0, 0.1, 0.5, 0, 0.6, 0.2, 0.9, 0.3], ...opts });
+    const flags = [];
+    const mark = (label) => {
+      flags.push([label, h.wander.isFalling(), h.wander.isHeld(), h.wander.isWandering(), h.wander.isArmed()]);
+    };
+    h.wander.containNow();
+    mark('startup');
+    h.wander.setMode('idle');
+    h.advance(ARM);
+    mark('armed');
+    h.advance(400 * TICK);
+    mark('walked, paused, resumed');
+    h.wander.setMode('busy');
+    h.advance(100 * TICK);
+    mark('calm hop');
+    h.setWorkArea({ x: 200, y: 0, width: 1720, height: 900 }); // left wall in, floor up
+    h.advance(100 * TICK);
+    mark('turned at the wall');
+    h.wander.grab();
+    mark('grabbed');
+    h.wander.moveTo(300, 200);
+    h.wander.moveTo(340, 180);
+    h.wander.release({ vx: 900, vy: -200 });
+    mark('thrown');
+    h.advance(150);
+    h.setWorkArea({ x: 0, y: 0, width: 1200, height: 900 }); // shrinks mid-flight
+    h.advance(30_000);
+    mark('landed');
+    h.place(5_000, 5_000);
+    h.wander.containNow();
+    mark('contained');
+    h.place(800, 100);
+    h.wander.containNow();
+    mark('dragged up');
+    h.advance(30_000);
+    mark('fell');
+    h.wander.grab();
+    h.wander.moveTo(99_999, 99_999);
+    h.wander.release({ vx: 0, vy: 0 });
+    mark('home');
+    h.advance(300_000);
+    mark('strolled again');
+    h.wander.cancel();
+    h.wander.setMode('waiting');
+    mark('cancelled');
+    h.wander.stop();
+    mark('stopped');
+    h.advance(60_000);
+    return {
+      moves: h.moves,
+      walkStates: h.walkStates,
+      airborneStates: h.airborneStates,
+      draws: h.draws(),
+      pending: h.pending(),
+      flags,
+    };
+  };
+
+  const base = script({}); // no getLedges at all: the floor-only module
+  // Not a vacuous comparison: the scenario really does all of the above.
+  const dirs = base.walkStates.map((s) => (s ? s.dir : null));
+  assert.deepEqual(dirs.slice(0, 3), ['left', null, 'left'], 'strolled, took a breather, walked on');
+  assert.ok(dirs.includes('right'), 'turned around at the wall that moved in');
+  // This one anchors the floor rule itself, which comparing variants cannot: the
+  // floor rising 140px under a stroll is containNow's to clamp, so she walks on at
+  // the old y to the wall instead of gravity "landing" her upward onto the new floor.
+  assert.ok(base.moves.some((m) => m.x === 200 && m.y === 720), 'strolled on below the risen floor');
+  assert.ok(base.moves.some((m) => m.x === 944 && m.y < 580), 'the throw hit the shrunken right wall in mid-air');
+  assert.ok(base.airborneStates.filter(Boolean).length >= 3, 'thrown, dropped, and picked up');
+  assert.ok(base.moves.length > 300 && base.draws > 4, `${base.moves.length} frames, ${base.draws} draws`);
+  assert.equal(base.pending, 0, 'and stop() left nothing pending');
+
+  const cycling = (values) => {
+    let i = 0;
+    return () => values[i++ % values.length];
+  };
+  // Only entries that are invalid under every work area the script uses.
+  const invalid = [
+    null,
+    'shelf',
+    42,
+    ledge(0, 1920, 300), // stands above the top of the work area
+    ledge(400, 400 + WIN_W - 1, 700), // narrower than her
+    ledge(NaN, 1000, 700),
+    ledge(400, 1000, Infinity),
+    ledge(400, 1000, 700, NaN),
+    { left: 400, right: 1000, top: 700 }, // no hwnd
+    ledge(0, 1920, FULL_HD.height), // standing y at the floor, not above it
+    ledge(0, 1920, 5_000), // below the floor
+    ledge(5_000, 9_000, 700), // off the side of the screen
+  ];
+  const variants = [
+    ['getLedges: () => []', { getLedges: () => [] }],
+    ['a frozen empty list', { getLedges: () => Object.freeze([]) }],
+    [
+      'a throwing getLedges',
+      {
+        getLedges: () => {
+          throw new Error('ledge helper died');
+        },
+      },
+    ],
+    ['a non-array getLedges', { getLedges: cycling([null, undefined, 'ledges', 42, { length: 1, 0: SHELF }]) }],
+    ['only invalid ledges', { getLedges: () => invalid }],
+  ];
+  for (const [label, opts] of variants) {
+    assert.deepEqual(script(opts), base, `${label}: identical to having no getLedges at all`);
+  }
+});
+
+test('pinned on a ledge she never strolls, yet still drops when the window under her closes', () => {
+  const h = perchHarness({ pinned: true, startX: 600, startY: SHELF_Y, ledges: [SHELF] });
+  h.wander.setMode('idle');
+  h.advance(30 * 60_000);
+  assert.equal(h.moves.length, 0, 'pinned: not one step along the shelf');
+  assert.equal(h.walkStates.length, 0);
+  assert.equal(h.wander.containNow(), false, 'the poll finds her standing on it');
+  assert.equal(h.wander.isFalling(), false);
+
+  h.setLedges([]);
+  h.wander.containNow();
+  assert.equal(h.wander.isFalling(), true, 'gravity outranks the pin, on a ledge as on the floor');
+  h.advance(20_000);
+  assert.deepEqual(at(h.moves.at(-1)), { x: 600, y: FLOOR_Y });
+  assert.equal(h.wander.isWandering(), false, 'and she still never strolls');
+});
+
+test('she can be picked up off a ledge, set down on another, and dropped from there into the air', () => {
+  // target fraction 0.5 (x 572 on the shelf, 622 on the table) / no pause / 82.5s gaps
+  const h = perchHarness({ ledges: [SHELF, TABLE], startX: 600, startY: SHELF_Y });
+  h.wander.setMode('idle');
+  h.advance(ARM + 5 * TICK);
+  assert.equal(h.wander.isWandering(), true, 'strolling along the shelf');
+
+  assert.equal(h.wander.grab(), true);
+  assert.equal(h.wander.isHeld(), true);
+  assert.equal(h.wander.isWandering(), false, 'the stroll is abandoned');
+  assert.deepEqual(h.dirs(), ['left', null]);
+  h.wander.moveTo(500, TABLE_Y);
+  const down = h.moves.length;
+  h.wander.release({ vx: 0, vy: 0 });
+  assert.equal(h.wander.isFalling(), false, 'set down on the table, not dropped onto it');
+  assert.deepEqual(h.airborneStates, [true, false]);
+  assert.equal(h.wander.isArmed(), true, 'straight back to the ordinary scheduler');
+  h.advance(1_000);
+  assert.equal(h.moves.length, down, 'not one physics tick spent on standing still');
+
+  h.advance(82_500 + 10_000); // the next stroll happens on the table
+  const onTable = h.moves.slice(down);
+  assert.ok(onTable.length > 0, 'she strolled again');
+  assert.ok(onTable.every((m) => m.y === TABLE_Y && m.x >= 300 && m.x <= 944), 'along the table');
+  assert.equal(h.moves.at(-1).x, 622, 'to a target picked on the table');
+
+  h.wander.grab();
+  h.wander.moveTo(1_300, 300); // over neither ledge
+  h.wander.release({ vx: 0, vy: 0 });
+  assert.equal(h.wander.isFalling(), true, 'let go in mid-air');
+  h.advance(20_000);
+  assert.deepEqual(at(h.moves.at(-1)), { x: 1_300, y: FLOOR_Y }, 'past the table, onto the floor');
+});
+
+test('home via grab + moveTo + release still lands her in the corner with ledges about, even mid-fall', () => {
+  const corner = ledge(1_300, 1_920, 500, 33); // a ledge right above the corner: stands at y 180
+  const h = perchHarness({ ledges: [SHELF, corner] });
+  h.wander.setMode('idle');
+  h.place(600, 0);
+  h.wander.containNow();
+  assert.equal(h.wander.isFalling(), true, 'falling toward the shelf when he asks her home');
+  h.advance(100);
+
+  h.wander.grab();
+  h.wander.moveTo(MAX_X, FLOOR_Y);
+  h.wander.release({ vx: 0, vy: 0 });
+  assert.equal(h.wander.isFalling(), false, 'the fall is over, not still integrating');
+  assert.deepEqual(at(h.moves.at(-1)), { x: MAX_X, y: FLOOR_Y }, 'in the corner, on the floor under the ledge');
+
+  const home = h.moves.length;
+  assert.equal(h.wander.containNow(), false, 'standing on the floor');
+  h.advance(WANDER_DEFAULTS.gapMinMs - 1);
+  assert.equal(h.moves.length, home, 'nothing drags her back out of it');
+});
+
+test('containment stands down while she is held, even as the ledges change under her', () => {
+  const h = perchHarness({ ledges: [SHELF] });
+  h.wander.grab();
+  h.wander.moveTo(600, 100);
+  const carried = h.moves.length;
+
+  h.setLedges([TABLE]);
+  assert.equal(h.wander.containNow(), false, 'the onChange call finds nothing to do');
+  h.setLedges([]);
+  assert.equal(h.wander.containNow(), false);
+  assert.equal(h.moves.length, carried, 'and moves her not at all');
+  assert.equal(h.wander.isFalling(), false, 'nor drops her out of his hand');
+  assert.equal(h.wander.isHeld(), true);
+
+  h.setLedges([SHELF, TABLE]);
+  h.wander.release({ vx: 0, vy: 0 });
+  h.advance(20_000);
+  assert.deepEqual(at(h.moves.at(-1)), { x: 600, y: SHELF_Y }, 'let go, she lands on the shelf below her');
+});
+
+test('fractional ledge coordinates survive rounding: the poll never knocks her off her own ledge', () => {
+  // DIP edges are fractional at 125%/150% scaling; moveWindow and getPosition are
+  // whole pixels. Stands at y 180.4, x in [400.3, 744.7].
+  const h = perchHarness({ ledges: [ledge(400.3, 1000.7, 500.4, 44)], randoms: [0, 0.9, 0.5] });
+  h.place(600, 0);
+  h.wander.containNow();
+  h.advance(20_000);
+  assert.equal(h.wander.isFalling(), false);
+  assert.deepEqual(at(h.moves.at(-1)), { x: 600, y: 180 }, 'landed at 180.4, rounded for the window');
+  const airborne = h.airborneStates.length;
+
+  // The poll re-reads the window's whole-pixel position: 0.4px off the edge.
+  assert.equal(h.wander.containNow(), false);
+  assert.equal(h.wander.containNow(), false);
+  assert.equal(h.wander.isFalling(), false, 'still standing on it');
+
+  h.wander.setMode('idle');
+  h.advance(ARM + 80 * TICK); // target fraction 0: the left end, 400.3
+  assert.equal(h.moves.at(-1).x, 400, 'walked to the fractional end, rounded for the window');
+  assert.equal(h.wander.isWandering(), false, 'and arrived');
+  h.wander.containNow(); // reads x back as 400: 0.3px past the end of the ledge
+  assert.equal(h.wander.isFalling(), false, 'half a pixel of slack: rounding cannot walk her off it');
+  assert.equal(h.airborneStates.length, airborne, 'and no airborne edge flickered');
+});
+
+// ------------------------------------------------- review fixes (perching, r1)
+
+function reviewRig(ledges, start = { x: 200, y: 600 }) {
+  let now = 0;
+  let id = 1;
+  const timers = new Map();
+  const pos = { ...start };
+  const moves = [];
+  const w = createWander({
+    clock: { now: () => now },
+    schedule: (fn, ms) => {
+      const i = id++;
+      timers.set(i, { at: now + ms, fn });
+      return () => timers.delete(i);
+    },
+    moveWindow: (mx, my) => {
+      pos.x = mx;
+      pos.y = my;
+      moves.push([mx, my]);
+    },
+    getWorkArea: () => ({ x: 0, y: 0, width: 1920, height: 1040 }),
+    getWindowSize: () => ({ width: 256, height: 320 }),
+    getPosition: () => ({ ...pos }),
+    getLedges: () => ledges,
+  });
+  const runFall = () => {
+    for (let n = 0; w.isFalling() && n < 2000; n++) {
+      let pick = null;
+      for (const [i, t] of timers) if (!pick || t.at < pick.t.at || (t.at === pick.t.at && i < pick.i)) pick = { i, t };
+      timers.delete(pick.i);
+      now = pick.t.at;
+      pick.t.fn();
+    }
+  };
+  return { w, pos, moves, runFall };
+}
+
+test('perch: rising up through a ledge is mid-air — no ground friction on that tick', () => {
+  const throwUp = (ledges) => {
+    const r = reviewRig(ledges);
+    r.w.containNow();
+    r.w.grab();
+    r.w.moveTo(200, 600);
+    r.moves.length = 0;
+    r.w.release({ vx: 100, vy: -1500 });
+    r.runFall();
+    return r.moves;
+  };
+  const free = throwUp(Object.freeze([]));
+  // A ledge whose standing y is exactly where she is after the first tick, while
+  // she is still rising: the second tick starts "on" it, moving up.
+  const [, y1] = free[0];
+  const ledge = Object.freeze([Object.freeze({ left: 0, right: 1919, top: y1 + 320, hwnd: 1 })]);
+  const through = throwUp(ledge);
+  assert.ok(free[1][1] < free[0][1], 'precondition: still rising on tick 2');
+  assert.deepEqual(through.slice(0, 3), free.slice(0, 3), 'the first ticks of the flight are untouched by the ledge she passes');
+});
+
+test('perch: set down within the slack past a ledge end, the 1s poll leaves her on it', () => {
+  // lo 300, hi 800.3 at standing y 400.
+  const ledge = Object.freeze([Object.freeze({ left: 300, right: 1056.3, top: 720, hwnd: 7 })]);
+  const r = reviewRig(ledge, { x: 600, y: 400 });
+  r.w.grab();
+  r.w.moveTo(800.7, 400);
+  r.w.release({ vx: 0, vy: 0 });
+  assert.equal(r.w.isFalling(), false);
+  for (let i = 0; i < 3; i++) r.w.containNow();
+  assert.equal(r.w.isFalling(), false, 'an unchanged ledge never drops her');
+  assert.ok(r.pos.x <= 800.8 && r.pos.y === 400, `still on the ledge at ${r.pos.x},${r.pos.y}`);
+
+  // Mirror at the left end.
+  const left = Object.freeze([Object.freeze({ left: 300.7, right: 1056, top: 720, hwnd: 7 })]);
+  const m = reviewRig(left, { x: 600, y: 400 });
+  m.w.grab();
+  m.w.moveTo(300.3, 400);
+  m.w.release({ vx: 0, vy: 0 });
+  m.w.containNow();
+  assert.equal(m.w.isFalling(), false);
+});
+
+test('perch: no skid that comes to rest on a ledge is knocked off it by the poll', () => {
+  let drops = 0;
+  let rests = 0;
+  for (const frac of [0, 0.1, 0.3, 0.5]) {
+    const ledge = Object.freeze([Object.freeze({ left: 300, right: 1056 + frac, top: 720, hwnd: 7 })]);
+    for (let sx = 600; sx <= 800; sx += 7) {
+      for (let vx0 = 40; vx0 <= 1400; vx0 += 37) {
+        const r = reviewRig(ledge, { x: sx, y: 400 });
+        r.w.grab();
+        r.w.moveTo(sx, 400);
+        r.w.release({ vx: vx0, vy: 0 });
+        r.runFall();
+        if (r.pos.y !== 400) continue; // skidded off the end: fine, that is a fall
+        rests += 1;
+        r.w.containNow();
+        if (r.w.isFalling()) drops += 1;
+      }
+    }
+  }
+  assert.ok(rests > 100, `enough skids came to rest on the ledge (${rests})`);
+  assert.equal(drops, 0);
+});
+
+test('perch: a hostile ledge entry costs that entry, not containment', () => {
+  const evil = {};
+  Object.defineProperty(evil, 'left', { get() { throw new Error('boom'); } });
+  const good = { left: 0, right: 1919, top: 720, hwnd: 2 };
+  const r = reviewRig([evil, good], { x: 600, y: 100 });
+  assert.doesNotThrow(() => r.w.containNow());
+  r.runFall();
+  assert.equal(r.pos.y, 400, 'landed on the good ledge');
+});
+
+test('perch: setting her down on the floor never moves her, even if the work area shrank while held', () => {
+  // Pinned after a review round where a ledge-only clamp leaked onto the floor:
+  // on the floor an out-of-range x is containNow's business, exactly as before.
+  let area = { x: 0, y: 0, width: 1920, height: 1040 };
+  const moves = [];
+  const pos = { x: 1600, y: 720 };
+  const w = createWander({
+    clock: { now: () => 0 },
+    schedule: () => () => {},
+    moveWindow: (mx, my) => { pos.x = mx; pos.y = my; moves.push([mx, my]); },
+    getWorkArea: () => area,
+    getWindowSize: () => ({ width: 256, height: 320 }),
+    getPosition: () => ({ ...pos }),
+    getLedges: () => [],
+  });
+  w.grab();
+  w.moveTo(1600, 720);
+  area = { x: 0, y: 0, width: 1200, height: 1040 }; // maxX 944 now; she is at 1600
+  moves.length = 0;
+  w.release({ vx: 0, vy: 0 });
+  assert.deepEqual(moves, [], 'release itself writes no position on the floor');
+  w.containNow();
+  assert.deepEqual(moves.at(-1), [944, 720], 'containNow is what pulls her back');
+});

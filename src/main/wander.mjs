@@ -42,6 +42,20 @@
 // throw: she keeps her horizontal speed through the air, bounces off the side
 // walls, and skids to a stop on the floor.
 //
+// Perching is the fifth rule, and it changes what "the floor" means rather than
+// adding a new kind of motion. `getLedges` hands over the visible top edges of
+// other windows; every one she fits on is a *surface*, and the floor is simply
+// the lowest surface, the one spanning the whole work area. Everything above then
+// runs unchanged against "the surface under her": she rests on one, falls when she
+// is on none, lands on the highest one below her feet, bounces and skids on it,
+// and strolls only between its ends. One physics loop rather than a second one for
+// ledges, so a ledge can never drift out of step with how the floor behaves. Two
+// rules keep it honest: a ledge is re-validated against this module's own bounds
+// on every read (the list is a snapshot of other processes' windows, and her size
+// or the work area may have changed since), and a ledge is never "under" her once
+// it has risen above her feet — a window moving up can drop her, never teleport
+// her onto it. With no ledges this is exactly the floor-only module it was.
+//
 // Production wiring (module A):
 //   createWander({
 //     clock: { now: () => Date.now() },
@@ -53,10 +67,13 @@
 //     onWalkState: (walk) => pushStateToRenderer({ walk }),
 //     isPinned: () => flags.pinned,
 //     random: Math.random,
+//     getLedges: () => ledgeSource.current(),  // ledges.mjs; [] when GANYU_PERCH=0 or the helper is down
 //   })
 // then, on every aggregate state change: wander.setMode(state.aggregate())
-// and call wander.containNow() on startup, from the 1s state poll, and on the
-// `screen` events display-metrics-changed / display-added / display-removed.
+// and call wander.containNow() on startup, from the 1s state poll, on the
+// `screen` events display-metrics-changed / display-added / display-removed, and
+// from ledgeSource.onChange — a window moving out from under her is a display
+// change in miniature, and containNow is what notices she is standing on air.
 
 export const WANDER_DEFAULTS = Object.freeze({
   armMs: 20_000, // aggregate mode must stay calm this long before the first stroll
@@ -153,6 +170,10 @@ export function createWander({
   // adds invisible frame padding, so the constants below are 4px optimistic and
   // used only as a fallback.
   getWindowSize = null,
+  // Optional: the top edges of other windows she can stand on, as
+  // `{left, right, top, hwnd}` in DIP (see readLedges). Absent, throwing, or
+  // returning garbage means "no ledges", which is the floor-only behaviour.
+  getLedges = null,
   windowWidth = WANDER_DEFAULTS.windowWidth,
   windowHeight = WANDER_DEFAULTS.windowHeight,
 } = {}) {
@@ -230,12 +251,115 @@ export function createWander({
     const aw = num(wa.width, 0);
     const ah = num(wa.height, 0);
     const size = windowSize();
-    return {
-      minX: ax,
-      maxX: Math.max(ax, ax + aw - size.width),
-      minY: ay,
-      bottomY: Math.max(ay, ay + ah - size.height),
-    };
+    const minX = ax;
+    const maxX = Math.max(ax, ax + aw - size.width);
+    const minY = ay;
+    const bottomY = Math.max(ay, ay + ah - size.height);
+    return { minX, maxX, minY, bottomY, ledges: readLedges(minX, maxX, minY, bottomY, size) };
+  }
+
+  /**
+   * The ledges she can stand on, as surfaces `{y, lo, hi}`: `y` is the window-y
+   * she stands at (the edge's top minus her height — her feet are the window's
+   * bottom edge, exactly as for the floor) and `[lo, hi]` the window-x range in
+   * which her whole footprint is on the edge.
+   *
+   * Re-validated here against this module's own bounds rather than trusted: the
+   * list is a snapshot of other processes' windows, taken against whatever her
+   * size and the work area were at the time. A ledge she would stand on above the
+   * top of the work area, or that is not clearly above the floor, or that she does
+   * not fit on, is not a surface. Read fresh on every bounds() call, never cached
+   * (production returns a ready-made array, so it is cheap), and never mutated —
+   * it may be a frozen array shared with other readers. Anything malformed is
+   * dropped entry by entry, and a getLedges that throws or returns a non-array
+   * means no ledges at all: perching is an extra, so a broken helper must leave
+   * the floor-only behaviour standing rather than take containment down with it.
+   */
+  function readLedges(minX, maxX, minY, bottomY, size) {
+    if (typeof getLedges !== 'function') return [];
+    let list;
+    try {
+      list = getLedges();
+      if (!Array.isArray(list)) return []; // inside the try: a revoked Proxy throws here
+    } catch {
+      return [];
+    }
+    const surfaces = [];
+    for (const l of list) {
+      // Per entry, so a hostile one (a throwing getter, a revoked Proxy) costs
+      // that entry rather than taking containNow() down with it.
+      let left;
+      let right;
+      let top;
+      let hwnd;
+      try {
+        if (!l) continue;
+        ({ left, right, top, hwnd } = l);
+      } catch {
+        continue;
+      }
+      if (
+        !Number.isFinite(left) || !Number.isFinite(right) ||
+        !Number.isFinite(top) || !Number.isFinite(hwnd)
+      ) continue;
+      const sy = top - size.height;
+      if (!(sy >= minY && sy < bottomY - FLOOR_EPS)) continue;
+      const lo = Math.max(left, minX);
+      const hi = Math.min(right - size.width, maxX);
+      if (lo > hi) continue;
+      surfaces.push({ y: sy, lo, hi });
+    }
+    return surfaces;
+  }
+
+  /** The floor as a surface: the whole width of the work area. */
+  function floorOf(b) {
+    return { y: b.bottomY, lo: b.minX, hi: b.maxX };
+  }
+
+  /**
+   * Whether ledge `s` holds her up at window-x `px`. The slack is FLOOR_EPS for
+   * the same reason as on the vertical axis: moveWindow rounds, and readPosition
+   * adopts that rounded value, so a pet parked on a fractional ledge end reads
+   * back up to half a pixel outside it. Without the slack, the 1s containNow poll
+   * would walk her off the end of her own ledge.
+   */
+  function supports(s, px) {
+    return px >= s.lo - FLOOR_EPS && px <= s.hi + FLOOR_EPS;
+  }
+
+  /**
+   * The surface she is resting on, or null if she is standing on air.
+   *
+   * The floor keeps today's one-sided test (`y` at or *below* bottomY - EPS) on
+   * purpose. A work area that shrinks under her leaves her below the new floor,
+   * and that is containNow's to clamp, not gravity's to "fall" up from — a
+   * symmetric test here would change the floor-only behaviour. The floor is
+   * checked first for the same reason. Ledges get the symmetric test: a ledge
+   * that moved more than EPS in either direction is no longer under her.
+   */
+  function surfaceUnder(b) {
+    if (y >= b.bottomY - FLOOR_EPS) return floorOf(b);
+    for (const s of b.ledges) {
+      if (Math.abs(y - s.y) <= FLOOR_EPS && supports(s, x)) return s;
+    }
+    return null;
+  }
+
+  /**
+   * Where a falling step that started at `fromY` would land: the highest surface
+   * not above her feet at the start of the step (so she passes up through a ledge
+   * from below and lands on it from above, and a ledge that rose past her feet is
+   * not hers to snap onto) that holds her up at the step's final x. The floor is
+   * the unconditional fallback, as it was before ledges existed: it catches her
+   * even from below.
+   */
+  function landingSurface(b, fromY) {
+    let best = floorOf(b);
+    for (const s of b.ledges) {
+      if (s.y >= fromY - FLOOR_EPS && s.y < best.y && supports(s, x)) best = s;
+    }
+    return best;
   }
 
   /**
@@ -340,13 +464,14 @@ export function createWander({
   }
 
   /**
-   * Start falling if she is above the floor — dragged up, or left high by a
-   * display change. Runs regardless of mode and pinned state, but never out of
-   * the owner's hand: while held, this module's position is his to aim.
+   * Start falling if she is standing on no surface — dragged up, left high by a
+   * display change, or the window she was perched on moved, shrank or closed.
+   * Runs regardless of mode and pinned state, but never out of the owner's hand:
+   * while held, this module's position is his to aim.
    */
   function maybeFall(b) {
     if (stopped || falling || held || !Number.isFinite(y)) return false;
-    if (y >= b.bottomY - FLOOR_EPS) return false;
+    if (surfaceUnder(b)) return false;
     return startFall();
   }
 
@@ -366,14 +491,23 @@ export function createWander({
     lastFallAt = now;
 
     // Ground contact is decided from where the step *starts*: friction belongs to
-    // a tick that began on the floor, so a skid decays and a flight does not.
-    const onFloor = y >= b.bottomY - FLOOR_EPS;
+    // a tick that began on a surface (the floor or a ledge), so a skid decays and
+    // a flight does not. The start y also bounds which surfaces she can land on.
+    const fromY = y;
+    // A ledge counts as contact only when she is not moving up: a throw that
+    // carries her up *through* a ledge passes its standing y in mid-air, and a
+    // tick that happens to start within EPS of it must not skid her. The floor
+    // keeps its old rule exactly (contact whatever vy is), so floor-only
+    // behaviour is unchanged; the one asymmetry is that the tick leaving a
+    // ledge on a bounce gets no friction where the floor's would.
+    const under = surfaceUnder(b);
+    const onSurface = under !== null && (under.y === b.bottomY || vy >= 0);
 
     vy = Math.min(vy + D.gravityPxPerSec2 * dt, D.maxFallPxPerSec);
     y += vy * dt;
 
     if (vx !== 0) {
-      if (onFloor) {
+      if (onSurface) {
         const drop = D.groundFrictionPxPerSec2 * dt;
         vx = Math.abs(vx) <= drop ? 0 : vx - Math.sign(vx) * drop;
       }
@@ -385,18 +519,26 @@ export function createWander({
         x = b.maxX;
         vx = -vx * D.wallRestitution;
       }
-      if (onFloor && Math.abs(vx) < D.minSlideVelocity) vx = 0;
+      if (onSurface && Math.abs(vx) < D.minSlideVelocity) vx = 0;
     }
     x = clamp(x, b.minX, b.maxX); // the work area can change mid-flight
 
-    if (y < b.bottomY) {
+    // Chosen after x has moved, so a skid that carries her past a ledge's end
+    // finds no ledge under her and she drops off it like walking off a table.
+    const land = landingSurface(b, fromY);
+    if (y < land.y) {
       moveWindow(Math.round(x), Math.round(y));
       fallTimer = schedule(fallTick, D.tickMs);
       return;
     }
 
     const rebound = vy * D.restitution;
-    y = b.bottomY; // exactly on the floor, whether she bounces or settles
+    y = land.y; // exactly on the surface, whether she bounces or settles
+    // And inside its standing range: `supports` allows EPS of slack, so a skid can
+    // stop up to half a pixel past a ledge's end, the window rounds a further
+    // half pixel out, and the 1s containNow poll then reads her back as standing
+    // on air. At most a 0.5px nudge; on the floor x is already in range (no-op).
+    x = clamp(x, land.lo, land.hi);
     moveWindow(Math.round(x), Math.round(y));
 
     if (rebound >= D.minBounceVelocity) {
@@ -471,12 +613,22 @@ export function createWander({
     const vx0 = clamp(num(velocity && velocity.vx, 0), -cap, cap);
     const vy0 = clamp(num(velocity && velocity.vy, 0), -cap, cap);
 
-    // Set down rather than thrown: already on the floor, not moving up, and no
-    // sideways speed worth simulating. Nothing to fly, so hand her straight back
-    // to the ordinary scheduler.
+    // Set down rather than thrown: already on a surface (the floor or a ledge),
+    // not moving up, and no sideways speed worth simulating. Nothing to fly, so
+    // hand her straight back to the ordinary scheduler.
     const b = bounds();
-    if (y >= b.bottomY - FLOOR_EPS && vy0 >= 0 && Math.abs(vx0) < D.minSlideVelocity) {
-      y = b.bottomY;
+    const under = surfaceUnder(b);
+    if (under && vy0 >= 0 && Math.abs(vx0) < D.minSlideVelocity) {
+      y = under.y;
+      // Same reason as the landing clamp in fallTick: set down within EPS past a
+      // ledge's end, she would read back as standing on air on the next poll.
+      // Ledges only: on the floor an out-of-range x (the work area changed while
+      // she was held) is containNow's to fix, exactly as it was before ledges.
+      const cx = under.y === b.bottomY ? x : clamp(x, under.lo, under.hi);
+      if (cx !== x) {
+        x = cx;
+        moveWindow(Math.round(x), Math.round(y));
+      }
       vx = 0;
       vy = 0;
       setAirborne(false);
@@ -535,7 +687,10 @@ export function createWander({
     syncPosition(b);
     if (maybeFall(b)) return; // dragged up since the last stroll: fall first
 
-    target = clamp(Math.round(between(b.minX, b.maxX)), b.minX, b.maxX);
+    // The target is picked on whatever she is standing on, so a stroll on a
+    // ledge stays on it. On the floor this is the whole work area, as it always was.
+    const s = surfaceUnder(b) || floorOf(b);
+    target = clamp(Math.round(between(s.lo, s.hi)), s.lo, s.hi);
 
     pauseAtX = null;
     if (random() < D.pauseChance) {
@@ -557,18 +712,20 @@ export function createWander({
   /**
    * A wall moved under her — the work area shrank, the window grew, or she was
    * dropped outside — so turn around at the edge and keep walking toward a fresh
-   * target on the way back instead of stopping dead against it.
+   * target on the way back instead of stopping dead against it. `s` is the
+   * surface she is walking on, so on a ledge its ends are the walls: the window
+   * under her shrank, and she turns at the new end rather than walk into the air.
    */
-  function turnAround(b, wall, dirAfter) {
+  function turnAround(s, wall, dirAfter) {
     x = wall;
     moveWindow(Math.round(x), Math.round(y));
 
-    const span = dirAfter > 0 ? b.maxX - x : x - b.minX;
+    const span = dirAfter > 0 ? s.hi - x : x - s.lo;
     if (span < 1) {
       endStroll(); // no room to walk in either direction
       return;
     }
-    target = clamp(Math.round(x + dirAfter * between(1, span)), b.minX, b.maxX);
+    target = clamp(Math.round(x + dirAfter * between(1, span)), s.lo, s.hi);
     pauseAtX = null; // the breather threshold belonged to the abandoned path
     pushWalk({ dir: dirAfter > 0 ? 'right' : 'left' });
     tickTimer = schedule(tick, D.tickMs);
@@ -595,11 +752,15 @@ export function createWander({
 
     const step = (D.speedPxPerSec * dt) / 1000;
     const dir = target > x ? 1 : -1;
+    // Re-derived every tick rather than remembered from the start of the stroll:
+    // the window under her can shrink between two steps. maybeFall above already
+    // proved she is on something, so the floor fallback is only a backstop.
+    const s = surfaceUnder(b) || floorOf(b);
 
     // Arrival wins over the wall check, so a target sitting exactly on an edge
     // still ends the stroll rather than bouncing off it. A target now *outside*
-    // the work area cannot be arrived at, and falls through to the wall check.
-    if (Math.abs(target - x) <= step && target >= b.minX && target <= b.maxX) {
+    // the surface cannot be arrived at, and falls through to the wall check.
+    if (Math.abs(target - x) <= step && target >= s.lo && target <= s.hi) {
       x = target;
       moveWindow(Math.round(x), Math.round(y));
       endStroll();
@@ -607,12 +768,12 @@ export function createWander({
     }
 
     const next = x + dir * step;
-    if (next < b.minX) {
-      turnAround(b, b.minX, 1);
+    if (next < s.lo) {
+      turnAround(s, s.lo, 1);
       return;
     }
-    if (next > b.maxX) {
-      turnAround(b, b.maxX, -1);
+    if (next > s.hi) {
+      turnAround(s, s.hi, -1);
       return;
     }
 
