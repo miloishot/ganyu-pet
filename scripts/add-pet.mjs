@@ -93,10 +93,11 @@ export function parseArgs(argv) {
  * id, looked up as `<codexHome>/pets/<id>` — and checked as a safe name first,
  * because it is about to become a path segment.
  */
-function resolveSource({ fs: fsImpl, target, codexHome }) {
+function resolveSource({ fs: fsImpl, target, codexHome, baseDir }) {
   try {
-    fsImpl.statSync(target);
-    return { ok: true, source: path.resolve(target) };
+    const onDisk = path.resolve(baseDir, target);
+    fsImpl.statSync(onDisk);
+    return { ok: true, source: onDisk };
   } catch {
     // Not on disk: fall through to reading it as a Codex pet id.
   }
@@ -254,15 +255,22 @@ export function main(argv, deps = {}) {
     return 1;
   }
 
-  const petsDir = args.petsDir ?? defaultUserPetsDir({ env, platform, home });
+  // `npm run` starts this script in the package root, not where the user typed
+  // the command; npm records that directory as INIT_CWD. Relative paths the
+  // user typed are resolved against it, so `npm run add-pet -- my-pet.zip`
+  // means the zip beside them, wherever they are.
+  const baseDir = typeof env.INIT_CWD === 'string' && env.INIT_CWD.trim() ? env.INIT_CWD.trim() : process.cwd();
+  const fromUser = (p) => (p == null ? p : path.resolve(baseDir, p));
+
+  const petsDir = fromUser(args.petsDir) ?? defaultUserPetsDir({ env, platform, home });
   if (!petsDir) {
     printError(`${SCRIPT}: cannot work out the user pets dir on this machine — pass --pets-dir`);
     return 1;
   }
   const envCodexHome = typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim() ? env.CODEX_HOME.trim() : null;
-  const codexHome = args.codexHome ?? envCodexHome ?? (home ? path.join(home, '.codex') : null);
+  const codexHome = fromUser(args.codexHome) ?? envCodexHome ?? (home ? path.join(home, '.codex') : null);
 
-  const found = resolveSource({ fs: fsImpl, target: args.target, codexHome });
+  const found = resolveSource({ fs: fsImpl, target: args.target, codexHome, baseDir });
   if (!found.ok) {
     for (const e of found.errors) printError(`${SCRIPT}: ${e}`);
     return 1;

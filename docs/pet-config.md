@@ -368,8 +368,8 @@ GANYU_PET=<id>                 # this machine
 | Linux | `$XDG_CONFIG_HOME/ganyu-pet/pets/` (default `~/.config/ganyu-pet/pets/`) |
 
 `GANYU_PETS_DIR` replaces that directory for both the installer and the app; `--pets-dir <dir>`
-replaces it for one install. Tests always use one of the two — nothing in this repo writes the
-real directory.
+replaces it for one install. Tests always use one of the two — no test or check in this repo writes
+the real directory.
 
 **What a pack is.** A folder, or a `.zip` of one, holding either:
 

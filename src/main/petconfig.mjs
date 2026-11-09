@@ -110,7 +110,7 @@ const ACCESSORY_KEYS = Object.freeze(['id', 'sheet', 'enabled']);
 // var and split on commas, so it is kept to the characters that survive that
 // trip: no spaces, no commas, no case to get wrong.
 const ACCESSORY_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
-const MAX_NAME_CHARS = 64;
+export const MAX_NAME_CHARS = 64;
 
 // A pet name becomes a directory under the user pets dir, so it has to be one
 // safe path segment. Dots are allowed (Codex pet ids may carry them) but never

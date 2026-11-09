@@ -30,7 +30,7 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import { Buffer, constants as bufferConstants } from 'node:buffer';
 
-import { isSafePetName, loadPetConfig, resolveSheetPath, validatePetConfig } from './petconfig.mjs';
+import { isSafePetName, MAX_NAME_CHARS, loadPetConfig, resolveSheetPath, validatePetConfig } from './petconfig.mjs';
 
 /** The file a finished pack carries, and the one an installed pet is read from. */
 export const PACK_CONFIG_NAME = 'ganyu-pet.json';
@@ -46,7 +46,6 @@ export const ZIP_MAX_TOTAL_BYTES = 64 * 1024 * 1024;
  * anywhere. The rule itself is `isSafePetName` in `petconfig.mjs`, shared with
  * `findPetConfig`, so the installer and main cannot disagree about a name.
  */
-const MAX_ID_CHARS = 64;
 
 /** Electron's `userData` for this app is `<appData>/<package name>`. */
 const APP_DIR_NAME = 'ganyu-pet';
@@ -193,6 +192,11 @@ export function readZip(buffer, { maxEntries = ZIP_MAX_ENTRIES, maxTotalBytes = 
   const fail = (...errors) => ({ ok: false, entries: [], errors });
   if (!Buffer.isBuffer(buffer) && !(buffer instanceof Uint8Array)) {
     return fail('not a zip: expected the archive bytes');
+  }
+  // zlib.crc32 arrived in Node 22.2. Without it every archive would fail the
+  // CRC check and be reported as damaged — blame the runtime, not the pack.
+  if (typeof zlib.crc32 !== 'function') {
+    return fail(`reading a zip needs Node 22.2 or newer (this is ${process.version}); unzip it and pass the folder instead`);
   }
   const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   try {
@@ -674,7 +678,7 @@ export function installPack({
       return done({
         ...base,
         errors: [
-          `id: ${JSON.stringify(id)} cannot be installed — it becomes the directory <pets dir>/<id>, so it must be lowercase letters, digits, ".", "-" and "_", starting with a letter or digit, with no "..", at most ${MAX_ID_CHARS} characters`,
+          `id: ${JSON.stringify(id)} cannot be installed — it becomes the directory <pets dir>/<id>, so it must be lowercase letters, digits, ".", "-" and "_", starting with a letter or digit, with no "..", at most ${MAX_NAME_CHARS} characters`,
         ],
       });
     }
