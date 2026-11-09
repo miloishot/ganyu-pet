@@ -31,6 +31,7 @@ import {
   createVoice,
   escapeSsml,
   loadVoiceConfig,
+  loadCallConfig,
   secMsGec,
 } from '../src/main/voice.mjs';
 import { AUDIO_HOLD_MS, createSpeech, QUIET_THROTTLE_MS } from '../src/main/speech.mjs';
@@ -1103,4 +1104,44 @@ test('an element that throws on play is swallowed', () => {
     throw new Error('no output device');
   };
   assert.equal(createVoicePlayer({ el }).play({ mime: AUDIO_MIME, base64: 'QUJD' }), false);
+});
+
+// ---------------------------------------------------------------- call mode keys
+
+test('loadCallConfig: no file means no call device, never a throw', () => {
+  assert.deepEqual(loadCallConfig({}), { device: '', mixMic: false, mic: '' });
+  assert.deepEqual(
+    loadCallConfig({ envPath: 'x', fs: { readFileSync: () => { throw new Error('ENOENT'); } } }),
+    { device: '', mixMic: false, mic: '' },
+  );
+});
+
+test('loadCallConfig reads the three keys with the same parse rules as the voice', () => {
+  const read = (text) => loadCallConfig({ envPath: 'x', fs: { readFileSync: () => text } });
+  assert.deepEqual(read('GANYU_CALL_DEVICE= Voicemeeter AUX Input \n'), { device: 'Voicemeeter AUX Input', mixMic: false, mic: '' });
+  assert.deepEqual(
+    read('GANYU_CALL_DEVICE=CABLE Input\nGANYU_CALL_MIX_MIC=1\nGANYU_CALL_MIC=USB Mic\n'),
+    { device: 'CABLE Input', mixMic: true, mic: 'USB Mic' },
+  );
+  for (const off of ['0', 'false', 'no', 'off', 'never', '']) {
+    assert.equal(read(`GANYU_CALL_MIX_MIC=${off}\n`).mixMic, false, `"${off}" is off`);
+  }
+  assert.equal(read('# GANYU_CALL_MIX_MIC=1\n').mixMic, false, 'a commented key is not set');
+  // Call keys never change the voice config's shape.
+  const voice = loadVoiceConfig({ envPath: 'x', fs: { readFileSync: () => 'GANYU_CALL_DEVICE=CABLE Input\n' } });
+  assert.equal('call' in voice, false);
+});
+
+test('GANYU_CALL_MIX_MIC is strictly opt-in: only an explicit yes opens the mic', () => {
+  const read = (text) => loadCallConfig({ envPath: 'x', fs: { readFileSync: () => text } });
+  // Mix mode opens the microphone, so anything short of a clear yes is off —
+  // including the spellings a looser parser read as "not falsey, so on".
+  const off = ['0 # off', '"0"', 'disabled', 'n', 'y', '2', 'allow', 'enabled', '0', 'false', 'no', 'off', 'never', '', ' '];
+  for (const value of off) {
+    assert.equal(read(`GANYU_CALL_MIX_MIC=${value}\n`).mixMic, false, `${JSON.stringify(value)} is off`);
+  }
+  assert.equal(read('GANYU_CALL_DEVICE=CABLE Input\n').mixMic, false, 'a missing key is off');
+  for (const value of ['1', 'true', 'yes', 'on', 'TRUE', ' Yes ', 'ON']) {
+    assert.equal(read(`GANYU_CALL_MIX_MIC=${value}\n`).mixMic, true, `${JSON.stringify(value)} is on`);
+  }
 });

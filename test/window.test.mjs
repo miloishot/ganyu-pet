@@ -39,6 +39,8 @@ import {
   throwVelocity,
   toSpeechDetail,
   toStatePayload,
+  mediaPermissionHandlers,
+  installMediaPermissions,
 } from '../src/main/window.mjs';
 
 // ---------------------------------------------------------------- geometry
@@ -523,7 +525,7 @@ test('enforceWindowSize with tolerance 0 normalizes the constructor rounding', (
 // ---------------------------------------------------------------- menu actions
 
 test("MENU_ACTIONS carries the recall action alongside the original three", () => {
-  assert.deepEqual([...MENU_ACTIONS], ['toggle-mute', 'toggle-pin', 'home', 'quit']);
+  assert.deepEqual([...MENU_ACTIONS], ['toggle-mute', 'toggle-pin', 'toggle-call', 'home', 'quit']);
   assert.ok(Object.isFrozen(MENU_ACTIONS), 'frozen so callers cannot widen it at runtime');
 });
 
@@ -546,10 +548,10 @@ test('registerIpc dispatches every MENU_ACTIONS entry and nothing else', () => {
   const menu = handlers.get(CHANNELS.menu);
   for (const action of MENU_ACTIONS) menu(null, action);
   // 'home' has to survive the allow-list filter, or the recall path is dead.
-  assert.deepEqual(seen, ['toggle-mute', 'toggle-pin', 'home', 'quit']);
+  assert.deepEqual(seen, ['toggle-mute', 'toggle-pin', 'toggle-call', 'home', 'quit']);
 
-  for (const bogus of ['go-home', 'HOME', '', null, undefined, 'eval']) menu(null, bogus);
-  assert.deepEqual(seen, ['toggle-mute', 'toggle-pin', 'home', 'quit'], 'unknown actions are dropped');
+  for (const bogus of ['go-home', 'HOME', '', null, undefined, 'eval', 'toggle-calls', 'TOGGLE-CALL']) menu(null, bogus);
+  assert.deepEqual(seen, ['toggle-mute', 'toggle-pin', 'toggle-call', 'home', 'quit'], 'unknown actions are dropped');
 
   dispose();
   assert.equal(handlers.size, 0, 'dispose removes every listener it added');
@@ -1036,4 +1038,64 @@ test('registerIpc without onDrag still registers the channel and swallows the me
     onMenuAction: () => {},
   });
   assert.doesNotThrow(() => handlers.get(CHANNELS.drag)(null, 'press'));
+});
+
+// ---------------------------------------------------------------- media permission
+//
+// Call mode needs exactly one permission: audio-only `media`, for the app's own
+// page. Electron grants everything by default, so everything else is refused.
+
+const APP_URL = 'file:///C:/Users/me/ganyu-pet/src/renderer/index.html';
+
+test('media permission: audio from the app page is granted, on both handlers', () => {
+  const { check, request } = mediaPermissionHandlers({ appUrl: APP_URL });
+  assert.equal(check(null, 'media', 'file:///', { mediaType: 'audio', requestingUrl: APP_URL, isMainFrame: true }), true);
+  // Chromium may normalise the drive letter and the encoding.
+  assert.equal(check(null, 'media', 'file:///', { mediaType: 'audio', requestingUrl: 'file:///c:/Users/me/ganyu-pet/src/renderer/index.html#x' }), true);
+  const wc = { getURL: () => APP_URL };
+  assert.equal(check(wc, 'media', 'file:///', { mediaType: 'audio' }), true, 'falls back to the page URL');
+
+  let granted = null;
+  request(null, 'media', (v) => { granted = v; }, { mediaTypes: ['audio'], requestingUrl: APP_URL, isMainFrame: true });
+  assert.equal(granted, true);
+});
+
+test('media permission: video, screen capture, other permissions and other pages are denied', () => {
+  const { check, request } = mediaPermissionHandlers({ appUrl: APP_URL });
+  const ask = (permission, details) => {
+    let v = 'never called';
+    request(null, permission, (x) => { v = x; }, details);
+    return v;
+  };
+  const ok = { requestingUrl: APP_URL, isMainFrame: true };
+
+  assert.equal(ask('media', { ...ok, mediaTypes: ['video'] }), false, 'video');
+  assert.equal(ask('media', { ...ok, mediaTypes: ['audio', 'video'] }), false, 'audio + video');
+  assert.equal(ask('media', { ...ok, mediaTypes: [] }), false, 'legacy screen capture arrives with no types');
+  assert.equal(ask('media', { ...ok }), false, 'no types at all');
+  for (const p of ['notifications', 'geolocation', 'clipboard-read', 'display-capture', 'fullscreen', 'openExternal']) {
+    assert.equal(ask(p, { ...ok, mediaTypes: ['audio'] }), false, p);
+    assert.equal(check(null, p, 'file:///', { ...ok, mediaType: 'audio' }), false, p);
+  }
+  for (const url of ['https://example.com/', 'file:///C:/Users/me/evil.html', 'file:///C:/Users/me/ganyu-pet/src/renderer/index.html.evil', '', undefined]) {
+    assert.equal(ask('media', { requestingUrl: url, isMainFrame: true, mediaTypes: ['audio'] }), false, String(url));
+    assert.equal(check({ getURL: () => url }, 'media', 'file:///', { requestingUrl: url, mediaType: 'audio' }), false, String(url));
+  }
+  assert.equal(ask('media', { ...ok, isMainFrame: false, mediaTypes: ['audio'] }), false, 'subframe');
+  assert.equal(check(null, 'media', 'file:///', { ...ok, mediaType: 'video' }), false, 'video check');
+  assert.equal(check(null, 'media', 'file:///', { ...ok, mediaType: 'unknown' }), false, 'unknown check');
+  assert.equal(check(null, 'media', 'file:///', { ...ok, isMainFrame: false, mediaType: 'audio' }), false, 'subframe check');
+});
+
+test('installMediaPermissions sets both handlers on the session', () => {
+  const set = {};
+  const session = {
+    setPermissionCheckHandler: (fn) => { set.check = fn; },
+    setPermissionRequestHandler: (fn) => { set.request = fn; },
+  };
+  assert.equal(installMediaPermissions(session, { appUrl: APP_URL }), true);
+  assert.equal(typeof set.check, 'function');
+  assert.equal(typeof set.request, 'function');
+  assert.equal(set.check(null, 'media', 'file:///', { mediaType: 'audio', requestingUrl: APP_URL }), true);
+  assert.equal(installMediaPermissions(null, { appUrl: APP_URL }), false);
 });

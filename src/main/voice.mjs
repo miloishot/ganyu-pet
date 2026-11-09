@@ -186,6 +186,43 @@ export function loadVoiceConfig({ envPath = null, fs = null, pet = null } = {}) 
   };
 }
 
+/**
+ * `loadCallConfig({envPath, fs})` -> `{device, mixMic, mic}` — call mode's keys.
+ *
+ * Read from the same `.env.local` with the same parse rules as
+ * `loadVoiceConfig` above, and kept beside it rather than inside it so the
+ * voice config's shape stays what every caller already expects.
+ *
+ *   GANYU_CALL_DEVICE   substring of the output device's label, e.g.
+ *                       `Voicemeeter AUX Input` or `CABLE Input`. Blank = none.
+ *   GANYU_CALL_MIX_MIC  strictly opt-in, because it opens the microphone: on
+ *                       ONLY for `1`/`true`/`yes`/`on` (any case, trimmed).
+ *                       Every other value, and a missing key, is off.
+ *   GANYU_CALL_MIC      substring of the mic's label; blank = the default input.
+ *
+ * Never throws. A missing file is no call device, not an error.
+ */
+/** The only spellings that turn mix mode on. Kept local, not shared with brain.mjs. */
+const CALL_MIX_YES = new Set(['1', 'true', 'yes', 'on']);
+export const callMixMicFrom = (value) =>
+  value != null && CALL_MIX_YES.has(String(value).trim().toLowerCase());
+
+export function loadCallConfig({ envPath = null, fs = null } = {}) {
+  let env = {};
+  if (envPath && fs && typeof fs.readFileSync === 'function') {
+    try {
+      env = parseEnvFile(fs.readFileSync(envPath, 'utf8'));
+    } catch {
+      env = {};
+    }
+  }
+  return {
+    device: String(env.GANYU_CALL_DEVICE ?? '').trim(),
+    mixMic: callMixMicFrom(env.GANYU_CALL_MIX_MIC),
+    mic: String(env.GANYU_CALL_MIC ?? '').trim(),
+  };
+}
+
 const WS_OPEN = 1;
 
 /**

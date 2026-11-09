@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { createChat } from './chat.mjs';
 import { buildContext, payloadOf, trackActiveSince } from './context.mjs';
@@ -23,6 +23,7 @@ import {
   createLeaveWatch,
   createPetWindow,
   enforceWindowSize,
+  installMediaPermissions,
   moveWindowPinned,
   pointInBox,
   registerIpc,
@@ -108,7 +109,14 @@ if (process.env.GANYU_NO_GPU === '1') app.disableHardwareAcceleration();
 
 /** @type {import('electron').BrowserWindow | null} */
 let win = null;
-const flags = { muted: false, pinned: false };
+const flags = { muted: false, pinned: false, callMode: false };
+/**
+ * Call mode's device keys (`loadCallConfig` in voice.mjs). Call mode is off at
+ * every launch; this only says where it would go. Under GANYU_SMOKE the device
+ * comes from GANYU_SMOKE_CALL instead, for the opt-in sink probe.
+ */
+let callConfig = { device: '', mixMic: false, mic: '' };
+const SMOKE_CALL = String(process.env.GANYU_SMOKE_CALL ?? '').trim();
 let spriteUrl = null;
 
 /**
@@ -815,6 +823,9 @@ async function composeRuntime() {
   let ambientVoice = null;
   const voiceMod = await tryImport('./voice.mjs');
   if (voiceMod?.createVoice && !SMOKE) {
+    if (typeof voiceMod.loadCallConfig === 'function') {
+      callConfig = voiceMod.loadCallConfig({ envPath: ENV_FILE, fs });
+    }
     const voiceConfig = voiceMod.loadVoiceConfig({ envPath: ENV_FILE, fs, pet: petConfig });
     if (voiceConfig.enabled) {
       voice = voiceMod.createVoice({
@@ -973,8 +984,12 @@ function getFlags() {
   return {
     muted: flags.muted,
     pinned: flags.pinned,
+    callMode: flags.callMode,
+    call: { ...callConfig },
     spritePath: spriteUrl,
     sprite: spriteBlock(),
+    // The smoke probe's device — present only under GANYU_SMOKE with it set.
+    ...(SMOKE && SMOKE_CALL !== '' ? { smokeCall: SMOKE_CALL } : {}),
   };
 }
 
@@ -1106,11 +1121,18 @@ function handleMenuAction(action) {
     }
     return;
   }
+  if (action === 'toggle-call') {
+    flags.callMode = !flags.callMode;
+    return;
+  }
   if (action === 'home') {
     goHome();
     return;
   }
-  if (action === 'quit') app.quit();
+  if (action === 'quit') {
+    flags.callMode = false;
+    app.quit();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1154,17 @@ async function main() {
     workArea: screen.getPrimaryDisplay().workArea,
     preloadPath: PRELOAD,
   });
+  // Audio-only `media` for the renderer page, nothing else for anyone — see
+  // mediaPermissionHandlers. Installed before the page loads, so no request
+  // can arrive ahead of the policy.
+  installMediaPermissions(win.webContents.session, { appUrl: pathToFileURL(RENDERER).href });
+  if (SMOKE && SMOKE_CALL !== '') {
+    // The renderer has no stdout. Relay only the probe's own line.
+    win.webContents.on('console-message', (...args) => {
+      const msg = String(args[0]?.message ?? args[2] ?? '');
+      if (/^CALL_SINK_(OK|FAIL) /.test(msg)) console.log(msg);
+    });
+  }
   // The BrowserWindow constructor rounds a 256x320 request up to a 259x323 outer
   // rect on this machine, which hangs 3px past the work area. One pinned move
   // normalizes it to exactly 256x320 (measured), so do that before measuring —

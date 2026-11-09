@@ -95,6 +95,39 @@ input, tool result, thinking block, attachment, or file-history record.
 If you would rather it saw less, `GANYU_SEE_PROMPTS=0` and `GANYU_READ_SESSIONS=0` in
 `.env.local`.
 
+### Talking in calls
+
+She can speak into a Discord, Roblox or Teams call through a virtual audio device. Right-click
+her and pick **Talk in calls** (**Stop talking in calls** turns it off). She still plays on your
+speakers as well, and a muted pet stays silent in the call too. She talks into the call; she does
+not listen to it. Nothing is installed and your Windows default devices are left alone. You
+bring the virtual device.
+
+**Voicemeeter** (or another mixer that combines sources, such as SteelSeries Sonar):
+
+1. In `.env.local`, set `GANYU_CALL_DEVICE=Voicemeeter AUX Input`. This routes her to
+   Voicemeeter's AUX input strip.
+2. In Voicemeeter, send that strip (and your mic strip) to the virtual output bus the call
+   should hear.
+3. In the call app, pick Voicemeeter's virtual output (e.g. `Voicemeeter Out B1`) as the
+   microphone.
+4. Right-click her and pick **Talk in calls**.
+
+**Bare VB-Cable** (no mixer). Mix mode adds your mic, because the call app can only listen to one
+input:
+
+1. In `.env.local`, set `GANYU_CALL_DEVICE=CABLE Input` and `GANYU_CALL_MIX_MIC=1`. If you
+   don't want the default input, also set `GANYU_CALL_MIC=<part of your mic's name>`.
+2. In the call app, set the microphone to `CABLE Output`.
+3. Right-click her and pick **Talk in calls**. Your mic stays open only while call mode is
+   on. It is mixed live and never recorded, stored or sent anywhere else.
+
+The device names are case-insensitive substrings of what Windows calls the device. If the
+device can't be found, or vanishes mid-call, call mode turns itself off and she says which
+device she could not reach. To check a device without joining a call, run
+`GANYU_SMOKE_CALL="Voicemeeter AUX Input" npm run smoke`. It should print
+`CALL_SINK_OK <label>`.
+
 ### Development
 
 ```bash
