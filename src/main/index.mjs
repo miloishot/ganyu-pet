@@ -34,7 +34,15 @@ import {
   toStatePayload,
   usePetConfig,
 } from './window.mjs';
-import { DEFAULT_PET_CONFIG, loadPetConfig, resolveSheetPath } from './petconfig.mjs';
+import {
+  DEFAULT_PET_CONFIG,
+  findPetConfig,
+  loadPetConfig,
+  resolveAccessoryPaths,
+  resolveSheetPath,
+  selectAccessories,
+} from './petconfig.mjs';
+import { defaultUserPetsDir } from './petpack.mjs';
 import { createPersona } from './persona.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -119,6 +127,8 @@ let spriteUrl = null;
 let petConfig = DEFAULT_PET_CONFIG;
 let persona = createPersona(DEFAULT_PET_CONFIG);
 let petConfigPath = null;
+/** `[{id, url}]`, chosen in bootPet; see bootAccessories. */
+let accessoryLayers = [];
 
 let state = null;
 let server = null;
@@ -1005,7 +1015,31 @@ function spriteBlock() {
       airborne: anim.airborne,
       celebrate: [...anim.celebrate],
     },
+    // Resolved once in bootPet. Always an array, so the renderer's "absent
+    // means none" rule is for an older main, not for this one.
+    accessories: accessoryLayers.map((layer) => ({ ...layer })),
   };
+}
+
+/**
+ * The accessory layers this run draws: the config's list, filtered by
+ * `GANYU_ACCESSORIES`, minus any sheet that is not on disk. Each drop is one
+ * log line — a missing hat is worth saying, never worth refusing to start.
+ */
+function bootAccessories() {
+  const { selected, warnings } = selectAccessories(petConfig, process.env.GANYU_ACCESSORIES);
+  for (const w of warnings) console.warn(`[ganyu] GANYU_ACCESSORIES: ${w}`);
+  const byId = new Map(resolveAccessoryPaths(petConfig, petConfigPath).map((a) => [a.id, a]));
+  const layers = [];
+  for (const id of selected) {
+    const sheet = byId.get(id)?.path;
+    if (!sheet || !fs.existsSync(sheet)) {
+      console.warn(`[ganyu] accessory "${id}" skipped: sheet not found (${sheet ?? 'no path'})`);
+      continue;
+    }
+    layers.push({ id, url: spriteFileUrl(sheet) });
+  }
+  return layers;
 }
 
 /**
@@ -1023,11 +1057,23 @@ function bootPet() {
     : String(process.env.GANYU_PET ?? '').trim();
 
   if (named !== '') {
-    const filePath = path.join(HERE, '..', '..', 'pets', `${named}.json`);
-    const result = loadPetConfig({ fs, filePath });
+    // User pets dir (where `npm run add-pet` installs), then the repo's pets/,
+    // then the built-in by its own id. The first place that has the file
+    // decides: a broken user copy is a hard exit, not a fall-through.
+    const found = findPetConfig({
+      fs,
+      name: named,
+      userPetsDir: defaultUserPetsDir({ env: process.env, platform: process.platform, home: os.homedir() }),
+      repoPetsDir: path.join(HERE, '..', '..', 'pets'),
+    });
+    const result = !found.ok
+      ? found
+      : found.source === 'builtin'
+        ? { ok: true, config: DEFAULT_PET_CONFIG }
+        : loadPetConfig({ fs, filePath: found.filePath });
     if (result.ok) {
       petConfig = result.config;
-      petConfigPath = filePath;
+      petConfigPath = found.filePath;
     } else {
       console.error(`[ganyu] pet "${named}" could not be loaded:`);
       for (const err of result.errors) console.error(`  ${err}`);
@@ -1039,10 +1085,13 @@ function bootPet() {
 
   persona = createPersona(petConfig);
   const bound = usePetConfig(petConfig);
+  accessoryLayers = bootAccessories();
   console.log(
     `[ganyu] pet: ${petConfig.displayName} (${petConfig.id}) `
-      + `${bound.size.width}x${bound.size.height}, ${petConfig.animation.rows.length} rows`,
+      + `${bound.size.width}x${bound.size.height}, ${petConfig.animation.rows.length} rows`
+      + `${petConfigPath ? ` from ${petConfigPath}` : ''}`,
   );
+  console.log(`[ganyu] accessories: ${accessoryLayers.map((l) => l.id).join(', ') || 'none'}`);
 }
 
 /**

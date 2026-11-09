@@ -344,6 +344,99 @@ moment either file moves.
 
 ---
 
+## Installing a pet
+
+Someone hands you a pet. You install it with one command:
+
+```
+npm run add-pet -- <pack.zip | pack-folder | codex-pet-id>
+```
+
+It validates the pack, copies it into your **user pets directory**, and prints how to run it:
+
+```
+npm start -- --pet <id>        # this run only
+GANYU_PET=<id>                 # this machine
+```
+
+**Where it goes.** One directory per pet, `<pets dir>/<id>/ganyu-pet.json` plus its sheets:
+
+| Platform | Pets dir |
+|---|---|
+| Windows | `%APPDATA%\ganyu-pet\pets\` |
+| macOS | `~/Library/Application Support/ganyu-pet/pets/` |
+| Linux | `$XDG_CONFIG_HOME/ganyu-pet/pets/` (default `~/.config/ganyu-pet/pets/`) |
+
+`GANYU_PETS_DIR` replaces that directory for both the installer and the app; `--pets-dir <dir>`
+replaces it for one install. Tests always use one of the two — nothing in this repo writes the
+real directory.
+
+**What a pack is.** A folder, or a `.zip` of one, holding either:
+
+1. **A ganyu pet** — `ganyu-pet.json` (exactly the format this page describes) plus every file
+   its `spritesheet` and `accessories[].sheet` name, as relative paths inside the pack; or
+2. **A bare Codex pet** — `pet.json` + `spritesheet.webp` (or `.png`), with no `ganyu-pet.json`.
+   The installer drafts the config with the analyzer from step 1, so the same honesty applies:
+   **the geometry and frame counts are measured; every row label, `modes`, `walk`, `airborne`
+   and `celebrate` are placeholders**, and with no `persona` the pet speaks with the built-in
+   one. The installer lists those fields when it finishes. It installs and runs — every mode
+   points at row 0, so it will stand still through everything until you finish steps 2-4 in
+   the installed `ganyu-pet.json`.
+
+Passing a bare name that is not a file or folder means a Codex pet id: it is read from
+`$CODEX_HOME/pets/<id>/` (default `~/.codex/pets/<id>/`), or `--codex-home <dir>`.
+
+**What it refuses.** Anything `validatePetConfig` refuses, with the validator's own messages; a
+sheet the config names that is not in the pack; an `id` that is not a plain lowercase name
+(it becomes a directory). From a zip, also: entries with `..`, absolute paths or drive letters,
+symlinks, encrypted entries, compression other than stored/deflate, more than 512 entries, or
+more than 64 MB uncompressed. A refused install leaves the pets dir exactly as it was — the
+pack is staged and validated first, and moved into place only when everything passed.
+
+**Replacing a pet.** An existing `<id>` is refused. `--force` replaces it, after renaming the old
+copy to `<id>.bak-<timestamp>` beside it.
+
+**How a name is found.** `--pet <id>` / `GANYU_PET=<id>` looks in the user pets dir, then the
+repo's `pets/<id>.json`, then the built-in pet (by its own id). The **first place that has the
+pet decides**: a broken copy in the user dir stops the app, it does not quietly fall through to
+the repo's copy. A pet asked for by name that cannot be loaded is always a hard exit — running a
+different pet than the one you named would look like the setting was ignored.
+
+---
+
+## Accessories
+
+An accessory is a transparent sheet drawn on top of the pet: a hat, ears, glasses. The starter pet
+ships one — Pip's hat, `pets/starter-hat.png`, drawn by `scripts/make-starter-pet.mjs` like the
+pet itself.
+
+```json
+"accessories": [
+  { "id": "hat", "sheet": "starter-hat.png", "enabled": true }
+]
+```
+
+- **Same grid, exactly.** An accessory sheet has the base sheet's pixel size. Each frame is drawn
+  over the base frame on the same row and frame, so a hat that should follow the pet's bob has
+  to be drawn bobbing — the layer is a second sheet, not a sticker.
+- **Listed order is draw order.** Later entries sit on top of earlier ones.
+- **A wrong-sized sheet is skipped, never fatal.** One log line in the renderer console, and the
+  pet draws without it. So is a sheet that fails to load, or one that is missing on disk (logged
+  by main at boot).
+- **`enabled`** is optional and defaults to `true`.
+
+**Per machine:** `GANYU_ACCESSORIES` overrides `enabled` without editing the config:
+
+```
+GANYU_ACCESSORIES=none          # nothing on
+GANYU_ACCESSORIES=hat           # only the hat
+GANYU_ACCESSORIES=hat,glasses   # these, drawn in the config's order
+```
+
+An id the config does not list is logged and ignored. Unset means "whatever the config says".
+
+---
+
 ## Field reference
 
 | Field | Type | Notes |
@@ -367,6 +460,10 @@ moment either file moves.
 | `presentation.windowWidth` / `windowHeight` | int > 0 | Must be at least the frame size, or the sprite is cropped. Ganyu's 256×320 is a 192×208 frame plus bubble headroom. |
 | `persona` | object | Optional. See step 4. `identity` + `register` + `voiceExamples` + `messages`; there is no field for the system prompt. |
 | `voice` | object | Optional. See step 4b. Omit for a silent pet. |
+| `accessories[]` | array | Optional. See *Accessories*. `[]` or absent is no layers. |
+| `accessories[].id` | string | Lowercase name, unique in the list. What `GANYU_ACCESSORIES` names. |
+| `accessories[].sheet` | string | Absolute, or relative to the config file. Same pixel size as `spritesheet`. |
+| `accessories[].enabled` | boolean | Optional, default `true`. |
 
 Unknown keys are **rejected**, not ignored. A mistyped `"fsp": 6` on a walk row would
 otherwise animate at the default rate forever and look like a problem with the sheet.
