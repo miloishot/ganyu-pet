@@ -1131,3 +1131,17 @@ test('loadCallConfig reads the three keys with the same parse rules as the voice
   const voice = loadVoiceConfig({ envPath: 'x', fs: { readFileSync: () => 'GANYU_CALL_DEVICE=CABLE Input\n' } });
   assert.equal('call' in voice, false);
 });
+
+test('GANYU_CALL_MIX_MIC is strictly opt-in: only an explicit yes opens the mic', () => {
+  const read = (text) => loadCallConfig({ envPath: 'x', fs: { readFileSync: () => text } });
+  // Mix mode opens the microphone, so anything short of a clear yes is off —
+  // including the spellings a looser parser read as "not falsey, so on".
+  const off = ['0 # off', '"0"', 'disabled', 'n', 'y', '2', 'allow', 'enabled', '0', 'false', 'no', 'off', 'never', '', ' '];
+  for (const value of off) {
+    assert.equal(read(`GANYU_CALL_MIX_MIC=${value}\n`).mixMic, false, `${JSON.stringify(value)} is off`);
+  }
+  assert.equal(read('GANYU_CALL_DEVICE=CABLE Input\n').mixMic, false, 'a missing key is off');
+  for (const value of ['1', 'true', 'yes', 'on', 'TRUE', ' Yes ', 'ON']) {
+    assert.equal(read(`GANYU_CALL_MIX_MIC=${value}\n`).mixMic, true, `${JSON.stringify(value)} is on`);
+  }
+});
