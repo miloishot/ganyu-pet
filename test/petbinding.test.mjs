@@ -49,6 +49,12 @@ test("the renderer's built-in geometry is DEFAULT_PET_CONFIG's, field for field"
   for (const [i, row] of animation.rows.entries()) {
     assert.equal(pet.fpsForRow(i), row.fps ?? animation.defaultFps, `fps for row ${i}`);
   }
+
+  // Accessory layers. The built-in pet declares none, so the renderer's mirror
+  // starts bare — and stays a frozen list, since it is a binding, not state.
+  assert.equal(DEFAULT_PET_CONFIG.accessories, undefined, 'the built-in pet declares no accessories');
+  assert.deepEqual(pet.ACCESSORIES, [], 'accessories');
+  assert.ok(Object.isFrozen(pet.ACCESSORIES));
 });
 
 // ---------------------------------------------------------------------------
@@ -266,6 +272,9 @@ test('useSpriteConfig rebinds the renderer to the pet, and ignores nothing grace
   assert.deepEqual({ ...pet.MODE_ROW }, { idle: 0, busy: 3, waiting: 3, failed: 3 });
   assert.deepEqual([...pet.CELEBRATE_PULSE], [], 'a sheet with no celebration pose is allowed');
   assert.equal(pet.AIRBORNE_ROW, 3);
+  // The block above has no `accessories` — what an older main sends — so the
+  // pet stays bare rather than inheriting anything.
+  assert.deepEqual(pet.ACCESSORIES, [], 'an absent accessory list keeps []');
 });
 
 test('after rebinding, the animation helpers answer for the new sheet', () => {
@@ -280,4 +289,43 @@ test('after rebinding, the animation helpers answer for the new sheet', () => {
   assert.equal(pet.baseRowFor({ walk: { dir: 'left' } }), 2);
   assert.equal(pet.baseRowFor({ mode: 'busy' }), 3);
   assert.equal(pet.baseRowFor({ mode: 'nonsense' }), 0, 'unknown modes fall back to the idle row');
+});
+
+test('useSpriteConfig binds the accessory layers main selected, and drops anything malformed', () => {
+  const hat = { id: 'hat', url: 'file:///pets/starter-hat.png' };
+  const scarf = { id: 'scarf', url: 'file:///pets/scarf.png' };
+  assert.equal(pet.useSpriteConfig({
+    accessories: [
+      { ...hat, sheet: 'not carried over' },
+      null,
+      'hat',
+      { id: 'no-url' },
+      { url: 'file:///no-id.png' },
+      { id: 3, url: 'file:///numeric-id.png' },
+      { id: '', url: 'file:///empty-id.png' },
+      { id: 'empty-url', url: '' },
+      scarf,
+    ],
+  }), true);
+
+  assert.deepEqual(pet.ACCESSORIES, [hat, scarf], 'only {id, url} entries, in the order main sent them');
+  assert.ok(Object.isFrozen(pet.ACCESSORIES));
+  assert.ok(pet.ACCESSORIES.every(Object.isFrozen));
+  assert.equal(pet.FRAME_W, 64, 'a block that carries only layers leaves the geometry alone');
+});
+
+test("the bound layers are what boot's unchanged createSpriteRenderer call loads", () => {
+  // boot() calls createSpriteRenderer({canvas, image, dpr}) with no accessories,
+  // so the default has to read the live binding — this is the whole wiring.
+  const requested = [];
+  class RecordingImage {
+    set src(v) { requested.push(v); }
+  }
+  const canvas = { getContext: () => ({ clearRect() {}, drawImage() {} }) };
+  pet.createSpriteRenderer({ canvas, image: {}, ImageCtor: RecordingImage });
+  assert.deepEqual(requested, ['file:///pets/starter-hat.png', 'file:///pets/scarf.png']);
+
+  // And an explicitly empty list from main is a bare pet again.
+  pet.useSpriteConfig({ accessories: [] });
+  assert.deepEqual(pet.ACCESSORIES, []);
 });

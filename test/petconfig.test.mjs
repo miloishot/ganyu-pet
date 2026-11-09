@@ -1,7 +1,8 @@
 // Pet config tests — the schema that makes the app pet-agnostic.
 //
 // `fs` is injected and every path below is invented, so nothing here reads the
-// disk, the real spritesheet or the installed pet directory. The persona half is
+// disk, the real spritesheet or the installed pet directory — with one named
+// exception at the very end, which reads the repo's own `pets/starter.json`. The persona half is
 // exercised with a tiny synthetic character rather than Ganyu's own text —
 // deliberately, because the whole point of the persona rules is that they hold
 // for a pet nobody has written yet. A test that only asserted against Ganyu
@@ -24,6 +25,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import realFs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   DEFAULT_PET_CONFIG,
@@ -36,8 +40,11 @@ import {
   PET_SCHEMA_VERSION,
   VOICE_PROVIDERS,
   WALK_DIRECTIONS,
+  findPetConfig,
   loadPetConfig,
+  resolveAccessoryPaths,
   resolveSheetPath,
+  selectAccessories,
   validatePersonaConfig,
   validatePetConfig,
   validateVoiceConfig,
@@ -809,4 +816,271 @@ test('a voice block carried inside a pet config is validated with it', () => {
   const bad = clone();
   bad.voice = { provider: 'edge' };
   assertRejects(validatePetConfig(bad), 'voice.name: missing');
+});
+
+// ---------------------------------------------------------------------------
+// Accessories — validation
+// ---------------------------------------------------------------------------
+
+/** The defaults with an accessory list, which is the only thing these vary. */
+const withAccessories = (accessories) => ({ ...clone(), accessories });
+
+test('an accessory list validates, with enabled optional', () => {
+  const result = validatePetConfig(withAccessories([
+    { id: 'hat', sheet: 'hat.png', enabled: true },
+    { id: 'scarf_2', sheet: path.resolve('/sheets/scarf.png') },
+    { id: 'glasses-1', sheet: 'glasses.png', enabled: false },
+  ]));
+  assert.deepEqual(result.errors, []);
+  assert.deepEqual(validatePetConfig(withAccessories([])).errors, [], 'an empty list is no layers');
+});
+
+test('the built-in pet declares no accessories', () => {
+  assert.equal(DEFAULT_PET_CONFIG.accessories, undefined);
+});
+
+test('an accessory without an id is rejected', () => {
+  assertRejects(validatePetConfig(withAccessories([{ sheet: 'hat.png' }])), 'accessories[0].id: missing');
+});
+
+test('two accessories cannot share an id, and the message names the first one', () => {
+  const result = validatePetConfig(withAccessories([
+    { id: 'hat', sheet: 'a.png' },
+    { id: 'scarf', sheet: 'b.png' },
+    { id: 'hat', sheet: 'c.png' },
+  ]));
+  assertRejects(result, 'accessories[2].id: "hat" is already used by accessories[0]');
+  assert.equal(result.errors.length, 1, 'and only the duplicate is reported');
+});
+
+test('an accessory id must be a safe lowercase name', () => {
+  // Each of these either breaks the env var's comma split, has a case to get
+  // wrong, or is not a string at all.
+  for (const bad of ['Hat', '-hat', '_hat', 'hat band', 'hat,scarf', 'hat.png', '', 42, null, 'a'.repeat(65)]) {
+    assertRejects(validatePetConfig(withAccessories([{ id: bad, sheet: 'x.png' }])), 'accessories[0].id: expected a lowercase name');
+  }
+  assert.equal(validatePetConfig(withAccessories([{ id: 'a'.repeat(64), sheet: 'x.png' }])).ok, true, '64 is the limit, inclusive');
+  assert.equal(validatePetConfig(withAccessories([{ id: '0', sheet: 'x.png' }])).ok, true, 'a digit may lead');
+});
+
+test('an accessory sheet must be a non-empty string', () => {
+  assertRejects(validatePetConfig(withAccessories([{ id: 'hat' }])), 'accessories[0].sheet: missing');
+  for (const bad of ['', '   ', 5, null, ['hat.png']]) {
+    assertRejects(validatePetConfig(withAccessories([{ id: 'hat', sheet: bad }])), 'accessories[0].sheet: expected a non-empty string');
+  }
+});
+
+test('enabled must be a real boolean — the string "false" would switch the layer on', () => {
+  for (const bad of ['false', 'true', 0, 1, null]) {
+    assertRejects(validatePetConfig(withAccessories([{ id: 'hat', sheet: 'x.png', enabled: bad }])), 'accessories[0].enabled: expected true or false');
+  }
+});
+
+test('a mistyped accessory key is reported rather than ignored', () => {
+  assertRejects(
+    validatePetConfig(withAccessories([{ id: 'hat', sheet: 'x.png', enable: false }])),
+    'accessories[0]: unknown key "enable"',
+  );
+});
+
+test('accessories must be an array of objects', () => {
+  for (const bad of ['hat.png', { id: 'hat', sheet: 'x.png' }, null, 3]) {
+    assertRejects(validatePetConfig(withAccessories(bad)), 'accessories: expected an array');
+  }
+  assertRejects(validatePetConfig(withAccessories(['hat.png'])), 'accessories[0]: expected an object');
+  assertRejects(validatePetConfig(withAccessories([{ id: 'hat', sheet: 'x.png' }, null])), 'accessories[1]: expected an object');
+});
+
+// ---------------------------------------------------------------------------
+// Accessories — paths and selection
+// ---------------------------------------------------------------------------
+
+test('accessory sheets resolve by the same rule as the spritesheet', () => {
+  const abs = path.resolve('/elsewhere/scarf.png');
+  const config = {
+    spritesheet: 'sheet.png',
+    accessories: [
+      { id: 'hat', sheet: 'hat.png' },
+      { id: 'scarf', sheet: abs, enabled: false },
+    ],
+  };
+  const got = resolveAccessoryPaths(config, CONFIG_PATH);
+  assert.deepEqual(got, [
+    { id: 'hat', sheet: 'hat.png', enabled: true, path: path.join(path.dirname(CONFIG_PATH), 'hat.png') },
+    { id: 'scarf', sheet: abs, enabled: false, path: abs },
+  ]);
+  assert.equal(
+    path.dirname(got[0].path),
+    path.dirname(resolveSheetPath(config, CONFIG_PATH)),
+    'a relative layer lands beside the relative pet',
+  );
+});
+
+test('resolveAccessoryPaths is empty for a pet with none, and null-pathed without a config path', () => {
+  assert.deepEqual(resolveAccessoryPaths(DEFAULT_PET_CONFIG, CONFIG_PATH), []);
+  assert.deepEqual(resolveAccessoryPaths({ accessories: [] }, CONFIG_PATH), []);
+  assert.deepEqual(resolveAccessoryPaths(null, CONFIG_PATH), []);
+  const [hat] = resolveAccessoryPaths({ accessories: [{ id: 'hat', sheet: 'hat.png' }] }, null);
+  assert.equal(hat.path, null, 'exactly where resolveSheetPath would give up');
+});
+
+/**
+ * Three layers, so a test can tell an override from a filter: one on by
+ * default, one off, one explicitly on. The env lists below name them in the
+ * reverse of this order, so a result in this order is config order and not
+ * the env's.
+ */
+const DRESSED = {
+  accessories: [
+    { id: 'hat', sheet: 'hat.png' },
+    { id: 'scarf', sheet: 'scarf.png', enabled: false },
+    { id: 'glasses', sheet: 'glasses.png', enabled: true },
+  ],
+};
+
+test("unset or blank GANYU_ACCESSORIES means the config's own enabled flags", () => {
+  for (const env of [undefined, null, '', '   ']) {
+    assert.deepEqual(selectAccessories(DRESSED, env), { selected: ['hat', 'glasses'], warnings: [] }, `env ${JSON.stringify(env)}`);
+  }
+});
+
+test('GANYU_ACCESSORIES=none switches every layer off', () => {
+  assert.deepEqual(selectAccessories(DRESSED, 'none'), { selected: [], warnings: [] });
+  assert.deepEqual(selectAccessories(DRESSED, '  none \n'), { selected: [], warnings: [] }, 'trimmed');
+});
+
+test('a list picks exactly those layers, in config order, overriding enabled', () => {
+  // scarf is enabled:false and still comes on, because he named it; hat is
+  // enabled by default and stays off, because he did not.
+  assert.deepEqual(selectAccessories(DRESSED, 'glasses,scarf').selected, ['scarf', 'glasses']);
+  assert.deepEqual(selectAccessories(DRESSED, ' glasses , hat ').selected, ['hat', 'glasses'], 'segments are trimmed');
+  assert.deepEqual(selectAccessories(DRESSED, 'hat,,').selected, ['hat'], 'empty segments are ignored');
+  assert.deepEqual(selectAccessories(DRESSED, 'hat,,').warnings, []);
+});
+
+test('an id the pet does not have is one warning each, and is otherwise ignored', () => {
+  const result = selectAccessories(DRESSED, 'crown,hat,HAT,crown');
+  assert.deepEqual(result.selected, ['hat']);
+  assert.equal(result.warnings.length, 2, result.warnings.join('\n'));
+  assert.ok(result.warnings[0].includes('"crown"'));
+  assert.ok(result.warnings[1].includes('"HAT"'), 'ids are case-sensitive');
+  assert.ok(result.warnings[0].includes('hat, scarf, glasses'), 'and the warning says what there is');
+});
+
+test('selecting on a pet with no accessories is empty, and warns only when asked for one', () => {
+  assert.deepEqual(selectAccessories(DEFAULT_PET_CONFIG, undefined), { selected: [], warnings: [] });
+  const asked = selectAccessories(DEFAULT_PET_CONFIG, 'hat');
+  assert.deepEqual(asked.selected, []);
+  assert.equal(asked.warnings.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// findPetConfig — which file a name means
+// ---------------------------------------------------------------------------
+
+const USER_DIR = path.resolve('/fake/user-pets');
+const REPO_DIR = path.resolve('/fake/repo/pets');
+const userFile = (name) => path.join(USER_DIR, name, 'ganyu-pet.json');
+const repoFile = (name) => path.join(REPO_DIR, `${name}.json`);
+
+/** `existsSync` over a fixed set of paths, recording every path it was asked about. */
+function existsFs(present = []) {
+  const asked = [];
+  return {
+    asked,
+    existsSync(p) {
+      asked.push(p);
+      return present.includes(p);
+    },
+  };
+}
+
+test('a user-installed pet beats the repo copy of the same name', () => {
+  const fs = existsFs([userFile('pip'), repoFile('pip')]);
+  assert.deepEqual(
+    findPetConfig({ fs, name: 'pip', userPetsDir: USER_DIR, repoPetsDir: REPO_DIR }),
+    { ok: true, source: 'user', filePath: userFile('pip'), errors: [] },
+  );
+});
+
+test('with no user copy the repo pet is found', () => {
+  const fs = existsFs([repoFile('pip')]);
+  assert.deepEqual(
+    findPetConfig({ fs, name: 'pip', userPetsDir: USER_DIR, repoPetsDir: REPO_DIR }),
+    { ok: true, source: 'repo', filePath: repoFile('pip'), errors: [] },
+  );
+  assert.deepEqual(fs.asked, [userFile('pip'), repoFile('pip')], 'user dir first, then the repo');
+});
+
+test('the built-in pet is found last, and only by its own id', () => {
+  const id = DEFAULT_PET_CONFIG.id;
+  assert.deepEqual(
+    findPetConfig({ fs: existsFs(), name: id, userPetsDir: USER_DIR, repoPetsDir: REPO_DIR }),
+    { ok: true, source: 'builtin', filePath: null, errors: [] },
+  );
+  // A user copy under the built-in's id is still a user copy — first place wins.
+  const fs = existsFs([userFile(id)]);
+  assert.equal(findPetConfig({ fs, name: id, userPetsDir: USER_DIR, repoPetsDir: REPO_DIR }).source, 'user');
+});
+
+test('no user pets dir skips that place rather than failing', () => {
+  const fs = existsFs([repoFile('pip')]);
+  const found = findPetConfig({ fs, name: 'pip', userPetsDir: null, repoPetsDir: REPO_DIR });
+  assert.equal(found.source, 'repo');
+  assert.deepEqual(fs.asked, [repoFile('pip')]);
+});
+
+test('a name found nowhere is not ok, and the error lists every place looked', () => {
+  const result = findPetConfig({ fs: existsFs(), name: 'nobody', userPetsDir: USER_DIR, repoPetsDir: REPO_DIR });
+  assert.equal(result.ok, false);
+  assert.equal(result.source, null);
+  assert.equal(result.filePath, null);
+  const msg = joined(result);
+  assert.ok(msg.includes(userFile('nobody')), msg);
+  assert.ok(msg.includes(repoFile('nobody')), msg);
+  assert.ok(msg.includes(DEFAULT_PET_CONFIG.id), 'and that the built-in was considered');
+});
+
+test('a name that is not one safe path segment is refused before anything is looked up', () => {
+  for (const bad of ['../evil', 'a/b', 'a\\b', '..', 'a..b', '.staging-1', 'Pip', ' pip', '', 'c:', 'x'.repeat(65), null, 42]) {
+    const fs = existsFs([userFile('evil')]);
+    const result = findPetConfig({ fs, name: bad, userPetsDir: USER_DIR, repoPetsDir: REPO_DIR });
+    assert.equal(result.ok, false, `${JSON.stringify(bad)} should be refused`);
+    assert.ok(joined(result).includes('not a safe name'), joined(result));
+    assert.deepEqual(fs.asked, [], `${JSON.stringify(bad)} reached the disk`);
+  }
+  // Dots are fine inside a name — Codex pet ids carry them.
+  const fs = existsFs([repoFile('pip.v2')]);
+  assert.equal(findPetConfig({ fs, name: 'pip.v2', userPetsDir: USER_DIR, repoPetsDir: REPO_DIR }).ok, true);
+});
+
+test('findPetConfig never throws, whatever fs does', () => {
+  const hostile = { existsSync() { throw new Error('the disk caught fire'); } };
+  const result = findPetConfig({ fs: hostile, name: 'pip', userPetsDir: USER_DIR, repoPetsDir: REPO_DIR });
+  assert.equal(result.ok, false);
+  assert.equal(findPetConfig({ name: 'pip', repoPetsDir: REPO_DIR }).ok, false, 'no fs at all');
+  assert.equal(findPetConfig().ok, false);
+});
+
+// ---------------------------------------------------------------------------
+// The repo's own starter pet — the one test here that reads the disk, and only
+// the repo's files.
+// ---------------------------------------------------------------------------
+
+const REPO_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+test("pets/starter.json validates, and its hat sheet is really there", () => {
+  const petsDir = path.join(REPO_ROOT, 'pets');
+  const found = findPetConfig({ fs: realFs, name: 'starter', userPetsDir: null, repoPetsDir: petsDir });
+  assert.equal(found.source, 'repo');
+
+  const result = loadPetConfig({ fs: realFs, filePath: found.filePath });
+  assert.deepEqual(result.errors, []);
+
+  const layers = resolveAccessoryPaths(result.config, found.filePath);
+  assert.deepEqual(layers.map(({ id, enabled }) => ({ id, enabled })), [{ id: 'hat', enabled: true }]);
+  assert.equal(layers[0].path, path.join(petsDir, 'starter-hat.png'));
+  assert.ok(realFs.existsSync(layers[0].path), 'the hat sheet exists — run scripts/make-starter-pet.mjs');
+  assert.ok(realFs.existsSync(resolveSheetPath(result.config, found.filePath)), 'and so does the pet under it');
+  assert.deepEqual(selectAccessories(result.config, undefined).selected, ['hat']);
 });

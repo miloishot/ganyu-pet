@@ -82,6 +82,7 @@ const TOP_KEYS = Object.freeze([
   'presentation',
   'persona',
   'voice',
+  'accessories',
 ]);
 const GEOMETRY_KEYS = Object.freeze(['frameW', 'frameH', 'columns', 'rows']);
 const ANIMATION_KEYS = Object.freeze([
@@ -103,6 +104,19 @@ const PERSONA_KEYS = Object.freeze([
   'messages',
 ]);
 const VOICE_KEYS = Object.freeze(['provider', 'name', 'rate', 'pitch']);
+const ACCESSORY_KEYS = Object.freeze(['id', 'sheet', 'enabled']);
+
+// An accessory id is what `GANYU_ACCESSORIES` names, typed by hand into an env
+// var and split on commas, so it is kept to the characters that survive that
+// trip: no spaces, no commas, no case to get wrong.
+const ACCESSORY_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+const MAX_NAME_CHARS = 64;
+
+// A pet name becomes a directory under the user pets dir, so it has to be one
+// safe path segment. Dots are allowed (Codex pet ids may carry them) but never
+// first — which also keeps `.staging-*` and `..` from ever being a pet — and
+// `..` is refused anywhere, because the pattern alone would admit `a..b`.
+const PET_NAME_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 
 // ---------------------------------------------------------------------------
 // Small predicates. Deliberately boring — every validation message below is
@@ -113,6 +127,17 @@ const VOICE_KEYS = Object.freeze(['provider', 'name', 'rate', 'pitch']);
 const isPlainObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isPosInt = (v) => Number.isInteger(v) && v > 0;
 const isNonEmptyString = (v) => typeof v === 'string' && v.trim() !== '';
+const isSafeName = (v, pattern) =>
+  typeof v === 'string' && v.length <= MAX_NAME_CHARS && pattern.test(v);
+
+/**
+ * True when `name` is safe to become `<pets dir>/<name>`. The one copy of the
+ * rule: `findPetConfig` applies it to a name on the command line and
+ * `petpack.mjs` to a pack's id before installing it.
+ */
+export function isSafePetName(name) {
+  return isSafeName(name, PET_NAME_PATTERN) && !name.includes('..');
+}
 
 /** How a bad value is quoted back to the author. Never dumps a whole object. */
 function describe(value) {
@@ -732,7 +757,62 @@ export function validatePetConfig(obj) {
     errors.push(...result.errors);
   }
 
+  // ---- accessories ---------------------------------------------------------
+  // Optional too: absent and `[]` both mean a pet with nothing drawn on top.
+  if (obj.accessories !== undefined) checkAccessories(obj.accessories, errors);
+
   return { ok: errors.length === 0, errors };
+}
+
+/**
+ * The `accessories` list. Pushes one message per problem, like everything above.
+ *
+ * Only the shape is checked here. Whether the sheet exists is main's question
+ * (a missing file is dropped at boot with a log line, not refused, so one lost
+ * hat cannot cost him the pet), and whether it is the right pixel size is the
+ * renderer's, because that is the first place the image is actually decoded.
+ */
+function checkAccessories(list, errors) {
+  if (!Array.isArray(list)) {
+    errors.push(`accessories: expected an array of {id, sheet} entries, got ${describe(list)}`);
+    return;
+  }
+  const seen = new Map(); // id -> index of its first use
+  list.forEach((entry, i) => {
+    const at = `accessories[${i}]`;
+    if (!isPlainObject(entry)) {
+      errors.push(`${at}: expected an object, got ${describe(entry)}`);
+      return;
+    }
+    checkUnknownKeys(entry, ACCESSORY_KEYS, at, errors);
+
+    if (entry.id === undefined) {
+      errors.push(`${at}.id: missing (required) — the name GANYU_ACCESSORIES uses to pick this layer`);
+    } else if (!isSafeName(entry.id, ACCESSORY_ID_PATTERN)) {
+      errors.push(
+        `${at}.id: expected a lowercase name (a-z, 0-9, "-" and "_", starting with a letter or digit, at most ${MAX_NAME_CHARS} characters), got ${describe(entry.id)}`,
+      );
+    } else if (seen.has(entry.id)) {
+      // Two layers under one name cannot be told apart from the env var, so
+      // "hat" would switch on whichever happened to be listed first.
+      errors.push(
+        `${at}.id: "${entry.id}" is already used by accessories[${seen.get(entry.id)}] — GANYU_ACCESSORIES picks layers by id, so each must be unique`,
+      );
+    } else {
+      seen.set(entry.id, i);
+    }
+
+    if (entry.sheet === undefined) {
+      errors.push(`${at}.sheet: missing (required) — a transparent sheet the same pixel size as spritesheet`);
+    } else if (!isNonEmptyString(entry.sheet)) {
+      errors.push(`${at}.sheet: expected a non-empty string, got ${describe(entry.sheet)}`);
+    }
+
+    // A string "false" is truthy, so accepting it would switch the layer *on*.
+    if (entry.enabled !== undefined && typeof entry.enabled !== 'boolean') {
+      errors.push(`${at}.enabled: expected true or false, got ${describe(entry.enabled)}`);
+    }
+  });
 }
 
 /**
@@ -783,11 +863,133 @@ export function loadPetConfig({ fs, filePath } = {}) {
  * `resolveSpritePath` in `window.mjs`, which reads it exactly that way.
  */
 export function resolveSheetPath(config, configPath) {
-  const declared = config && config.spritesheet;
+  return resolveBesideConfig(config && config.spritesheet, configPath);
+}
+
+/**
+ * The one path rule, shared by the spritesheet and every accessory sheet: an
+ * accessory that resolved differently from the pet it sits on would be found in
+ * one checkout layout and lost in the next.
+ */
+function resolveBesideConfig(declared, configPath) {
   if (!isNonEmptyString(declared)) return null;
   if (path.isAbsolute(declared)) return declared;
   if (!isNonEmptyString(configPath)) return null;
   return path.join(path.dirname(configPath), declared);
+}
+
+/**
+ * Every declared accessory with its sheet resolved, in config order:
+ * `[{id, sheet, enabled, path}]`. `enabled` is filled in (default `true`) so no
+ * caller has to remember the default; `path` is null exactly when
+ * `resolveSheetPath` would be. A config with no `accessories` is `[]`.
+ */
+export function resolveAccessoryPaths(config, configPath) {
+  const list = config && config.accessories;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((entry) => isPlainObject(entry) && isNonEmptyString(entry.id))
+    .map((entry) => ({
+      id: entry.id,
+      sheet: entry.sheet,
+      enabled: entry.enabled !== false,
+      path: resolveBesideConfig(entry.sheet, configPath),
+    }));
+}
+
+/**
+ * Which accessories to draw on this machine: `{selected, warnings}`, `selected`
+ * being ids in **config order** — the list order is the draw order, and letting
+ * the env var reorder it would put the hat under the scarf on one machine and
+ * over it on the next.
+ *
+ * `GANYU_ACCESSORIES` (passed in as `envValue`, trimmed):
+ *   - unset, or empty / whitespace -> the config's own `enabled` flags;
+ *   - exactly `none`               -> nothing at all;
+ *   - `a,b`                        -> exactly those, whatever `enabled` says.
+ *     Empty segments (`a,,b`, a trailing comma) are ignored. Ids are
+ *     case-sensitive, like the config's. An id this pet does not have is one
+ *     warning and is otherwise ignored — it is far more likely a typo than a
+ *     reason to refuse to start, and the pet is still recognisably the pet.
+ *
+ * `none` counts only as the whole value; inside a list it is just an unknown id.
+ */
+export function selectAccessories(config, envValue) {
+  const declared = resolveAccessoryPaths(config, null);
+  const raw = typeof envValue === 'string' ? envValue.trim() : '';
+
+  if (raw === '') {
+    return { selected: declared.filter((a) => a.enabled).map((a) => a.id), warnings: [] };
+  }
+  if (raw === 'none') return { selected: [], warnings: [] };
+
+  const wanted = new Set(raw.split(',').map((s) => s.trim()).filter((s) => s !== ''));
+  const known = declared.map((a) => a.id);
+  const warnings = [];
+  for (const id of wanted) {
+    if (!known.includes(id)) {
+      const has = known.length > 0 ? `it has: ${known.join(', ')}` : 'it has none';
+      warnings.push(`GANYU_ACCESSORIES names "${id}", which this pet does not have (${has}) — ignored`);
+    }
+  }
+  return { selected: known.filter((id) => wanted.has(id)), warnings };
+}
+
+/**
+ * Where a pet asked for by name lives: `{ok, source, filePath, errors}`, with
+ * `source` one of `'user' | 'repo' | 'builtin'` (null when not ok). It finds; it
+ * does not load — `loadPetConfig` does that, and a find that also validated
+ * would be the second loader this file exists to prevent.
+ *
+ * Looked up in order, and **the first place that has the file decides**:
+ *   1. `<userPetsDir>/<name>/ganyu-pet.json` — what `add-pet` installs;
+ *   2. `<repoPetsDir>/<name>.json`            — the pets that ship with the repo;
+ *   3. the built-in pet, only when `name` is its own id (`filePath` null).
+ * A user copy therefore beats the repo's even when it turns out to be broken.
+ * That is deliberate: falling through to a different file than the one he
+ * installed would run a pet he did not ask for and look like the install
+ * was ignored.
+ *
+ * `fs` is injected and only `existsSync` is used. `userPetsDir` may be null (no
+ * user dir on this machine, or a caller that does not want one).
+ */
+export function findPetConfig({ fs, name, userPetsDir = null, repoPetsDir = null } = {}) {
+  const fail = (msg) => ({ ok: false, source: null, filePath: null, errors: [msg] });
+
+  // Before any lookup: the name becomes a path segment, and one that is not
+  // safe must not reach `path.join` at all.
+  if (!isSafePetName(name)) {
+    return fail(
+      `pet name ${describe(name)} is not a safe name — lowercase letters, digits, ".", "-" and "_", starting with a letter or digit, no "..", at most ${MAX_NAME_CHARS} characters`,
+    );
+  }
+  if (!fs || typeof fs.existsSync !== 'function') {
+    return fail('findPetConfig: an fs with existsSync must be injected');
+  }
+  const exists = (p) => {
+    try {
+      return Boolean(fs.existsSync(p));
+    } catch {
+      return false; // a lookup that cannot be made is a place that does not have it
+    }
+  };
+
+  const places = [];
+  if (isNonEmptyString(userPetsDir)) {
+    places.push(['user', path.join(userPetsDir, name, 'ganyu-pet.json')]);
+  }
+  if (isNonEmptyString(repoPetsDir)) {
+    places.push(['repo', path.join(repoPetsDir, `${name}.json`)]);
+  }
+  for (const [source, filePath] of places) {
+    if (exists(filePath)) return { ok: true, source, filePath, errors: [] };
+  }
+  if (name === DEFAULT_PET_CONFIG.id) {
+    return { ok: true, source: 'builtin', filePath: null, errors: [] };
+  }
+
+  const looked = [...places.map(([, p]) => p), `the built-in pet (id "${DEFAULT_PET_CONFIG.id}")`];
+  return fail(`pet "${name}" was not found — looked in: ${looked.join('; ')}`);
 }
 
 // ---------------------------------------------------------------------------

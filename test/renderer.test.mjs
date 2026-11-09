@@ -584,6 +584,167 @@ test('sprite renderer scales the backing store for DPR', () => {
 });
 
 // ---------------------------------------------------------------------------
+// accessory layers
+// ---------------------------------------------------------------------------
+
+/** The pet's own sheet, at the size every layer has to match. */
+const SHEET = Object.freeze({ naturalWidth: SHEET_W, naturalHeight: SHEET_H });
+
+/**
+ * An Image whose load the test finishes by hand, at a natural size the test
+ * picks (`[w, h]`) or as a failure (`'error'`) — so layers can arrive in any
+ * order, at any size, or never.
+ */
+function makeLayerLoader(outcomes) {
+  const made = [];
+  class LayerImage {
+    constructor() {
+      this.onload = null;
+      this.onerror = null;
+      this.src = '';
+      made.push(this);
+    }
+  }
+  return {
+    LayerImage,
+    made,
+    imageFor: (url) => made.find((img) => img.src === url),
+    async finish(url) {
+      const img = made.find((i) => i.src === url);
+      const outcome = outcomes[url];
+      if (outcome === 'error') {
+        img.onerror();
+      } else {
+        [img.naturalWidth, img.naturalHeight] = outcome;
+        img.onload();
+      }
+      await flush(); // the renderer hears about it a promise tick later
+    },
+  };
+}
+
+const drawCalls = (canvas) => canvas.ctx.calls.filter((c) => c[0] === 'drawImage');
+
+test('layers draw over the pet in list order, whatever order they loaded in', async () => {
+  const canvas = makeCanvas();
+  const loader = makeLayerLoader({ 'file:///hat.png': [SHEET_W, SHEET_H], 'file:///scarf.png': [SHEET_W, SHEET_H] });
+  const warns = [];
+  const r = createSpriteRenderer({
+    canvas,
+    image: SHEET,
+    dpr: 1,
+    accessories: [{ id: 'hat', url: 'file:///hat.png' }, { id: 'scarf', url: 'file:///scarf.png' }],
+    ImageCtor: loader.LayerImage,
+    warn: (m) => warns.push(m),
+  });
+  assert.equal(loader.made.length, 2, 'every layer is requested up front');
+
+  await loader.finish('file:///scarf.png'); // the second layer lands first
+  await loader.finish('file:///hat.png');
+  assert.deepEqual([...r.activeAccessories], ['hat', 'scarf']);
+
+  assert.equal(r.draw(ROW.FAILED, 3), true);
+  const calls = drawCalls(canvas);
+  assert.deepEqual(
+    calls.map((c) => c[1]),
+    [SHEET, loader.imageFor('file:///hat.png'), loader.imageFor('file:///scarf.png')],
+    'pet first, then the list order — not the load order',
+  );
+  for (const call of calls) {
+    assert.deepEqual(call.slice(2), [3 * 192, 5 * 208, 192, 208, 0, 0, 192, 208], 'the same cell and the same place, every layer');
+  }
+  assert.deepEqual(warns, []);
+});
+
+test('a layer of the wrong size is skipped with one warning, and the rest still draw', async () => {
+  const canvas = makeCanvas();
+  const loader = makeLayerLoader({
+    'file:///big-hat.png': [SHEET_W, SHEET_H * 2], // right width, wrong height
+    'file:///scarf.png': [SHEET_W, SHEET_H],
+  });
+  const warns = [];
+  const r = createSpriteRenderer({
+    canvas,
+    image: SHEET,
+    accessories: [{ id: 'big-hat', url: 'file:///big-hat.png' }, { id: 'scarf', url: 'file:///scarf.png' }],
+    ImageCtor: loader.LayerImage,
+    warn: (m) => warns.push(m),
+  });
+  await loader.finish('file:///big-hat.png');
+  await loader.finish('file:///scarf.png');
+
+  assert.equal(warns.length, 1, warns.join('\n'));
+  assert.ok(warns[0].includes('"big-hat"'), warns[0]);
+  assert.ok(warns[0].includes(`${SHEET_W}x${SHEET_H * 2}`), 'names the layer size');
+  assert.ok(warns[0].includes(`${SHEET_W}x${SHEET_H}`), "and the pet's");
+
+  r.draw(ROW.IDLE, 0);
+  r.draw(ROW.IDLE, 1);
+  assert.deepEqual(drawCalls(canvas).map((c) => c[1]), [SHEET, loader.imageFor('file:///scarf.png'), SHEET, loader.imageFor('file:///scarf.png')]);
+  assert.deepEqual([...r.activeAccessories], ['scarf']);
+  assert.equal(warns.length, 1, 'one warning, not one per frame');
+});
+
+test('a layer that fails to load is skipped with one warning, and the pet still draws', async () => {
+  const canvas = makeCanvas();
+  const loader = makeLayerLoader({ 'file:///hat.png': 'error' });
+  const warns = [];
+  const r = createSpriteRenderer({
+    canvas,
+    image: SHEET,
+    accessories: [{ id: 'hat', url: 'file:///hat.png' }],
+    ImageCtor: loader.LayerImage,
+    warn: (m) => warns.push(m),
+  });
+  await loader.finish('file:///hat.png');
+  assert.equal(warns.length, 1);
+  assert.ok(warns[0].includes('"hat"'), warns[0]);
+
+  r.draw(ROW.IDLE, 0);
+  r.draw(ROW.IDLE, 1);
+  assert.deepEqual(drawCalls(canvas).map((c) => c[1]), [SHEET, SHEET]);
+  assert.deepEqual([...r.activeAccessories], []);
+});
+
+test('with no layers there is exactly one drawImage per draw, as before', () => {
+  const loader = makeLayerLoader({});
+  for (const opts of [
+    {}, // the default: ACCESSORIES, which is empty for the built-in pet
+    { accessories: [], ImageCtor: loader.LayerImage },
+    // Layers with nothing to load them (node has no global Image): never drawn.
+    { accessories: [{ id: 'hat', url: 'file:///hat.png' }], ImageCtor: undefined },
+  ]) {
+    const canvas = makeCanvas();
+    const r = createSpriteRenderer({ canvas, image: SHEET, ...opts });
+    r.draw(ROW.IDLE, 0);
+    r.draw(ROW.IDLE, 1);
+    r.draw(ROW.IDLE, 1); // deduped
+    assert.equal(drawCalls(canvas).length, 2);
+  }
+  assert.equal(loader.made.length, 0, 'and no image is requested when there is nothing to request');
+});
+
+test('a layer that loads after the first draw repaints on the next draw of the same frame', async () => {
+  const canvas = makeCanvas();
+  const loader = makeLayerLoader({ 'file:///hat.png': [SHEET_W, SHEET_H] });
+  const r = createSpriteRenderer({
+    canvas,
+    image: SHEET,
+    accessories: [{ id: 'hat', url: 'file:///hat.png' }],
+    ImageCtor: loader.LayerImage,
+    warn: () => assert.fail('no warning expected'),
+  });
+
+  assert.equal(r.draw(ROW.IDLE, 0), true, 'the pet does not wait for its hat');
+  assert.equal(r.draw(ROW.IDLE, 0), false, 'deduped as usual');
+  assert.equal(drawCalls(canvas).length, 1);
+
+  await loader.finish('file:///hat.png');
+  assert.equal(r.draw(ROW.IDLE, 0), true, 'same row, same frame, and it still repaints');
+  assert.deepEqual(drawCalls(canvas).slice(1).map((c) => c[1]), [SHEET, loader.imageFor('file:///hat.png')]);
+});
+
+// ---------------------------------------------------------------------------
 // interactivity + menu geometry
 // ---------------------------------------------------------------------------
 
