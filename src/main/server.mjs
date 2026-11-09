@@ -436,7 +436,7 @@ async function main(argv = process.argv.slice(2), env = process.env) {
   }
   // Machine-parsable first, human second.
   console.log(`GANYU_SERVER_LISTENING ${JSON.stringify({ ...info, standalone })}`);
-  console.log(`ganyu-pet server listening on ${info.url} (POST /event/codex|claude)`);
+  console.log(`ganyu-pet server listening on ${info.url} (POST /event/codex|claude|opencode)`);
   hooks.state.onChange((snapshot) => {
     console.log(`ganyu-pet state: mode=${snapshot.mode} sessions=${snapshot.sessionCount} celebrate=${snapshot.celebrate}`);
   });
