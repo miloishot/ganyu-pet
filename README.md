@@ -60,6 +60,19 @@ That measures the sheet and writes a draft config with correct geometry and plac
 semantics. You finish it by looking at the image. The five steps, the field reference, and three
 traps that will otherwise cost you an evening are in **[`docs/pet-config.md`](docs/pet-config.md)**.
 
+**Installing a pet someone gave you** is one command — a zip, a folder, or a Codex pet id:
+
+```bash
+npm run add-pet -- my-pet.zip
+npm start -- --pet my-pet
+```
+
+It validates the pack, refuses anything broken without writing a file, and installs into your user
+pets directory (`%APPDATA%\ganyu-pet\pets\` on Windows). Pets can also carry **accessories** — a
+hat or glasses drawn over every frame; try `npm start -- --pet starter` for Pip's. See
+[Installing a pet](docs/pet-config.md#installing-a-pet) and
+[Accessories](docs/pet-config.md#accessories).
+
 ### Setup
 
 Requires **Node 22+** and Windows 11.

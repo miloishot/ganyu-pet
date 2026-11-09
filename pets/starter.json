@@ -19,6 +19,7 @@
     "celebrate": []
   },
   "presentation": { "windowWidth": 128, "windowHeight": 200 },
+  "accessories": [{ "id": "hat", "sheet": "starter-hat.png", "enabled": true }],
   "persona": {
     "characterName": "Pip",
     "ownerName": "you",

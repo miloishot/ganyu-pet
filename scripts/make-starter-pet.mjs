@@ -1,5 +1,6 @@
 // Draw the starter pet's spritesheet, so `npm start` shows something on a
-// machine that has no pet installed.
+// machine that has no pet installed — and its hat, so the accessory layer has a
+// real sheet to draw and a stranger has an example to copy.
 //
 // **Why this exists at all.** The app deliberately ships no character art — the
 // sheet is looked up in `~/.codex/pets/<id>/`, never committed — which is right
@@ -18,7 +19,10 @@ import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const OUT = path.join(HERE, '..', 'assets', 'starter-pet.png');
+const ROOT = path.join(HERE, '..');
+const OUT = path.join(ROOT, 'assets', 'starter-pet.png');
+// Beside pets/starter.json, which names it relative to itself.
+const OUT_HAT = path.join(ROOT, 'pets', 'starter-hat.png');
 
 // Matches pets/starter.json. A 4x4 grid of 64px cells: sleep, walk-right,
 // walk-left, stare — the four things the app actually asks a sheet for.
@@ -37,37 +41,60 @@ const BODY_DARK = [96, 132, 162];
 const EYE = [28, 38, 48];
 const BLUSH = [214, 142, 138];
 
-const px = new Uint8Array(W * H * 4); // RGBA, transparent by default
+// The hat is warm where Pip is cool, so it reads as a thing he is wearing
+// rather than as more of him.
+const HAT = [186, 78, 70];
+const HAT_LIGHT = [214, 112, 100];
+const HAT_BRIM = [150, 60, 54];
+const HAT_BAND = [240, 210, 130];
 
-function set(x, y, [r, g, b], a = 255) {
+const px = new Uint8Array(W * H * 4); // RGBA, transparent by default
+// The hat's own sheet: the same grid at the same size, because the renderer
+// crops a layer with the pet's rect and skips one of any other size.
+const hat = new Uint8Array(W * H * 4);
+
+function set(x, y, [r, g, b], a = 255, buf = px) {
   if (x < 0 || y < 0 || x >= W || y >= H) return;
   const i = (y * W + x) * 4;
   // Straight "over" compositing. Only used for the blush, which is the one
   // thing drawn on top of anything.
   if (a === 255) {
-    px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = 255;
+    buf[i] = r; buf[i + 1] = g; buf[i + 2] = b; buf[i + 3] = 255;
     return;
   }
   const src = a / 255;
-  const dst = px[i + 3] / 255;
+  const dst = buf[i + 3] / 255;
   const out = src + dst * (1 - src);
   if (out === 0) return;
-  px[i] = Math.round((r * src + px[i] * dst * (1 - src)) / out);
-  px[i + 1] = Math.round((g * src + px[i + 1] * dst * (1 - src)) / out);
-  px[i + 2] = Math.round((b * src + px[i + 2] * dst * (1 - src)) / out);
-  px[i + 3] = Math.round(out * 255);
+  buf[i] = Math.round((r * src + buf[i] * dst * (1 - src)) / out);
+  buf[i + 1] = Math.round((g * src + buf[i + 1] * dst * (1 - src)) / out);
+  buf[i + 2] = Math.round((b * src + buf[i + 2] * dst * (1 - src)) / out);
+  buf[i + 3] = Math.round(out * 255);
 }
 
 /** A filled circle, because every shape in this pet is one. */
-function disc(cx, cy, r, colour, alpha = 255) {
+function disc(cx, cy, r, colour, alpha = 255, buf = px) {
   const r2 = r * r;
   for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y += 1) {
     for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x += 1) {
       const dx = x - cx;
       const dy = y - cy;
-      if (dx * dx + dy * dy <= r2) set(x, y, colour, alpha);
+      if (dx * dx + dy * dy <= r2) set(x, y, colour, alpha, buf);
     }
   }
+}
+
+/**
+ * Where the body is for one pose: its centre and its two radii. The one place
+ * that is worked out, so the hat sits on the head `drawPet` actually drew.
+ */
+function bodyAt(ox, oy, { bob = 0, lean = 0, squash = 0 } = {}) {
+  return {
+    cx: ox + CELL / 2 + lean,
+    cy: oy + CELL / 2 + 4 - bob,
+    rx: 17 + squash,
+    ry: 17 - squash,
+  };
 }
 
 /**
@@ -75,10 +102,7 @@ function disc(cx, cy, r, colour, alpha = 255) {
  * flattens it — three numbers are enough for a creature that is a blob.
  */
 function drawPet(ox, oy, { bob = 0, lean = 0, squash = 0, eyes = 'open', feet = 0 } = {}) {
-  const cx = ox + CELL / 2 + lean;
-  const cy = oy + CELL / 2 + 4 - bob;
-  const rx = 17 + squash;
-  const ry = 17 - squash;
+  const { cx, cy, rx, ry } = bodyAt(ox, oy, { bob, lean, squash });
 
   // feet first, so the body overlaps them
   disc(cx - 7 + feet, cy + ry - 2, 4, BODY_DARK);
@@ -121,38 +145,77 @@ function drawPet(ox, oy, { bob = 0, lean = 0, squash = 0, eyes = 'open', feet = 
   disc(cx + 12, cy + 2, 3, BLUSH, 90);
 }
 
-// row 0 — sleep: three frames of breathing, eyes shut
-for (let f = 0; f < ROW_FRAMES[0]; f += 1) {
-  const squash = [2, 3, 2][f];
-  drawPet(f * CELL, 0, { bob: -1, squash, eyes: 'closed' });
+/**
+ * Pip's hat for one pose, into the hat sheet: a small crown with a band and a
+ * brim. Anchored on `bodyAt`'s head rather than on numbers of its own, so it
+ * rides every bob, lean and squash of the frame it is drawn for.
+ */
+function drawHat(ox, oy, pose) {
+  const { cx, cy, ry } = bodyAt(ox, oy, pose);
+  const top = cy - ry; // the topmost row of the head
+  const fill = (x0, x1, y0, y1, colour) => {
+    for (let y = y0; y <= y1; y += 1) {
+      for (let x = x0; x <= x1; x += 1) set(x, y, colour, 255, hat);
+    }
+  };
+  // The head is a single pixel wide at `top` and about 17px wide two rows down,
+  // so the brim rests there — across the curve, between the ears — rather than
+  // balancing on the apex.
+  fill(cx - 4, cx + 4, top - 5, top - 1, HAT);
+  fill(cx - 3, cx - 3, top - 4, top - 2, HAT_LIGHT);
+  fill(cx - 4, cx + 4, top, top, HAT_BAND);
+  fill(cx - 7, cx + 7, top + 1, top + 2, HAT_BRIM);
 }
-// row 1 — walking right
-for (let f = 0; f < ROW_FRAMES[1]; f += 1) {
-  drawPet(f * CELL, CELL, {
+
+// Per-frame pose for every row that is drawn rather than mirrored. The pet and
+// its hat both read this table, so the hat cannot follow a different bob from
+// the head it is sitting on.
+const POSES = [
+  // row 0 — sleep: three frames of breathing, eyes shut
+  [2, 3, 2].map((squash) => ({ bob: -1, squash, eyes: 'closed' })),
+  // row 1 — walking right
+  [0, 1, 2, 3].map((f) => ({
     bob: [0, 2, 0, 2][f],
     lean: [-2, 0, 2, 0][f],
     feet: [0, 3, 0, -3][f],
+  })),
+  // row 2 — mirrored from row 1 by mirrorWalk, so it has no poses of its own
+  null,
+  // row 3 — stare: what it does while the machine is busy or something broke
+  [0, 1].map((f) => ({ eyes: f === 0 ? 'wide' : 'open', bob: f })),
+];
+
+/** Every real frame of every drawn row. Blank cells stay blank on both sheets. */
+function eachPose(drawFrame) {
+  POSES.forEach((poses, row) => {
+    if (!poses) return;
+    for (let f = 0; f < ROW_FRAMES[row]; f += 1) drawFrame(f * CELL, row * CELL, poses[f]);
   });
 }
-// row 2 — the same walk, mirrored. Drawn by reflecting row 1 pixel for pixel
+
+// Row 2 — the same walk, mirrored. Drawn by reflecting row 1 pixel for pixel
 // rather than by leaning the other way: a lean is not a reflection, and two
 // walk rows that look identical are indistinguishable from a broken row map.
-for (let f = 0; f < ROW_FRAMES[2]; f += 1) {
-  for (let y = 0; y < CELL; y += 1) {
-    for (let x = 0; x < CELL; x += 1) {
-      const from = ((CELL + y) * W + f * CELL + (CELL - 1 - x)) * 4;
-      const to = ((2 * CELL + y) * W + f * CELL + x) * 4;
-      px[to] = px[from];
-      px[to + 1] = px[from + 1];
-      px[to + 2] = px[from + 2];
-      px[to + 3] = px[from + 3];
+// The hat goes through the same reflection, which is what keeps it on the head.
+function mirrorWalk(buf) {
+  for (let f = 0; f < ROW_FRAMES[2]; f += 1) {
+    for (let y = 0; y < CELL; y += 1) {
+      for (let x = 0; x < CELL; x += 1) {
+        const from = ((CELL + y) * W + f * CELL + (CELL - 1 - x)) * 4;
+        const to = ((2 * CELL + y) * W + f * CELL + x) * 4;
+        buf[to] = buf[from];
+        buf[to + 1] = buf[from + 1];
+        buf[to + 2] = buf[from + 2];
+        buf[to + 3] = buf[from + 3];
+      }
     }
   }
 }
-// row 3 — stare: what it does while the machine is busy or something broke
-for (let f = 0; f < ROW_FRAMES[3]; f += 1) {
-  drawPet(f * CELL, 3 * CELL, { eyes: f === 0 ? 'wide' : 'open', bob: f });
-}
+
+eachPose(drawPet);
+mirrorWalk(px);
+eachPose(drawHat);
+mirrorWalk(hat);
 
 // ---------------------------------------------------------------------------
 // PNG container
@@ -183,28 +246,34 @@ function chunk(type, data) {
   return Buffer.concat([len, body, crc]);
 }
 
-const ihdr = Buffer.alloc(13);
-ihdr.writeUInt32BE(W, 0);
-ihdr.writeUInt32BE(H, 4);
-ihdr[8] = 8; // bit depth
-ihdr[9] = 6; // colour type: RGBA
-// 10..12 stay 0: deflate, adaptive filtering, no interlace
+/** An 8-bit RGBA PNG of `w`x`h` from `rgba` (row-major, 4 bytes a pixel). */
+function encodePng(w, h, rgba) {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // colour type: RGBA
+  // 10..12 stay 0: deflate, adaptive filtering, no interlace
 
-// One filter byte per scanline. Filter 0 (none) — the image is flat colour and
-// deflate handles it fine; a filter search would be code with nothing to buy it.
-const raw = Buffer.alloc((W * 4 + 1) * H);
-for (let y = 0; y < H; y += 1) {
-  raw[y * (W * 4 + 1)] = 0;
-  Buffer.from(px.buffer, y * W * 4, W * 4).copy(raw, y * (W * 4 + 1) + 1);
+  // One filter byte per scanline. Filter 0 (none) — the image is flat colour and
+  // deflate handles it fine; a filter search would be code with nothing to buy it.
+  const raw = Buffer.alloc((w * 4 + 1) * h);
+  for (let y = 0; y < h; y += 1) {
+    raw[y * (w * 4 + 1)] = 0;
+    Buffer.from(rgba.buffer, rgba.byteOffset + y * w * 4, w * 4).copy(raw, y * (w * 4 + 1) + 1);
+  }
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
+    chunk('IEND', Buffer.alloc(0)),
+  ]);
 }
 
-const png = Buffer.concat([
-  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-  chunk('IHDR', ihdr),
-  chunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
-  chunk('IEND', Buffer.alloc(0)),
-]);
-
-fs.mkdirSync(path.dirname(OUT), { recursive: true });
-fs.writeFileSync(OUT, png);
-console.log(`wrote ${path.relative(path.join(HERE, '..'), OUT)} — ${W}x${H}, ${png.length} bytes`);
+for (const [out, rgba] of [[OUT, px], [OUT_HAT, hat]]) {
+  const png = encodePng(W, H, rgba);
+  fs.mkdirSync(path.dirname(out), { recursive: true });
+  fs.writeFileSync(out, png);
+  console.log(`wrote ${path.relative(ROOT, out)} — ${W}x${H}, ${png.length} bytes`);
+}

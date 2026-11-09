@@ -89,6 +89,14 @@ export let WALK_FPS = 6;
 let ROW_FPS = { [ROW.RUN_RIGHT]: WALK_FPS, [ROW.RUN_LEFT]: WALK_FPS };
 
 /**
+ * Layers drawn over the pet, `[{id, url}]` in draw order — main has already
+ * applied `GANYU_ACCESSORIES` and dropped any sheet missing on disk, so this is
+ * exactly what to load. The built-in pet has none (`DEFAULT_PET_CONFIG` carries
+ * no `accessories`, and `test/petbinding.test.mjs` holds the two to that).
+ */
+export let ACCESSORIES = Object.freeze([]);
+
+/**
  * Bind this module to a loaded pet. Called once, from `boot`, with the sprite
  * block `ganyu.getFlags()` carries; called with nothing it leaves the built-in
  * pet in place, which is what a failed or absent config falls back to.
@@ -118,6 +126,18 @@ export function useSpriteConfig(sprite) {
   if (a.walk && typeof a.walk === 'object') WALK_ROW = { ...a.walk };
   if (Array.isArray(a.celebrate)) CELEBRATE_PULSE = [...a.celebrate];
   if (Number.isInteger(a.airborne)) AIRBORNE_ROW = a.airborne;
+
+  // Unlike the fields above this one *is* filtered rather than trusted: each
+  // entry becomes an image request, and a malformed one should cost that one
+  // layer, never the pet. Absent (an older main) leaves the binding alone.
+  if (Array.isArray(sprite.accessories)) {
+    ACCESSORIES = Object.freeze(
+      sprite.accessories
+        .filter((l) => l && typeof l.id === 'string' && l.id !== ''
+          && typeof l.url === 'string' && l.url !== '')
+        .map((l) => Object.freeze({ id: l.id, url: l.url })),
+    );
+  }
   return true;
 }
 
@@ -233,13 +253,30 @@ export function createAnimator({ now = () => Date.now() } = {}) {
   };
 }
 
-/** Crops one grid cell onto the canvas, scaled for the display's DPR. */
+/**
+ * Crops one grid cell onto the canvas, scaled for the display's DPR — then the
+ * same cell of every accessory layer on top of it.
+ *
+ * Layers load themselves, here, rather than being awaited in `boot`: the pet is
+ * drawn the moment its own sheet is ready, and a hat that is slow, missing or
+ * broken can only ever cost the hat. A layer that arrives late invalidates the
+ * dedup so it shows on the next tick instead of on the next frame change, which
+ * on a 3-frame sleep row at 3fps could be a visible second of bare head.
+ *
+ * A layer has to be the base sheet's exact pixel size, because it is cropped
+ * with the base's rect: a smaller one would draw some other frame's hat, or
+ * none, and nothing would say why. So a mismatch is one warning and the layer
+ * is never drawn; a load failure likewise. Neither touches the base pet.
+ */
 export function createSpriteRenderer({
   canvas,
   image,
   frameW = FRAME_W,
   frameH = FRAME_H,
   dpr = 1,
+  accessories = ACCESSORIES,
+  ImageCtor = globalThis.Image,
+  warn = console.warn,
 }) {
   const scale = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
   canvas.width = Math.round(frameW * scale);
@@ -249,28 +286,61 @@ export function createSpriteRenderer({
   let lastRow = -1;
   let lastFrame = -1;
 
+  function invalidate() {
+    lastRow = -1;
+    lastFrame = -1;
+  }
+
+  // Natural pixel size of a loaded image; `width`/`height` for an image that
+  // has no natural size to report.
+  const sizeOf = (img) => ({
+    w: img?.naturalWidth ?? img?.width,
+    h: img?.naturalHeight ?? img?.height,
+  });
+
+  // One slot per layer, indexed by list position, so the draw order is the
+  // config's order however the loads happen to finish.
+  const layers = (Array.isArray(accessories) ? accessories : [])
+    .filter((l) => l && typeof l.url === 'string')
+    .map(({ id, url }) => ({ id, url }));
+  const ready = layers.map(() => null);
+  if (typeof ImageCtor === 'function') {
+    layers.forEach(({ id, url }, i) => {
+      loadImage({ src: url, ImageCtor }).then(
+        (img) => {
+          const base = sizeOf(image);
+          const got = sizeOf(img);
+          if (got.w !== base.w || got.h !== base.h) {
+            warn(`[ganyu] accessory "${id}" is ${got.w}x${got.h} but the pet's sheet is ${base.w}x${base.h} — not drawn`);
+            return;
+          }
+          ready[i] = img;
+          invalidate();
+        },
+        () => warn(`[ganyu] accessory "${id}" failed to load (${url}) — not drawn`),
+      );
+    });
+  }
+
   return {
     draw(row, frame, force = false) {
       if (!force && row === lastRow && frame === lastFrame) return false;
       lastRow = row;
       lastFrame = frame;
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(
-        image,
-        frame * frameW,
-        row * frameH,
-        frameW,
-        frameH,
-        0,
-        0,
-        canvas.width,
-        canvas.height,
-      );
+      // One rect for the pet and every layer: the same row, the same frame,
+      // the same place on the canvas. A layer has no rect of its own to get wrong.
+      const cell = [frame * frameW, row * frameH, frameW, frameH, 0, 0, canvas.width, canvas.height];
+      ctx.drawImage(image, ...cell);
+      for (const layer of ready) {
+        if (layer) ctx.drawImage(layer, ...cell);
+      }
       return true;
     },
-    invalidate() {
-      lastRow = -1;
-      lastFrame = -1;
+    invalidate,
+    /** Ids of the layers being drawn, in draw order. Read-only, for tests. */
+    get activeAccessories() {
+      return Object.freeze(layers.filter((_, i) => ready[i]).map((l) => l.id));
     },
   };
 }
