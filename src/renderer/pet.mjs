@@ -532,7 +532,8 @@ export async function boot({
     onFail: ({ device }) => {
       if (!callMode) return;
       callMode = false;
-      // Only ever reached after start(), which only runs once the menu exists.
+      // Only ever reached after start(), and every start() runs after the menu
+      // buttons exist (the boot-time syncCall sits below them for this reason).
       paintMenu();
       ganyu.menuAction('toggle-call');
       bubbles.show(callFailedLine(device), { priority: BUBBLE_PRIORITY.chat });
@@ -682,9 +683,6 @@ export async function boot({
     // `active` yet, and only stop() cancels it (and stops its late stream).
     callAudio.stop();
   }
-  // A reloaded renderer under a main that still has call mode on picks it up.
-  callMode = Boolean(flags.callMode);
-  syncCall();
   // `npm run smoke` with GANYU_SMOKE_CALL set: perform the real setSinkId on
   // the real device and say what happened. Main relays the console line.
   if (typeof flags.smokeCall === 'string' && flags.smokeCall !== '') {
@@ -698,6 +696,12 @@ export async function boot({
   // ---- menu ----------------------------------------------------------------
 
   const menuButtons = Array.from(menuEl.querySelectorAll('[data-action]'));
+
+  // A reloaded renderer under a main that still has call mode on picks it up.
+  // After menuButtons, because a start that fails synchronously repaints the
+  // menu from onFail.
+  callMode = Boolean(flags.callMode);
+  syncCall();
 
   function paintMenu() {
     const labels = menuLabels({ muted, pinned, callMode });

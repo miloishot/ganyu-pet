@@ -2410,3 +2410,15 @@ test('the page going away closes the mic', async () => {
   assert.equal(app.call.micOpen, false);
   app.dispose();
 });
+
+test('a reloaded renderer whose call start fails at once still tells main and says so', async () => {
+  // Blank device: start() fails synchronously, from inside boot.
+  const { h, app } = await callHarness({
+    flags: { ...CALL_FLAGS, callMode: true, call: { device: '', mixMic: false, mic: '' } },
+  });
+  await flush();
+  assert.equal(app.flags.callMode, false);
+  assert.deepEqual(h.g.calls.menuAction, ['toggle-call'], 'main is turned off too');
+  assert.match(h.dom.bubble.textContent, /no call device is set/);
+  app.dispose();
+});

@@ -344,3 +344,16 @@ test('starting is true only while start() is awaiting', async () => {
   call.stop();
   assert.equal(call.starting, false);
 });
+
+test('a named device that is also the Windows default resolves to the real device, not the alias', () => {
+  const list = [
+    { kind: 'audiooutput', deviceId: 'default', label: 'Default - Voicemeeter Input (VB-Audio Voicemeeter VAIO)' },
+    { kind: 'audiooutput', deviceId: 'communications', label: 'Communications - Voicemeeter Input (VB-Audio Voicemeeter VAIO)' },
+    { kind: 'audiooutput', deviceId: 'vm-in', label: 'Voicemeeter Input (VB-Audio Voicemeeter VAIO)' },
+    { kind: 'audioinput', deviceId: 'default', label: 'Default - Microphone (USB Mic)' },
+    { kind: 'audioinput', deviceId: 'mic-1', label: 'Microphone (USB Mic)' },
+  ];
+  assert.equal(findDevice(list, 'audiooutput', 'voicemeeter input').deviceId, 'vm-in');
+  assert.equal(findDevice(list, 'audioinput', 'usb mic').deviceId, 'mic-1');
+  assert.equal(findDevice(list.slice(0, 2), 'audiooutput', 'voicemeeter input'), null, 'an alias alone is not a match');
+});

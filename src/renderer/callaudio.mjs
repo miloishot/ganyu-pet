@@ -39,11 +39,19 @@ export function callFailedLine(device) {
     : `I cannot reach the call — I could not find "${name}".`;
 }
 
-/** First device of `kind` whose label contains `needle`, case-insensitively. */
+/**
+ * Chromium's aliases for "whatever Windows' default is". Labelled
+ * "Default - <name>" / "Communications - <name>" and listed first, so a plain
+ * first-match would bind a named device to an alias that silently follows the
+ * OS default — and that never "disappears" for the devicechange check.
+ */
+const PSEUDO_DEVICE_IDS = new Set(['default', 'communications']);
+
+/** First real device of `kind` whose label contains `needle`, case-insensitively. */
 export function findDevice(devices, kind, needle) {
   const want = String(needle ?? '').trim().toLowerCase();
   if (want === '' || !Array.isArray(devices)) return null;
-  return devices.find((d) => d && d.kind === kind
+  return devices.find((d) => d && d.kind === kind && !PSEUDO_DEVICE_IDS.has(d.deviceId)
     && typeof d.label === 'string' && d.label.toLowerCase().includes(want)) || null;
 }
 
