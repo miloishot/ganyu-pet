@@ -20,11 +20,21 @@
 // there. The image is handed over as a `data:` URL rather than a `file://` one
 // so the canvas is never cross-origin-tainted and so this script writes nothing
 // to disk unless asked to.
+//
+// **Why it is also importable.** `scripts/add-pet.mjs` and the tests import the
+// pure half — the grid inference, the frame counting, the draft and the list of
+// what the draft leaves as placeholders — under plain node, where there is no
+// `app` to start. So nothing here touches Electron at import time: `electron` is
+// imported only inside the entry-script block at the bottom. It is a *dynamic*
+// import on purpose. Under plain node the `electron` package's main is a
+// function that returns the binary's path and **downloads the binary first if
+// it is missing**, and a missing package is an import error — either of which
+// would make importing a table of numbers depend on a 100 MB download.
 
-import { app, BrowserWindow } from 'electron';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const SCRIPT = 'analyze-pet.mjs';
 
@@ -136,7 +146,7 @@ function isDir(p) {
  * takes an id, so they are different functions that happen to look at the same
  * directory.
  */
-function findSheet(target, { env = process.env, home = os.homedir() } = {}) {
+export function findSheet(target, { env = process.env, home = os.homedir() } = {}) {
   if (isFile(target)) {
     const dir = path.dirname(target);
     return { sheetPath: path.resolve(target), petDir: dir, meta: readPetMeta(dir) };
@@ -224,7 +234,7 @@ function alignmentScore(count, cell, emptyLine) {
   return clean / (count - 1);
 }
 
-function inferCount(size, emptyLine) {
+export function inferCount(size, emptyLine) {
   const candidates = [];
   for (let n = 1; n <= MAX_CELL_COUNT; n++) {
     if (size % n !== 0) continue;
@@ -244,7 +254,7 @@ function inferCount(size, emptyLine) {
  * loop over — a lone frame after a gap cannot be reached without a frame list,
  * and no sheet seen so far has one. A gap is reported so it is never silent.
  */
-function framesInRow(percents) {
+export function framesInRow(percents) {
   let leading = 0;
   while (leading < percents.length && percents[leading] >= MIN_FRAME_OPAQUE) leading += 1;
   const total = percents.filter((p) => p >= MIN_FRAME_OPAQUE).length;
@@ -326,7 +336,23 @@ function printCellTable(percents, frames) {
   });
 }
 
-function draftConfig({ id, displayName, spritesheet, cols, rows, cellW, cellH, frames }) {
+/**
+ * Every field `draftConfig` fills with a placeholder rather than a measurement,
+ * as `{field, note}`. It lives here, beside the function that writes the
+ * placeholders, so the list cannot describe a draft this file no longer makes —
+ * `add-pet` prints it after installing a bare Codex pet, and a list kept over
+ * there would go stale the first time this function changed.
+ */
+export const DRAFT_PLACEHOLDERS = Object.freeze([
+  Object.freeze({ field: 'animation.rows[].label', note: 'every row is labelled "TODO row N"' }),
+  Object.freeze({ field: 'animation.modes', note: 'idle, busy, waiting and failed all point at row 0' }),
+  Object.freeze({ field: 'animation.walk', note: 'left and right both point at row 0' }),
+  Object.freeze({ field: 'animation.airborne', note: 'points at row 0' }),
+  Object.freeze({ field: 'animation.celebrate', note: 'empty, so finishing a task plays nothing' }),
+  Object.freeze({ field: 'persona', note: 'absent, so the pet speaks with the built-in persona' }),
+]);
+
+export function draftConfig({ id, displayName, spritesheet, cols, rows, cellW, cellH, frames }) {
   return {
     schemaVersion: 1,
     id,
@@ -359,7 +385,7 @@ function draftConfig({ id, displayName, spritesheet, cols, rows, cellW, cellH, f
 // Main
 // ---------------------------------------------------------------------------
 
-async function run() {
+async function run({ BrowserWindow }) {
   const opts = parseArgs(process.argv);
   const { sheetPath, petDir, meta } = findSheet(opts.target);
 
@@ -507,26 +533,58 @@ async function run() {
   return 0;
 }
 
-app.disableHardwareAcceleration();
+/**
+ * True only when this file is the script being run, not a module being
+ * imported. Compared resolved and, on Windows, case-insensitively: the same
+ * file arrives as `scripts/analyze-pet.mjs` from npm, `.\scripts\...` from a
+ * shell, and with whichever drive-letter case the caller typed.
+ */
+function isEntryScript() {
+  const entry = process.argv[1];
+  if (typeof entry !== 'string' || entry === '') return false;
+  const a = path.resolve(entry);
+  const b = path.resolve(fileURLToPath(import.meta.url));
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
 
-app.whenReady().then(
-  async () => {
-    let code = 1;
-    try {
-      code = await run();
-    } catch (err) {
-      if (err instanceof UsageError) {
-        if (err.message) console.error(`${SCRIPT}: ${err.message}`);
-        console.error(USAGE);
-      } else {
-        console.error(`${SCRIPT}: ${(err && err.stack) || err}`);
+function startCli(electron) {
+  const { app, BrowserWindow } = electron;
+
+  app.disableHardwareAcceleration();
+
+  app.whenReady().then(
+    async () => {
+      let code = 1;
+      try {
+        code = await run({ BrowserWindow });
+      } catch (err) {
+        if (err instanceof UsageError) {
+          if (err.message) console.error(`${SCRIPT}: ${err.message}`);
+          console.error(USAGE);
+        } else {
+          console.error(`${SCRIPT}: ${(err && err.stack) || err}`);
+        }
+        code = 1;
       }
-      code = 1;
-    }
-    app.exit(code);
-  },
-  (err) => {
-    console.error(`${SCRIPT}: electron failed to start (${(err && err.message) || err})`);
-    app.exit(1);
-  },
-);
+      app.exit(code);
+    },
+    (err) => {
+      console.error(`${SCRIPT}: electron failed to start (${(err && err.message) || err})`);
+      app.exit(1);
+    },
+  );
+}
+
+if (isEntryScript()) {
+  // Awaited at the top level so the module has finished evaluating — and
+  // `disableHardwareAcceleration` has run — before Electron emits `ready`.
+  const { default: electron } = await import('electron');
+  if (electron && typeof electron === 'object' && electron.app) {
+    startCli(electron);
+  } else {
+    // Plain `node scripts/analyze-pet.mjs`: the package resolved to a path
+    // string, because there is no Electron runtime here to decode a sheet with.
+    console.error(`${SCRIPT}: run this under Electron — npx electron scripts/${SCRIPT} <pet-id-or-path>`);
+    process.exitCode = 1;
+  }
+}
