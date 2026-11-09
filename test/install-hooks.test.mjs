@@ -24,6 +24,9 @@ import {
   CODEX_EVENTS,
   CLAUDE_EVENTS,
   HOOK_CMD_PATH,
+  OPENCODE_PLUGIN_PATH,
+  defaultOpencodeDir,
+  validatePlan,
 } from '../hooks/install-hooks.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -367,6 +370,156 @@ test('parseArgs defaults to dry run and both targets', () => {
   assert.equal(opts.claude, true);
   assert.equal(opts.hookPath, HOOK_CMD_PATH);
   assert.equal(parseArgs(['--apply']).apply, true);
+});
+
+// ---------------------------------------------------------------------------
+// opencode target — whole-file copy into <config dir>/plugins/ganyu.js
+// ---------------------------------------------------------------------------
+
+const OC_FIXTURES = path.join(FIXTURES, 'opencode');
+const REAL_OPENCODE = defaultOpencodeDir({});
+const listTree = (dir) => (fs.existsSync(dir)
+  ? fs.readdirSync(dir, { recursive: true }).map(String).sort()
+  : null);
+const realOpencodeBefore = listTree(path.join(REAL_OPENCODE, 'plugins'));
+const ocFixturesBefore = listTree(OC_FIXTURES)
+  .filter((n) => fs.statSync(path.join(OC_FIXTURES, n)).isFile())
+  .map((n) => ({ n, text: read(path.join(OC_FIXTURES, n)) }));
+
+/** A scratch copy of one fixture config dir. */
+function ocDir(t, name) {
+  const ws = workspace(t);
+  const dir = path.join(ws.dir, name);
+  fs.cpSync(path.join(OC_FIXTURES, name), dir, { recursive: true });
+  return dir;
+}
+const pluginSource = () => read(OPENCODE_PLUGIN_PATH);
+const ocOnly = (dir, ...rest) => ['--no-codex', '--no-claude', '--opencode-dir', dir, ...rest];
+
+test('opencode: off unless asked for, so bare runs never look at the OpenCode dir', () => {
+  const opts = parseArgs([]);
+  assert.equal(opts.opencode, false);
+  assert.equal(parseArgs(['--opencode']).opencode, true);
+  const withDir = parseArgs(['--opencode-dir', 'x']);
+  assert.equal(withDir.opencode, true);
+  assert.equal(withDir.opencodeDir, 'x');
+  const res = run(['--no-codex', '--no-claude'], silent);
+  assert.deepEqual(res.plans, []);
+});
+
+test('opencode: config dir is $XDG_CONFIG_HOME/opencode, else ~/.config/opencode', () => {
+  assert.equal(defaultOpencodeDir({ XDG_CONFIG_HOME: path.join('X', 'cfg') }), path.join('X', 'cfg', 'opencode'));
+  assert.equal(defaultOpencodeDir({}), path.join(os.homedir(), '.config', 'opencode'));
+});
+
+test('opencode: dry run writes nothing and shows the plugin as a diff', (t) => {
+  const dir = ocDir(t, 'fresh');
+  const before = listTree(dir);
+  const lines = [];
+  const res = run(ocOnly(dir), { log: (l) => lines.push(l) });
+  assert.equal(res.dryRun, true);
+  assert.deepEqual(listTree(dir), before);
+  const out = lines.join('\n');
+  assert.match(out, /opencode: .*plugins[\\/]ganyu\.js/);
+  assert.match(out, /\+export const GanyuPlugin/);
+  assert.match(out, /DRY RUN — nothing written/);
+});
+
+test('opencode: --apply installs, a second --apply is a no-op, other plugins untouched', (t) => {
+  const dir = ocDir(t, 'fresh');
+  const other = path.join(dir, 'plugins', 'other.js');
+  const otherText = read(other);
+  const otherStat = fs.statSync(other);
+
+  const first = run(ocOnly(dir, '--apply'), silent);
+  const target = path.join(dir, 'plugins', 'ganyu.js');
+  assert.equal(first.plans[0].changed, true);
+  assert.equal(read(target), pluginSource());
+  assert.equal(first.backups[target], null, 'nothing to back up on a fresh install');
+
+  const stat = fs.statSync(target);
+  const second = run(ocOnly(dir, '--apply'), silent);
+  assert.equal(second.plans[0].changed, false);
+  assert.deepEqual(second.backups, {});
+  assert.equal(fs.statSync(target).mtimeMs, stat.mtimeMs, 'second --apply rewrote the file');
+
+  assert.equal(read(other), otherText);
+  assert.equal(fs.statSync(other).mtimeMs, otherStat.mtimeMs);
+  assert.deepEqual(listTree(path.join(dir, 'plugins')), ['ganyu.js', 'other.js']);
+  assert.equal(read(path.join(dir, 'opencode.json')), read(path.join(OC_FIXTURES, 'fresh', 'opencode.json')));
+});
+
+test('opencode: a differing ganyu.js is backed up before it is replaced', (t) => {
+  const dir = ocDir(t, 'stale');
+  const target = path.join(dir, 'plugins', 'ganyu.js');
+  const old = read(target);
+  const plan = planTarget({ kind: 'opencode', file: target });
+  assert.equal(plan.changed, true);
+  assert.equal(plan.warnings.length, 1);
+
+  const res = run(ocOnly(dir, '--apply'), silent);
+  const backup = res.backups[target];
+  assert.equal(backup, `${target}.bak-ganyu-1`);
+  assert.equal(read(backup), old);
+  assert.equal(read(target), pluginSource());
+  // OpenCode loads plugins/*.{js,ts}; the backup's name must not match that glob.
+  assert.doesNotMatch(path.basename(backup), /\.(js|ts)$/);
+  assert.deepEqual(listTree(path.join(dir, 'plugins')).sort(), ['ganyu.js', 'ganyu.js.bak-ganyu-1', 'other.js']);
+});
+
+test('opencode: a config dir with no plugins/ folder gets one', (t) => {
+  const dir = ocDir(t, 'no-plugins-dir');
+  run(ocOnly(dir, '--apply'), silent);
+  assert.equal(read(path.join(dir, 'plugins', 'ganyu.js')), pluginSource());
+});
+
+test('opencode: missing or malformed config dirs fail safe with a clear message', (t) => {
+  const ws = workspace(t);
+  const missing = path.join(ws.dir, 'nope');
+  assert.throws(() => run(ocOnly(missing, '--apply'), silent), /OpenCode config dir not found/);
+  assert.equal(fs.existsSync(missing), false);
+
+  const asFile = ws.write('opencode-file', 'not a dir');
+  assert.throws(() => run(ocOnly(asFile, '--apply'), silent), /found a file/);
+  assert.equal(read(asFile), 'not a dir');
+
+  const pluginsFile = path.join(ws.dir, 'plugins-is-file');
+  fs.mkdirSync(pluginsFile);
+  fs.writeFileSync(path.join(pluginsFile, 'plugins'), 'x');
+  assert.throws(() => run(ocOnly(pluginsFile, '--apply'), silent), /plugins: expected a directory/);
+
+  const ganyuDir = path.join(ws.dir, 'ganyu-is-dir');
+  fs.mkdirSync(path.join(ganyuDir, 'plugins', 'ganyu.js'), { recursive: true });
+  assert.throws(() => run(ocOnly(ganyuDir, '--apply'), silent), /is a directory/);
+});
+
+test('opencode: a failing opencode target aborts before codex/claude are written', (t) => {
+  const ws = workspace(t);
+  const codex = ws.copy('codex-hooks.json');
+  const before = read(codex);
+  assert.throws(
+    () => run(['--apply', '--codex-file', codex, '--no-claude', '--opencode-dir', path.join(ws.dir, 'nope')], silent),
+    /not found/,
+  );
+  assert.equal(read(codex), before);
+});
+
+test('opencode: validatePlan refuses a target that is not plugins/ganyu.js', () => {
+  assert.throws(
+    () => validatePlan({ kind: 'opencode', file: path.join('x', 'plugins', 'other.js'), nextText: pluginSource(), source: OPENCODE_PLUGIN_PATH }),
+    /must be plugins\/ganyu\.js/,
+  );
+  assert.throws(
+    () => validatePlan({ kind: 'opencode', file: path.join('x', 'plugins', 'ganyu.js'), nextText: 'tampered', source: OPENCODE_PLUGIN_PATH }),
+    /differ/,
+  );
+});
+
+test('opencode: the real OpenCode plugins dir and the fixtures were never touched', () => {
+  assert.deepEqual(listTree(path.join(REAL_OPENCODE, 'plugins')), realOpencodeBefore);
+  for (const { n, text } of ocFixturesBefore) {
+    assert.equal(read(path.join(OC_FIXTURES, n)), text, `fixture opencode/${n} was modified`);
+  }
 });
 
 test('real config files and fixtures were never touched by this suite', () => {
