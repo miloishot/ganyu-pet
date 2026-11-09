@@ -180,12 +180,15 @@ test('--apply merges into codex hooks.json: preserves Orca + Superset, adds ours
   for (const c of beforeCommands) {
     assert.ok(afterCommands.includes(c), `pre-existing command lost: ${c}`);
   }
+  // Our own command carries the checkout path, which may itself contain
+  // "orca" or "superset" (an Orca worktree does) — count third-party entries only.
+  const foreign = afterCommands.filter((c) => !c.includes('ganyu-hook.cmd'));
   assert.equal(
-    afterCommands.filter((c) => c.includes('orca')).length,
+    foreign.filter((c) => c.includes('orca')).length,
     beforeCommands.filter((c) => c.includes('orca')).length,
   );
   assert.equal(
-    afterCommands.filter((c) => c.includes('superset')).length,
+    foreign.filter((c) => c.includes('superset')).length,
     beforeCommands.filter((c) => c.includes('superset')).length,
   );
 
