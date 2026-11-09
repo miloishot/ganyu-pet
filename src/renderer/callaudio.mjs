@@ -71,6 +71,8 @@ export function createCallAudio({
 } = {}) {
   let gen = 0; // bumped by every stop(); a start that sees it move has been cancelled
   let active = false;
+  let starting = false;
+  let playSeq = 0; // the newest play() in mix mode; an older decode never starts
   let config = null;
   let sinkEl = null;
   let sinkId = null;
@@ -127,6 +129,7 @@ export function createCallAudio({
     micId = null;
     label = null;
     active = false;
+    starting = false;
   }
 
   /** Every off path. Also cancels a start() that is still awaiting. */
@@ -137,13 +140,17 @@ export function createCallAudio({
     return was;
   }
 
-  function fail(reason) {
-    const device = config?.device ?? '';
+  /** `device` is what the canned line names: the output, or the mic when it was the mic. */
+  function fail(reason, device = config?.device ?? '') {
     stop();
     try {
       onFail({ device, reason });
     } catch { /* the caller's problem, not a reason to leave the mic open */ }
     return { ok: false, reason };
+  }
+
+  function micName() {
+    return config?.mic ? config.mic : 'the default microphone';
   }
 
   async function listDevices() {
@@ -154,6 +161,7 @@ export function createCallAudio({
   async function start(cfg = {}) {
     stop(); // a second start replaces the first; it never stacks a second mic
     const mine = gen;
+    starting = true;
     config = { device: String(cfg.device ?? '').trim(), mixMic: Boolean(cfg.mixMic), mic: String(cfg.mic ?? '').trim() };
     if (!mediaDevices || typeof mediaDevices.enumerateDevices !== 'function' || typeof createAudio !== 'function') {
       return fail('audio devices are not available here');
@@ -188,7 +196,7 @@ export function createCallAudio({
       let mic = null;
       if (config.mic !== '') {
         mic = findDevice(devices, 'audioinput', config.mic);
-        if (!mic) return fail(`no microphone matches "${config.mic}"`);
+        if (!mic) return fail(`no microphone matches "${config.mic}"`, micName());
       }
       if (typeof mediaDevices.getUserMedia !== 'function' || typeof createAudioContext !== 'function') {
         return fail('microphone mixing is not available here');
@@ -201,7 +209,7 @@ export function createCallAudio({
         });
       } catch (err) {
         if (mine !== gen) return { ok: false, reason: 'stopped' };
-        return fail(`could not open the microphone: ${err?.message ?? err}`);
+        return fail(`could not open the microphone: ${err?.message ?? err}`, micName());
       }
       if (mine !== gen) {
         // stop() ran while the permission prompt was up: this stream belongs to
@@ -225,6 +233,7 @@ export function createCallAudio({
 
     onDeviceChange = () => { checkDevices(); };
     mediaDevices.addEventListener?.('devicechange', onDeviceChange);
+    starting = false;
     active = true;
     return { ok: true, label };
   }
@@ -245,13 +254,14 @@ export function createCallAudio({
       return;
     }
     if (micId && !devices.some((d) => d && d.kind === 'audioinput' && d.deviceId === micId)) {
-      fail('the microphone disappeared');
+      fail('the microphone disappeared', micName());
     }
   }
 
   /** Stop the clip being said into the call, keep call mode (and the mic mix) up. */
   function silence() {
     if (!active) return false;
+    playSeq += 1; // a clip still decoding is cancelled too
     if (source) {
       try { source.stop(); } catch { /* already finished */ }
       source = null;
@@ -281,6 +291,7 @@ export function createCallAudio({
       }
     }
     const mine = gen;
+    const seq = (playSeq += 1);
     let bytes;
     try {
       bytes = decode(base64);
@@ -290,7 +301,7 @@ export function createCallAudio({
     Promise.resolve()
       .then(() => ctx.decodeAudioData(bytes))
       .then((buffer) => {
-        if (mine !== gen || !ctx || !dest) return;
+        if (mine !== gen || seq !== playSeq || !ctx || !dest) return;
         if (source) {
           try { source.stop(); } catch { /* already finished */ }
         }
@@ -310,6 +321,7 @@ export function createCallAudio({
     play,
     silence,
     get active() { return active; },
+    get starting() { return starting; },
     get label() { return label; },
     get micOpen() { return stream !== null; },
   };

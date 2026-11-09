@@ -296,3 +296,51 @@ test('the smoke probe performs setSinkId and reports one line, mic untouched', a
   const bad = await probeCallSink({ device: 'CABLE Input', mediaDevices: kit.mediaDevices, createAudio: kit.createAudio });
   assert.match(bad, /^CALL_SINK_FAIL no output device matches "CABLE Input"$/);
 });
+
+test('mix mode: a clip still decoding never starts after silence() or a newer clip', async () => {
+  const kit = makeMedia();
+  const call = kit.call();
+  await call.start({ device: 'Voicemeeter Input', mixMic: true });
+  const pending = [];
+  kit.ctxs[0].decodeAudioData = () => new Promise((r) => pending.push(r));
+
+  call.play(MP3);
+  await flush();
+  call.silence(); // muted while the first clip was decoding
+  pending[0]({});
+  await flush();
+  assert.equal(kit.sources.length, 0, 'a clip decoded after mute is never started');
+
+  call.play(MP3);
+  call.play(MP3);
+  await flush();
+  pending[2]({}); // the newer one finishes first
+  await flush();
+  pending[1]({}); // then the older one
+  await flush();
+  assert.equal(kit.sources.length, 1, 'only the newest clip plays');
+  call.stop();
+});
+
+test('a mic failure names the mic, not the output', async () => {
+  let kit = makeMedia();
+  await kit.call().start({ device: 'Voicemeeter Input', mixMic: true, mic: 'Blue Yeti' });
+  assert.equal(kit.fails[0].device, 'Blue Yeti');
+
+  kit = makeMedia({ gumRejects: true });
+  await kit.call().start({ device: 'Voicemeeter Input', mixMic: true });
+  assert.equal(kit.fails[0].device, 'the default microphone');
+});
+
+test('starting is true only while start() is awaiting', async () => {
+  const kit = makeMedia();
+  const call = kit.call();
+  assert.equal(call.starting, false);
+  const p = call.start({ device: 'Voicemeeter AUX Input' });
+  assert.equal(call.starting, true);
+  await p;
+  assert.equal(call.starting, false);
+  assert.equal(call.active, true);
+  call.stop();
+  assert.equal(call.starting, false);
+});

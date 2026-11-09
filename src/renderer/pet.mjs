@@ -674,8 +674,13 @@ export async function boot({
 
   /** Bring the call output in line with the flag. The mic opens only in here. */
   function syncCall() {
-    if (callMode && !callAudio.active) callAudio.start(callConfig);
-    else if (!callMode && callAudio.active) callAudio.stop();
+    if (callMode) {
+      if (!callAudio.active && !callAudio.starting) callAudio.start(callConfig);
+      return;
+    }
+    // Unconditionally: a start() still parked on the mic permission is not
+    // `active` yet, and only stop() cancels it (and stops its late stream).
+    callAudio.stop();
   }
   // A reloaded renderer under a main that still has call mode on picks it up.
   callMode = Boolean(flags.callMode);

@@ -2375,3 +2375,38 @@ test('a reloaded renderer picks up live call mode; dispose closes the mic', asyn
   assert.ok(kit.tracks.length === 1 && kit.tracks[0].stopped);
   assert.equal(app.call.active, false);
 });
+
+test('toggling off while the mic request is still pending closes the mic when it arrives', async () => {
+  const { h, app, kit, callBtn, click } = await callHarness({
+    flags: { ...CALL_FLAGS, call: { device: 'Voicemeeter AUX', mixMic: true, mic: '' } },
+  });
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const realGum = kit.mediaDevices.getUserMedia;
+  kit.mediaDevices.getUserMedia = async (c) => { await gate; return realGum(c); };
+
+  await click(callBtn); // on: start() is now parked on the permission
+  await click(callBtn); // off, before getUserMedia has answered
+  release();
+  await flush();
+  await flush();
+  assert.equal(kit.tracks.length, 1);
+  assert.equal(kit.tracks[0].stopped, true, 'the late stream is stopped, not left open');
+  assert.equal(app.call.micOpen, false);
+  assert.equal(app.call.active, false);
+  assert.equal(h.g.calls.menuAction.filter((a) => a === 'toggle-call').length, 2, 'no failure toggle');
+  app.dispose();
+});
+
+test('the page going away closes the mic', async () => {
+  const { h, app, kit, callBtn, click } = await callHarness({
+    flags: { ...CALL_FLAGS, call: { device: 'Voicemeeter AUX', mixMic: true, mic: '' } },
+  });
+  await click(callBtn);
+  await flush();
+  assert.equal(app.call.micOpen, true);
+  h.dom.win.dispatch('pagehide', {});
+  assert.ok(kit.tracks.length === 1 && kit.tracks[0].stopped);
+  assert.equal(app.call.micOpen, false);
+  app.dispose();
+});
