@@ -1,6 +1,9 @@
 // Module D (optional) — brain: turns a hook event into an in-character line, and
-// a message the owner typed into an in-character reply, via the owner's own
-// OpenAI-compatible endpoint.
+// a message the owner typed into an in-character reply, via the owner's own endpoint — an
+// OpenAI Responses one by default, or chat completions, Anthropic Messages or a
+// local Ollama, as `GANYU_BRAIN_PROVIDER` selects. The protocols differ only in
+// their wire shape, which lives in providers.mjs; every guarantee below is
+// written here once and holds for all of them.
 //
 // Everything here is best-effort. The deterministic MESSAGES table in
 // persona.mjs remains the real speech path; the brain only ever improves on it,
@@ -37,9 +40,10 @@
 // at his explicit request, the briefing carries the text of his most recent
 // `UserPromptSubmit` — bounded, redacted and switchable (see `readContext` and
 // `GANYU_SEE_PROMPTS`). Everything else is unchanged: no file contents, no
-// diffs, no subagent brief, no transcript. `store: false` asks the endpoint not
-// to retain the exchange, matching the owner's
-// `disable_response_storage` setting. The key is
+// diffs, no subagent brief, no transcript. `store: false` asks a Responses
+// endpoint not to retain the exchange, matching the owner's
+// `disable_response_storage` setting (the other protocols take no such field,
+// or default to not storing — see providers.mjs). The key is
 // read from disk at runtime, never logged, and never placed in an error message
 // — which is also why failures are reported by error *name* only, since a fetch
 // error's message carries the endpoint URL.
@@ -54,6 +58,17 @@ import {
   buildChatInput,
   clampLine,
 } from './persona.mjs';
+import {
+  DEFAULT_PROVIDER,
+  OLLAMA_BASE_URL,
+  PROVIDER_NAMES,
+  UNKNOWN_PROVIDER_REASON,
+  WIRES,
+  providerFrom,
+  providerNameFrom,
+} from './providers.mjs';
+
+export { PROVIDER_NAMES, OLLAMA_BASE_URL };
 
 /** Long enough for a slow first token, short enough that a stale line never lands. */
 export const REQUEST_TIMEOUT_MS = 10_000;
@@ -118,10 +133,13 @@ export const MAX_CHAT_LINE_CHARS = 240;
  * fallback — but reaching it takes an explicit key.
  */
 export const ROUTES = Object.freeze({
-  responses: '/v1/responses',
-  chat: '/v1/chat/completions',
+  responses: WIRES.responses.path,
+  chat: WIRES.chat.path,
 });
-const ROUTE_ORDER = ['responses', 'chat'];
+// The order itself is the `openai` provider's `routes` in providers.mjs, where
+// `chat` is its `gatedRoute`. The other providers have exactly one route each,
+// and for `openai-chat` / `ollama` that route is chat completions as the
+// *primary* — none of the warnings below applies to them.
 
 /**
  * The two things a future debugging session needs to find in the log, written
@@ -172,7 +190,12 @@ const MAX_CHAT_OUTPUT_TOKENS = 700;
 const AMBIENT_LIMITS = Object.freeze({ maxChars: MAX_BRAIN_LINE_CHARS, maxTokens: MAX_OUTPUT_TOKENS });
 const CHAT_LIMITS = Object.freeze({ maxChars: MAX_CHAT_LINE_CHARS, maxTokens: MAX_CHAT_OUTPUT_TOKENS });
 
-/** The three keys `.env.local` must carry for the brain to be usable. */
+/**
+ * The three keys `.env.local` must carry for the brain to be usable — for every
+ * provider, under these names, so a file written before `GANYU_BRAIN_PROVIDER`
+ * existed keeps working. The one relaxation: `ollama` needs only the model (its
+ * base URL defaults to the local server and it takes no key).
+ */
 export const REQUIRED_KEYS = Object.freeze([
   'GANYU_OPENAI_BASE_URL',
   'GANYU_OPENAI_MODEL',
@@ -275,12 +298,17 @@ export function parseEnvFile(text) {
 }
 
 /**
- * loadBrainConfig({envPath}) -> {enabled:false, reason} | {enabled:true, baseUrl, model, apiKey}
+ * loadBrainConfig({envPath}) -> {enabled:false, reason} | {enabled:true, provider, baseUrl, model, apiKey, ...}
  *
  * A missing file, an unreadable file or any missing/empty required key simply
  * means "no brain" — the pet still talks. `reason` names the missing key; it
  * never carries a value, so the whole config object is safe to log except for
  * the three fields above.
+ *
+ * `GANYU_BRAIN_PROVIDER` picks the protocol (providers.mjs). Unset means
+ * `openai`, exactly as before the key existed; a value that names no provider
+ * disables the brain rather than guessing, because a silent fall back to
+ * `openai` would send his key to a route his endpoint does not speak.
  */
 export function loadBrainConfig({ envPath } = {}) {
   if (!envPath) return { enabled: false, reason: 'no env path' };
@@ -292,15 +320,24 @@ export function loadBrainConfig({ envPath } = {}) {
   }
 
   const env = parseEnvFile(text);
-  const missing = REQUIRED_KEYS.filter((k) => !env[k]);
+  const providerName = providerNameFrom(env.GANYU_BRAIN_PROVIDER);
+  const provider = providerFrom(providerName);
+  if (!provider) return { enabled: false, reason: UNKNOWN_PROVIDER_REASON };
+  const required = REQUIRED_KEYS.filter((k) =>
+    (k !== 'GANYU_OPENAI_API_KEY' || provider.keyRequired)
+    && (k !== 'GANYU_OPENAI_BASE_URL' || !provider.defaultBaseUrl));
+  const missing = required.filter((k) => !env[k]);
   if (missing.length) return { enabled: false, reason: `missing ${missing.join(', ')}` };
 
   return {
     enabled: true,
-    baseUrl: env.GANYU_OPENAI_BASE_URL.replace(/\/+$/, ''),
+    // Absent means `openai`, so the default provider's config is exactly the
+    // object it was before the key existed.
+    ...(providerName === DEFAULT_PROVIDER ? {} : { provider: providerName }),
+    baseUrl: (env.GANYU_OPENAI_BASE_URL || provider.defaultBaseUrl).replace(/\/+$/, ''),
     model: env.GANYU_OPENAI_MODEL,
-    apiKey: env.GANYU_OPENAI_API_KEY,
-    reasoningEffort: env.GANYU_OPENAI_REASONING_EFFORT || DEFAULT_REASONING_EFFORT,
+    apiKey: env.GANYU_OPENAI_API_KEY ?? '',
+    reasoningEffort: env.GANYU_OPENAI_REASONING_EFFORT || provider.defaultEffort,
     seePrompts: seePromptsFrom(env.GANYU_SEE_PROMPTS),
     allowChatFallback: allowChatFallbackFrom(env.GANYU_ALLOW_CHAT_FALLBACK),
     memorySearch: memorySearchFrom(env.GANYU_MEMORY_SEARCH),
@@ -659,38 +696,6 @@ export function searchArgsFrom(args, now) {
   };
 }
 
-/** Every `function_call` item in a Responses body, ignoring anything malformed. */
-function functionCallsFrom(json) {
-  const out = [];
-  for (const item of Array.isArray(json?.output) ? json.output : []) {
-    if (item?.type !== 'function_call') continue;
-    const callId = typeof item.call_id === 'string' && item.call_id
-      ? item.call_id
-      : (typeof item.id === 'string' ? item.id : '');
-    const name = typeof item.name === 'string' ? item.name : '';
-    if (!callId || !name) continue;
-    out.push({ callId, name, arguments: typeof item.arguments === 'string' ? item.arguments : '{}' });
-  }
-  return out;
-}
-
-/** Responses API: the SDK shorthand, else walk the output items. */
-function textFromResponses(json) {
-  if (typeof json?.output_text === 'string') return json.output_text;
-  for (const item of Array.isArray(json?.output) ? json.output : []) {
-    if (item?.type !== 'message') continue;
-    for (const part of Array.isArray(item.content) ? item.content : []) {
-      if (part?.type === 'output_text' && typeof part.text === 'string') return part.text;
-    }
-  }
-  return '';
-}
-
-function textFromChat(json) {
-  const content = json?.choices?.[0]?.message?.content;
-  return typeof content === 'string' ? content : '';
-}
-
 /**
  * One line, at most `max` characters, word-boundary truncation. Empty -> null.
  * Defaults to the ambient cap; the chat path passes MAX_CHAT_LINE_CHARS, which
@@ -753,10 +758,16 @@ export function createBrain({
   // actually loaded, and the failure looks like "my custom pet sounds like Ganyu".
   persona = BUILTIN_PERSONA,
 } = {}) {
-  const baseUrl = String(config?.baseUrl ?? '').replace(/\/+$/, '');
+  // Unknown is null, and null is born disabled below — never a guess at openai.
+  const provider = providerFrom(config?.provider);
+  const baseUrl = String(config?.baseUrl || provider?.defaultBaseUrl || '').replace(/\/+$/, '');
   const model = String(config?.model ?? '');
   const apiKey = String(config?.apiKey ?? '');
-  const effort = String(config?.reasoningEffort ?? DEFAULT_REASONING_EFFORT).trim().toLowerCase();
+  // Each provider's own default: `low` for Responses, as measured; nothing at
+  // all for the rest, which reach servers that do not all take the field.
+  const rawEffort = String(config?.reasoningEffort ?? provider?.defaultEffort ?? DEFAULT_REASONING_EFFORT)
+    .trim().toLowerCase();
+  const effort = NO_REASONING.has(rawEffort) ? null : rawEffort;
   // Absent means on: a brain constructed from a hand-built config in a test, or
   // from a `.env.local` written before the key existed, behaves as he asked.
   const seePrompts = config?.seePrompts !== false;
@@ -797,8 +808,8 @@ export function createBrain({
 
   // A brain with nothing to call is born disabled rather than special-cased at
   // every call site: speech treats "returns null forever" identically to absent.
-  let disabled =
-    !config?.enabled || !baseUrl || !model || !apiKey || typeof fetchImpl !== 'function';
+  let disabled = !config?.enabled || !provider || !baseUrl || !model
+    || (provider.keyRequired && !apiKey) || typeof fetchImpl !== 'function';
   let route = null; // the route that last answered, remembered for the process
   /**
    * Single-flight **per kind**, not one latch for the brain.
@@ -842,31 +853,6 @@ export function createBrain({
     say(level, message);
   };
 
-  function bodyFor(kind, instructions, input, limits, tools = null) {
-    if (kind === 'responses') {
-      return {
-        model,
-        instructions,
-        input,
-        max_output_tokens: limits.maxTokens,
-        store: false,
-        // Chat completions has no such parameter, so this stays on this branch.
-        ...(NO_REASONING.has(effort) ? {} : { reasoning: { effort } }),
-        // Nor does it take this shape of tool — and it is a degraded route we
-        // reach only by explicit opt-in, so it does not get them at all.
-        ...(tools?.length ? { tools } : {}),
-      };
-    }
-    return {
-      model,
-      messages: [
-        { role: 'system', content: instructions },
-        { role: 'user', content: input },
-      ],
-      max_tokens: limits.maxTokens,
-    };
-  }
-
   /**
    * One HTTP attempt. Verdict flags rather than exceptions, so the caller can
    * tell "wrong route" from "wrong key" from "just didn't work this time":
@@ -877,19 +863,17 @@ export function createBrain({
    *                             empty and null in the interesting case)
    *   {}              anything else, including a timeout
    */
-  async function attempt(kind, instructions, input, limits, tools = null) {
+  async function attempt(kind, request, limits) {
+    const wire = WIRES[kind];
     const controller = new AbortController();
     // The deadline rides on `limits` beside the token cap, because it is the
     // same kind of fact: how much room this particular path is allowed.
     const timer = setTimeout(() => controller.abort(), limits?.timeoutMs ?? timeoutMs);
     try {
-      const res = await fetchImpl(`${baseUrl}${ROUTES[kind]}`, {
+      const res = await fetchImpl(`${baseUrl}${wire.path}`, {
         method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify(bodyFor(kind, instructions, input, limits, tools)),
+        headers: wire.headers(apiKey),
+        body: JSON.stringify(wire.body({ model, maxTokens: limits.maxTokens, ...request })),
         signal: controller.signal,
       });
       const status = Number(res?.status);
@@ -898,11 +882,11 @@ export function createBrain({
       if (status === 401 || status === 403) return { fatal: true };
       if (status < 200 || status >= 300) return {};
       const json = await res.json();
-      const raw = kind === 'responses' ? textFromResponses(json) : textFromChat(json);
       return {
         ok: true,
-        text: postProcess(raw, limits.maxChars),
-        calls: kind === 'responses' ? functionCallsFrom(json) : [],
+        text: postProcess(wire.text(json), limits.maxChars),
+        calls: wire.calls(json),
+        echo: wire.echo(json),
       };
     } catch (err) {
       // Name only: a fetch error's message contains the endpoint URL.
@@ -964,15 +948,18 @@ export function createBrain({
    * deploy, and the next request should find it back. The warning is what stops
    * that costing a log line every ten seconds.
    */
-  async function exchange(instructions, input, limits, { tools = null } = {}) {
-    const order = route ? [route, ...ROUTE_ORDER.filter((r) => r !== route)] : ROUTE_ORDER;
+  async function exchange(instructions, input, limits, { tools = null, rounds = [] } = {}) {
+    const routes = provider?.routes ?? [];
+    const order = route ? [route, ...routes.filter((r) => r !== route)] : routes;
     for (const kind of order) {
-      if (kind === 'chat') {
-        // A tool-loop input is an array of Responses items, and chat completions
-        // has no shape to send it in. Nothing to fall back *to*, so this is an
-        // ordinary null and the canned line — which is what the whole tool path
-        // promises anyway. Only reachable if /v1/responses disappears mid-loop.
-        if (typeof input !== 'string') return null;
+      const gated = kind === provider.gatedRoute;
+      if (gated) {
+        // A follow-up carries a tool exchange, and the degraded fallback is sent
+        // the old no-tools body with nowhere to put one. Nothing to fall back
+        // *to*, so this is an ordinary null and the canned line — which is what
+        // the whole tool path promises anyway. Only reachable if /v1/responses
+        // disappears mid-loop.
+        if (rounds.length) return null;
         if (!allowChatFallback) {
           sayOnce('warn', 'chat-declined', CHAT_FALLBACK_DECLINED);
           return null;
@@ -981,7 +968,15 @@ export function createBrain({
         // way out, so a 500 from this route has already cost what it costs.
         sayOnce('warn', 'chat-in-use', CHAT_FALLBACK_IN_USE);
       }
-      const verdict = await attempt(kind, instructions, input, limits, kind === 'responses' ? tools : null);
+      // The gated fallback keeps its original body exactly: no tools and no
+      // reasoning field. A primary route gets both.
+      const verdict = await attempt(kind, {
+        instructions,
+        input,
+        rounds,
+        tools: gated ? null : tools,
+        effort: gated ? null : effort,
+      }, limits);
       if (verdict.absent) continue;
       if (verdict.fatal) {
         disabled = true;
@@ -990,7 +985,10 @@ export function createBrain({
       }
       if (!verdict.ok) return null;
       route = kind;
-      return { text: verdict.text ?? null, calls: verdict.calls ?? [] };
+      // A route that was offered no tools yields no calls, whatever its reply
+      // claims — a proxy that injects its own tools can still answer with one.
+      if (gated) return { text: verdict.text ?? null, calls: [], echo: null };
+      return { text: verdict.text ?? null, calls: verdict.calls ?? [], echo: verdict.echo ?? null };
     }
     return null;
   }
@@ -1149,35 +1147,25 @@ export function createBrain({
       });
       if (!chatTools) return await textOf(persona.chatInstructions, input, chatLimits);
 
-      // `items` stays null until a tool result forces the array form, so the
-      // first request carries the plain string exactly as it always has — which
-      // is also what keeps the 404 fallback to chat completions reachable.
-      let items = null;
+      // `rounds` stays empty until a tool result has to go back, so the first
+      // request is the plain message exactly as it always was — which is also
+      // what keeps the 404 fallback to chat completions reachable. Each adapter
+      // lays the rounds out in its own protocol's shape; this loop never sees one.
+      const rounds = [];
       let carried = null;
       for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
-        const out = await exchange(persona.chatInstructions, items ?? input, chatLimits, { tools: chatTools });
+        const out = await exchange(persona.chatInstructions, input, chatLimits, { tools: chatTools, rounds });
         if (!out) return carried; // transport gave up; whatever we already had
         if (out.text) carried = out.text;
         if (out.calls.length === 0) return out.text ?? carried;
         if (round === MAX_TOOL_ROUNDS - 1) break;
 
-        // Echo the call back beside its result: `store: false` means the
-        // endpoint keeps nothing between requests, so the second one has to
-        // carry the whole exchange itself.
-        items = items ? [...items] : [{ role: 'user', content: input }];
-        for (const call of out.calls) {
-          items.push({
-            type: 'function_call',
-            call_id: call.callId,
-            name: call.name,
-            arguments: call.arguments,
-          });
-          items.push({
-            type: 'function_call_output',
-            call_id: call.callId,
-            output: await runToolCall(call),
-          });
-        }
+        // Every call is run, in order, and answered by its own id. None of the
+        // protocols keeps state between requests here (`store: false` on
+        // Responses), so the next one carries the whole exchange itself.
+        const outputs = [];
+        for (const call of out.calls) outputs.push(await runToolCall(call));
+        rounds.push({ calls: out.calls, outputs, echo: out.echo });
       }
       return carried;
     } catch {
@@ -1201,6 +1189,7 @@ export function createBrain({
     stats() {
       return {
         enabled: !disabled,
+        provider: provider ? providerNameFrom(config?.provider) : null,
         route,
         inFlight: inFlight.ambient || inFlight.chat,
         pending: { ...inFlight },

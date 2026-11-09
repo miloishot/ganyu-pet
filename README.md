@@ -73,9 +73,49 @@ npm start
 
 That runs it with no brain — it animates, reacts and wanders, and nothing leaves your machine.
 
-**To let it speak**, copy `.env.local.example` to `.env.local` and add an OpenAI-compatible
-endpoint and key. The file documents every switch, including the three that govern what it is
-allowed to see. All three default **on**, and all three only matter once a key is set.
+**To let it speak**, copy `.env.local.example` to `.env.local` and point it at an endpoint.
+The file documents every switch, including the three that govern what it is allowed to see.
+All three default **on**, and all three only matter once a brain is configured.
+
+`GANYU_BRAIN_PROVIDER` picks the protocol; the same three keys carry the base URL (without
+`/v1`), the model and the key for every one of them. Pick one block:
+
+```ini
+# OpenAI Responses API — the default; leaving GANYU_BRAIN_PROVIDER out means this
+GANYU_BRAIN_PROVIDER=openai
+GANYU_OPENAI_BASE_URL=https://api.openai.com
+GANYU_OPENAI_MODEL=<model-id>
+GANYU_OPENAI_API_KEY=<your-key>
+```
+
+```ini
+# Any chat-completions server: OpenRouter (https://openrouter.ai/api),
+# DeepSeek (https://api.deepseek.com), LM Studio (http://localhost:1234), ...
+GANYU_BRAIN_PROVIDER=openai-chat
+GANYU_OPENAI_BASE_URL=https://openrouter.ai/api
+GANYU_OPENAI_MODEL=<model-id>
+GANYU_OPENAI_API_KEY=<your-key>
+```
+
+```ini
+# Anthropic Messages API
+GANYU_BRAIN_PROVIDER=anthropic
+GANYU_OPENAI_BASE_URL=https://api.anthropic.com
+GANYU_OPENAI_MODEL=<model-id>
+GANYU_OPENAI_API_KEY=<your-key>
+```
+
+```ini
+# Ollama on this machine: no key, and the base URL defaults to http://127.0.0.1:11434
+GANYU_BRAIN_PROVIDER=ollama
+GANYU_OPENAI_MODEL=<a model from `ollama list`>
+```
+
+The route is appended to the base URL as `/v1/...`, so a server must answer at
+`<base>/v1/chat/completions` (or `/v1/messages`, `/v1/responses`). One that serves its
+compatible API somewhere else, such as Gemini's `/v1beta/openai/`, is not reachable this way.
+An unknown provider name turns the brain off and says which names are valid. The wire
+details of each protocol are in `contracts.md` under §Brain → Providers.
 
 **To wire up the hooks**, the installer is append-only — it never removes, reorders or rewrites
 existing entries, and it backs up before writing:
