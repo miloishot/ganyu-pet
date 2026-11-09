@@ -985,6 +985,9 @@ export function createBrain({
       }
       if (!verdict.ok) return null;
       route = kind;
+      // A route that was offered no tools yields no calls, whatever its reply
+      // claims — a proxy that injects its own tools can still answer with one.
+      if (gated) return { text: verdict.text ?? null, calls: [], echo: null };
       return { text: verdict.text ?? null, calls: verdict.calls ?? [], echo: verdict.echo ?? null };
     }
     return null;

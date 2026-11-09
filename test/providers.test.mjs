@@ -78,10 +78,13 @@ const hangingFetch = (url, init) => new Promise((_, reject) => {
 // ---------------------------------------------------------------------------
 // 1. The default provider is byte-identical to before
 //
-// These bodies were captured from brain.mjs at c325fb9, before providers.mjs
-// existed, with exactly the inputs below. The tool array is the exported,
-// unchanged pair of schemas; everything else is literal, and the sha256 binds
-// each string to that capture.
+// These bodies were captured by running brain.mjs at c325fb9, before
+// providers.mjs existed, with exactly the inputs below (a scratch script, then
+// pasted here as literals). The tool array is the exported, unchanged pair of
+// schemas; everything else is literal. The sha256 recorded at capture time only
+// guards the literal against later edits — it cannot itself prove where the
+// literal came from; the commit history (literals added in the same PR as the
+// refactor, from a pre-refactor capture) is the provenance.
 // ---------------------------------------------------------------------------
 
 const TOOLS = JSON.stringify([MEMORY_SEARCH_TOOL, READ_SESSION_TOOL]);
@@ -101,7 +104,7 @@ const responsesText = (text) => reply(200, { output: [{ type: 'message', content
 
 function assertSnapshot(call, name) {
   const want = SNAPSHOT[name];
-  assert.equal(crypto.createHash('sha256').update(want.body).digest('hex'), want.sha256, `${name}: the literal is the capture`);
+  assert.equal(crypto.createHash('sha256').update(want.body).digest('hex'), want.sha256, `${name}: the literal was edited after capture`);
   assert.equal(call.url, want.url, `${name}: url`);
   assert.deepEqual(call.headers, SNAPSHOT_HEADERS, `${name}: headers`);
   assert.equal(call.raw, want.body, `${name}: body is byte-identical`);
@@ -144,6 +147,28 @@ test('default provider: ambient, chat, tool follow-up and the gated fallback are
     assert.equal(await brain.requestChat({ text: 'what broke yesterday?', history: [] }), 'Hm.');
     assertSnapshot(f.calls[1], 'fallbackChat');
   }
+});
+
+test('default provider: the gated fallback acts on no tool call, even if the reply carries one', async () => {
+  const f = scriptedFetch(
+    reply(404, {}),
+    reply(200, {
+      choices: [{
+        message: {
+          content: 'Hm.',
+          tool_calls: [{ id: 'call_X', type: 'function', function: { name: 'search_memory', arguments: '{}' } }],
+        },
+      }],
+    }),
+  );
+  let searched = 0;
+  const brain = createBrain({
+    config: { ...SNAPSHOT_CONFIG, allowChatFallback: true }, fetchImpl: f, now: FIXED_NOW, persona: PERSONA,
+    searchMemory: () => { searched += 1; return [row]; }, readSession: () => digest,
+  });
+  assert.equal(await brain.requestChat({ text: 'what broke?' }), 'Hm.');
+  assert.equal(f.calls.length, 2, 'no follow-up request');
+  assert.equal(searched, 0, 'a tool it was never offered is never run');
 });
 
 test('an explicit GANYU_BRAIN_PROVIDER=openai is the same provider as leaving it unset', async () => {
