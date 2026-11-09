@@ -58,11 +58,16 @@ export const GanyuPlugin = async (ctx) => {
   // Subagent sessions (info.parentID set) report under their parent, so a
   // finishing subagent reads as SubagentStop (still busy), not as a Stop.
   const parentOf = new Map();
+  // A finished tool part can be re-published (metadata edits); report it once,
+  // or a late repeat after session.idle turns a finished session back to busy.
+  const finishedCalls = new Set();
 
   function send(event, sessionID, extra = {}) {
     const raw = token(sessionID);
     if (!raw) return;
     const parent = parentOf.get(raw);
+    // A subagent's end must not end its root session.
+    if (parent && event === 'SessionEnd') return;
     const name = parent && event === 'Stop' ? 'SubagentStop'
       : parent && event === 'SessionStart' ? 'SubagentStart'
         : event;
@@ -126,6 +131,12 @@ export const GanyuPlugin = async (ctx) => {
         const part = p.part;
         const status = part?.state?.status;
         if (part?.type === 'tool' && (status === 'completed' || status === 'error')) {
+          const call = token(part.callID);
+          if (call) {
+            if (finishedCalls.has(call)) break;
+            if (finishedCalls.size >= MAX_CHILDREN) finishedCalls.delete(finishedCalls.values().next().value);
+            finishedCalls.add(call);
+          }
           send('PostToolUse', p.sessionID ?? part.sessionID, { tool: part.tool });
         }
         break;

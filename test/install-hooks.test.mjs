@@ -377,7 +377,7 @@ test('parseArgs defaults to dry run and both targets', () => {
 // ---------------------------------------------------------------------------
 
 const OC_FIXTURES = path.join(FIXTURES, 'opencode');
-const REAL_OPENCODE = defaultOpencodeDir({});
+const REAL_OPENCODE = defaultOpencodeDir(process.env);
 const listTree = (dir) => (fs.existsSync(dir)
   ? fs.readdirSync(dir, { recursive: true }).map(String).sort()
   : null);

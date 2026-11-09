@@ -122,11 +122,22 @@ test('a subagent session reports under its parent and never celebrates', async (
   hooks.event(ev('session.created', { sessionID: 'child', info: { id: 'child', parentID: 'root' } }));
   hooks['tool.execute.before']({ tool: 'read', sessionID: 'child', callID: 'c1' });
   hooks.event(ev('session.idle', { sessionID: 'child' }));
+  hooks.event(ev('session.deleted', { sessionID: 'child', info: { id: 'child', parentID: 'root' } }));
   assert.deepEqual(calls.map((c) => [c.body.hook_event_name, c.body.session_id]), [
     ['SubagentStart', 'root'],
     ['PreToolUse', 'root'],
     ['SubagentStop', 'root'],
   ]);
+});
+
+test('a finished tool part re-published later posts only once', async (t) => {
+  const calls = fakeFetch(t);
+  const hooks = await load();
+  const done = ev('message.part.updated', { sessionID: 's1', part: { type: 'tool', tool: 'bash', callID: 'c9', state: { status: 'completed' } } });
+  hooks.event(done);
+  hooks.event(ev('session.idle', { sessionID: 's1' }));
+  hooks.event(done);
+  assert.deepEqual(calls.map((c) => c.body.hook_event_name), ['PostToolUse', 'Stop']);
 });
 
 test('privacy: message text, tool args and tool output never reach the body', async (t) => {
