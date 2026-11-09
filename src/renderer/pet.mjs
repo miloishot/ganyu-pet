@@ -8,6 +8,7 @@
 // plain node (no Electron, no DOM) for unit checks.
 
 import { createBubbles, BUBBLE_PRIORITY } from './bubbles.mjs';
+import { createCallAudio, callFailedLine, probeCallSink } from './callaudio.mjs';
 
 // ---------------------------------------------------------------------------
 // Sheet geometry and row semantics
@@ -365,10 +366,13 @@ export function clampMenu({ x, y, menuW, menuH, viewW, viewH, margin = MENU_MARG
   };
 }
 
-export function menuLabels({ muted = false, pinned = false } = {}) {
+export function menuLabels({ muted = false, pinned = false, callMode = false } = {}) {
   return {
     'toggle-mute': muted ? 'Unmute' : 'Mute',
     'toggle-pin': pinned ? 'Unpin' : 'Pin',
+    // Call mode: her voice also goes to the device named by GANYU_CALL_DEVICE
+    // (see callaudio.mjs). Computed from the live flag, like every label here.
+    'toggle-call': callMode ? 'Stop talking in calls' : 'Talk in calls',
     // The recall action. Phrased as the owner asking rather than as a command to
     // a window manager — every other label here is a switch, this one is a
     // request to a person. An action with no label renders a blank button, so
@@ -394,6 +398,16 @@ export const CHAT_FAILED_LINE = 'Forgive me — my thoughts went quiet just then
  */
 export const AUDIO_MIMES = Object.freeze(['audio/mpeg', 'audio/wav']);
 
+/** Main's `call` block from getFlags, normalised. Missing means call mode has no device. */
+export function readCallConfig(call) {
+  const c = call && typeof call === 'object' ? call : {};
+  return {
+    device: typeof c.device === 'string' ? c.device.trim() : '',
+    mixMic: c.mixMic === true,
+    mic: typeof c.mic === 'string' ? c.mic.trim() : '',
+  };
+}
+
 /**
  * Her voice, played through one `<audio>` element.
  *
@@ -410,8 +424,12 @@ export const AUDIO_MIMES = Object.freeze(['audio/mpeg', 'audio/wav']);
  *
  * `el` may be null — an overlay with no audio element is a silent pet, not a
  * broken one.
+ *
+ * `mirror(payload)` is called with the same clip once local playback has
+ * started — this is how call mode hears her. It runs *after* every gate that
+ * decided she speaks at all, so it can never say anything the room did not hear.
  */
-export function createVoicePlayer({ el } = {}) {
+export function createVoicePlayer({ el, mirror = null } = {}) {
   let playing = false;
 
   function stop() {
@@ -444,10 +462,17 @@ export function createVoicePlayer({ el } = {}) {
         // unhandled rejection in a window with no console open.
         if (started && typeof started.catch === 'function') started.catch(() => {});
         playing = true;
-        return true;
       } catch {
         return false;
       }
+      if (typeof mirror === 'function') {
+        try {
+          mirror(payload);
+        } catch {
+          /* the call is a second listener; it never costs the first one */
+        }
+      }
+      return true;
     },
     stop,
     get playing() {
@@ -492,7 +517,33 @@ export async function boot({
   const voiceEl = doc.getElementById('voice');
 
   const bubbles = createBubbles({ el: bubbleEl });
-  const voice = createVoicePlayer({ el: voiceEl });
+  // Call mode. Declared before the speech feeds below subscribe, because a clip
+  // can arrive before `await getFlags()` returns and the mirror reads these.
+  // `callMuted` shadows `muted` for that same reason.
+  let callMode = false;
+  let callMuted = false;
+  let callConfig = { device: '', mixMic: false, mic: '' };
+  const callAudio = createCallAudio({
+    mediaDevices: (win && win.navigator && win.navigator.mediaDevices) || null,
+    createAudio: win && typeof win.Audio === 'function' ? () => new win.Audio() : null,
+    createAudioContext: win && typeof win.AudioContext === 'function' ? () => new win.AudioContext() : null,
+    // Quiet and local: call mode turns itself off, she says one canned line
+    // naming the device, and the room keeps hearing her exactly as before.
+    onFail: ({ device }) => {
+      if (!callMode) return;
+      callMode = false;
+      // Only ever reached after start(), which only runs once the menu exists.
+      paintMenu();
+      ganyu.menuAction('toggle-call');
+      bubbles.show(callFailedLine(device), { priority: BUBBLE_PRIORITY.chat });
+    },
+  });
+  const voice = createVoicePlayer({
+    el: voiceEl,
+    mirror: (payload) => {
+      if (callMode && !callMuted) callAudio.play(payload);
+    },
+  });
   const animator = createAnimator({ now });
   const interactivity = createInteractivity({
     setInteractive: (v) => ganyu.setInteractive(v),
@@ -618,13 +669,33 @@ export async function boot({
   }
   let muted = Boolean(flags.muted);
   let pinned = Boolean(flags.pinned);
+  callMuted = muted;
+  callConfig = readCallConfig(flags.call);
+
+  /** Bring the call output in line with the flag. The mic opens only in here. */
+  function syncCall() {
+    if (callMode && !callAudio.active) callAudio.start(callConfig);
+    else if (!callMode && callAudio.active) callAudio.stop();
+  }
+  // A reloaded renderer under a main that still has call mode on picks it up.
+  callMode = Boolean(flags.callMode);
+  syncCall();
+  // `npm run smoke` with GANYU_SMOKE_CALL set: perform the real setSinkId on
+  // the real device and say what happened. Main relays the console line.
+  if (typeof flags.smokeCall === 'string' && flags.smokeCall !== '') {
+    probeCallSink({
+      device: flags.smokeCall,
+      mediaDevices: (win && win.navigator && win.navigator.mediaDevices) || null,
+      createAudio: win && typeof win.Audio === 'function' ? () => new win.Audio() : null,
+    }).then((line) => console.log(line));
+  }
 
   // ---- menu ----------------------------------------------------------------
 
   const menuButtons = Array.from(menuEl.querySelectorAll('[data-action]'));
 
   function paintMenu() {
-    const labels = menuLabels({ muted, pinned });
+    const labels = menuLabels({ muted, pinned, callMode });
     for (const btn of menuButtons) {
       const label = labels[btn.dataset.action];
       if (label) btn.textContent = label;
@@ -678,6 +749,9 @@ export async function boot({
       const fresh = (await ganyu.getFlags()) || {};
       muted = Boolean(fresh.muted);
       pinned = Boolean(fresh.pinned);
+      callMuted = muted;
+      callMode = Boolean(fresh.callMode);
+      syncCall();
     } catch {
       /* keep the mirrored values */
     }
@@ -885,12 +959,23 @@ export async function boot({
     const btn = ev.target && ev.target.closest ? ev.target.closest('[data-action]') : null;
     if (!btn) return;
     const action = btn.dataset.action;
-    if (action === 'toggle-mute') muted = !muted;
+    if (action === 'toggle-mute') {
+      muted = !muted;
+      callMuted = muted;
+      // A muted pet is silent in the call too, including the line mid-sentence.
+      if (muted) callAudio.silence();
+    }
     if (action === 'toggle-pin') pinned = !pinned;
+    if (action === 'toggle-call') callMode = !callMode;
+    // Before main is told, so the mic is closed before the app starts to go.
+    if (action === 'quit') callAudio.stop();
     paintMenu();
     closeMenu();
     ganyu.menuAction(action);
+    if (action === 'toggle-call') syncCall();
   });
+  // Quit, reload, a closed window: whichever way the page goes, the mic goes first.
+  on(win, 'pagehide', () => callAudio.stop());
 
   on(doc, 'mousedown', (ev) => {
     const target = ev && ev.target;
@@ -968,7 +1053,8 @@ export async function boot({
     chat: { open: openChat, close: closeChat, submit: submitChat, get isOpen() { return chatIsOpen(); } },
     menu: { close: closeMenu, guard: guardMenuReachable, get isOpen() { return menuEl.hidden !== true; } },
     drag: { get pressing() { return pressing; }, get dragging() { return dragging; } },
-    flags: { get muted() { return muted; }, get pinned() { return pinned; }, spritePath },
+    flags: { get muted() { return muted; }, get pinned() { return pinned; }, get callMode() { return callMode; }, spritePath },
+    call: callAudio,
     dispose() {
       running = false;
       if (handle !== null && cancelRaf) cancelRaf(handle);
@@ -977,6 +1063,7 @@ export async function boot({
       for (const undo of off.splice(0)) undo();
       bubbles.hide();
       voice.stop(); // a bubble torn down while she is still speaking is a ghost
+      callAudio.stop(); // and the mic, if mix mode had it, is closed with her
       // Closes the menu, which is also what tells main to give Escape back to
       // the rest of the machine. A teardown that skipped it would leave a global
       // Escape hook installed with nothing left alive to release it.

@@ -628,16 +628,21 @@ test('menu labels reflect the current flags', () => {
   assert.deepEqual(menuLabels({ muted: false, pinned: false }), {
     'toggle-mute': 'Mute',
     'toggle-pin': 'Pin',
+    'toggle-call': 'Talk in calls',
     home: 'Come here',
     quit: 'Quit',
   });
   assert.deepEqual(menuLabels({ muted: true, pinned: true }), {
     'toggle-mute': 'Unmute',
     'toggle-pin': 'Unpin',
+    'toggle-call': 'Talk in calls',
     home: 'Come here',
     quit: 'Quit',
   });
   assert.equal(menuLabels()['toggle-mute'], 'Mute');
+  // Computed from the live flag, never stored as text.
+  assert.equal(menuLabels({ callMode: true })['toggle-call'], 'Stop talking in calls');
+  assert.equal(menuLabels({ callMode: false })['toggle-call'], 'Talk in calls');
 });
 
 test('every MENU_ACTIONS entry has a label, or its button renders blank', () => {
@@ -646,7 +651,7 @@ test('every MENU_ACTIONS entry has a label, or its button renders blank', () => 
   // paintMenu only writes a label it finds, so a missing one is a blank button
   // rather than a crash — which is exactly why it went unnoticed.
   const labels = menuLabels();
-  for (const action of ['toggle-mute', 'toggle-pin', 'home', 'quit']) {
+  for (const action of ['toggle-mute', 'toggle-pin', 'toggle-call', 'home', 'quit']) {
     assert.equal(typeof labels[action], 'string', `${action} has a label`);
     assert.ok(labels[action].trim() !== '', `${action}'s label is not blank`);
   }
@@ -807,8 +812,10 @@ test('the fade timer clears the pending class along with the text', () => {
 async function bootHarness({
   flags = { muted: false, pinned: false, spritePath: 'file:///sheet.webp' },
   reply = 'Of course.',
+  setup = null,
 } = {}) {
   const dom = makeDom();
+  if (setup) setup(dom);
   let resolveFlags;
   const pending = new Promise((r) => {
     resolveFlags = r;
@@ -2170,4 +2177,201 @@ test('the Come here button is wired to the recall action', async () => {
   assert.deepEqual(h.g.calls.menuAction, ['home'], 'the action main has been filtering for all along');
   assert.equal(menu.hidden, true, 'and it closes behind itself like every other entry');
   app.dispose();
+});
+
+// ------------------------------------------------------------------ call mode
+//
+// The renderer half of call mode: the toggle, and the rule that the call hears
+// exactly what the room hears — after every gate, never around one.
+
+function makeCallMedia({ devices } = {}) {
+  const kit = { gum: [], tracks: [], els: [], listeners: new Set() };
+  kit.devices = devices || [
+    { kind: 'audiooutput', deviceId: 'default', label: 'Speakers' },
+    { kind: 'audiooutput', deviceId: 'vm-aux', label: 'Voicemeeter AUX Input (VB-Audio)' },
+  ];
+  kit.mediaDevices = {
+    enumerateDevices: async () => kit.devices.slice(),
+    getUserMedia: async (c) => {
+      kit.gum.push(c);
+      const t = { stopped: false, stop() { t.stopped = true; } };
+      kit.tracks.push(t);
+      return { getTracks: () => [t] };
+    },
+    addEventListener: (type, fn) => kit.listeners.add(fn),
+    removeEventListener: (type, fn) => kit.listeners.delete(fn),
+  };
+  kit.Audio = function FakeCallAudio() {
+    const el = {
+      sinkId: '', src: '', srcObject: null, played: [], paused: 0,
+      async setSinkId(id) { el.sinkId = id; },
+      play() { el.played.push(el.src); return Promise.resolve(); },
+      pause() { el.paused += 1; },
+      load() {},
+      removeAttribute() { el.src = ''; },
+    };
+    kit.els.push(el);
+    return el;
+  };
+  kit.AudioContext = function FakeCtx() {
+    return {
+      close: () => Promise.resolve(),
+      createMediaStreamDestination: () => ({ stream: {} }),
+      createMediaStreamSource: () => ({ connect() {} }),
+      decodeAudioData: async () => ({}),
+      createBufferSource: () => ({ connect() {}, start() {}, stop() {} }),
+    };
+  };
+  kit.setup = (dom) => {
+    dom.win.navigator = { mediaDevices: kit.mediaDevices };
+    dom.win.Audio = kit.Audio;
+    dom.win.AudioContext = kit.AudioContext;
+    // Same place as index.html: after Pin.
+    dom.menu.children.splice(2, 0, makeButton('toggle-call'));
+  };
+  return kit;
+}
+
+const CALL_FLAGS = {
+  muted: false,
+  pinned: false,
+  callMode: false,
+  call: { device: 'voicemeeter aux input', mixMic: false, mic: '' },
+  spritePath: 'file:///sheet.webp',
+};
+
+async function callHarness({ flags = CALL_FLAGS, devices, reply } = {}) {
+  const kit = makeCallMedia({ devices });
+  const h = await bootHarness({ flags, reply, setup: kit.setup });
+  await flush();
+  h.resolveFlags();
+  const app = await h.booting;
+  // Main's half: it owns the flags, flips them on each action, and is what the
+  // menu re-reads on every open — as index.mjs does.
+  const main = { ...flags };
+  const sendAction = h.g.api.menuAction;
+  h.g.api.menuAction = (a) => {
+    if (a === 'toggle-mute') main.muted = !main.muted;
+    if (a === 'toggle-call') main.callMode = !main.callMode;
+    sendAction(a);
+  };
+  h.g.api.getFlags = () => Promise.resolve({ ...main });
+  const button = (action) => h.dom.menu.children.find((b) => b.dataset.action === action);
+  const click = async (btn) => {
+    h.dom.canvas.dispatch('contextmenu', { clientX: 10, clientY: 10 });
+    await flush();
+    h.dom.menu.dispatch('click', { target: btn });
+    await flush();
+  };
+  return { h, app, kit, callBtn: button('toggle-call'), button, click };
+}
+
+test('call toggle: label flips from live state, main is told, the sink is routed', async () => {
+  const { h, app, kit, callBtn, click } = await callHarness();
+  assert.equal(callBtn.textContent, 'Talk in calls');
+  await click(callBtn);
+  assert.deepEqual(h.g.calls.menuAction, ['toggle-call']);
+  assert.equal(app.flags.callMode, true);
+  assert.equal(callBtn.textContent, 'Stop talking in calls');
+  assert.equal(app.call.active, true);
+  assert.equal(kit.els[0].sinkId, 'vm-aux');
+  assert.equal(kit.gum.length, 0, 'route mode never opens the mic');
+
+  await click(callBtn);
+  assert.deepEqual(h.g.calls.menuAction, ['toggle-call', 'toggle-call']);
+  assert.equal(app.call.active, false);
+  assert.equal(callBtn.textContent, 'Talk in calls');
+  app.dispose();
+});
+
+test('call mode: an accepted line plays locally AND into the call; a refused one in neither', async () => {
+  const { h, app, kit, callBtn, click } = await callHarness({ reply: 'The tests pass.' });
+  await click(callBtn);
+
+  h.g.speakCb({ text: 'The build is clean.', audio: MP3 });
+  assert.deepEqual(h.dom.voice.played, ['data:audio/mpeg;base64,QUJD'], 'the room still hears her');
+  assert.deepEqual(kit.els[0].played, ['data:audio/mpeg;base64,QUJD'], 'and so does the call');
+
+  h.g.audioCb(MP3);
+  assert.equal(kit.els[0].played.length, 2, 'late audio reaches the call too');
+
+  // A reply holds the bubble; an ambient line behind it is refused.
+  h.dom.canvas.dispatch('click', {});
+  h.dom.chatInput.value = 'how did it go?';
+  h.dom.chatInput.dispatch('keydown', { key: 'Enter' });
+  await flush();
+  assert.equal(h.dom.bubble.textContent, 'The tests pass.');
+  const local = h.dom.voice.played.length;
+  const inCall = kit.els[0].played.length;
+  h.g.speakCb({ text: 'Edit finished.', audio: MP3 });
+  assert.equal(h.dom.voice.played.length, local);
+  assert.equal(kit.els[0].played.length, inCall, 'a line the bubble refused is not heard in the call either');
+  app.dispose();
+});
+
+test('a muted pet sends nothing into the call, and muting silences the call mid-line', async () => {
+  const { h, app, kit, callBtn, button, click } = await callHarness({ flags: { ...CALL_FLAGS, muted: true } });
+  await click(callBtn);
+  h.g.audioCb(MP3);
+  assert.deepEqual(kit.els[0].played, [], 'muted: nothing to the call');
+
+  await click(button('toggle-mute')); // unmute
+  h.g.audioCb(MP3);
+  assert.equal(kit.els[0].played.length, 1);
+  const paused = kit.els[0].paused;
+  await click(button('toggle-mute')); // mute again, mid-line
+  assert.ok(kit.els[0].paused > paused, 'the line in progress is stopped in the call');
+  assert.equal(app.call.active, true, 'mute silences her; it does not leave the call');
+  h.g.audioCb(MP3);
+  assert.equal(kit.els[0].played.length, 1, 'and nothing new reaches it');
+  app.dispose();
+});
+
+test('device not found: call mode turns itself off with one canned line, local audio untouched', async () => {
+  const { h, app, kit, callBtn, click } = await callHarness({
+    devices: [{ kind: 'audiooutput', deviceId: 'default', label: 'Speakers' }],
+  });
+  await click(callBtn);
+  await flush();
+  assert.equal(app.flags.callMode, false);
+  assert.deepEqual(h.g.calls.menuAction, ['toggle-call', 'toggle-call'], 'main is told it is off again');
+  assert.equal(callBtn.textContent, 'Talk in calls');
+  assert.match(h.dom.bubble.textContent, /voicemeeter aux input/);
+  assert.equal(kit.els.length, 0);
+
+  h.g.audioCb(MP3);
+  assert.deepEqual(h.dom.voice.played, ['data:audio/mpeg;base64,QUJD'], 'she is still heard in the room');
+  app.dispose();
+});
+
+test('mix mode: the mic is open only while call mode is on, and quit closes it first', async () => {
+  const { h, app, kit, callBtn, button, click } = await callHarness({
+    flags: { ...CALL_FLAGS, call: { device: 'Voicemeeter AUX', mixMic: true, mic: '' } },
+  });
+  assert.equal(kit.gum.length, 0, 'not at boot');
+  await click(callBtn);
+  await flush();
+  assert.equal(kit.gum.length, 1);
+  assert.equal(kit.gum[0].video, false);
+  await click(callBtn);
+  assert.ok(kit.tracks.every((t) => t.stopped), 'toggle-off stops the tracks');
+
+  await click(callBtn);
+  await flush();
+  assert.equal(kit.tracks.length, 2);
+  await click(button('quit'));
+  assert.ok(kit.tracks.every((t) => t.stopped), 'quit stops the tracks');
+  assert.equal(h.g.calls.menuAction.at(-1), 'quit');
+  app.dispose();
+});
+
+test('a reloaded renderer picks up live call mode; dispose closes the mic', async () => {
+  const { app, kit } = await callHarness({
+    flags: { ...CALL_FLAGS, callMode: true, call: { device: 'Voicemeeter AUX', mixMic: true, mic: '' } },
+  });
+  await flush();
+  assert.equal(app.call.active, true);
+  app.dispose();
+  assert.ok(kit.tracks.length === 1 && kit.tracks[0].stopped);
+  assert.equal(app.call.active, false);
 });

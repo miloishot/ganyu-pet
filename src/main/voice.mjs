@@ -186,6 +186,38 @@ export function loadVoiceConfig({ envPath = null, fs = null, pet = null } = {}) 
   };
 }
 
+/**
+ * `loadCallConfig({envPath, fs})` -> `{device, mixMic, mic}` — call mode's keys.
+ *
+ * Read from the same `.env.local` with the same parse rules as
+ * `loadVoiceConfig` above, and kept beside it rather than inside it so the
+ * voice config's shape stays what every caller already expects.
+ *
+ *   GANYU_CALL_DEVICE   substring of the output device's label, e.g.
+ *                       `Voicemeeter AUX Input` or `CABLE Input`. Blank = none.
+ *   GANYU_CALL_MIX_MIC  opt-in. On mixes the mic in (for a bare virtual
+ *                       cable). Anything in FALSEY, or missing, is off.
+ *   GANYU_CALL_MIC      substring of the mic's label; blank = the default input.
+ *
+ * Never throws. A missing file is no call device, not an error.
+ */
+export function loadCallConfig({ envPath = null, fs = null } = {}) {
+  let env = {};
+  if (envPath && fs && typeof fs.readFileSync === 'function') {
+    try {
+      env = parseEnvFile(fs.readFileSync(envPath, 'utf8'));
+    } catch {
+      env = {};
+    }
+  }
+  return {
+    device: String(env.GANYU_CALL_DEVICE ?? '').trim(),
+    mixMic: env.GANYU_CALL_MIX_MIC != null
+      && !FALSEY.has(String(env.GANYU_CALL_MIX_MIC).trim().toLowerCase()),
+    mic: String(env.GANYU_CALL_MIC ?? '').trim(),
+  };
+}
+
 const WS_OPEN = 1;
 
 /**

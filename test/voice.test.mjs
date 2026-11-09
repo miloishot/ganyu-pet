@@ -31,6 +31,7 @@ import {
   createVoice,
   escapeSsml,
   loadVoiceConfig,
+  loadCallConfig,
   secMsGec,
 } from '../src/main/voice.mjs';
 import { AUDIO_HOLD_MS, createSpeech, QUIET_THROTTLE_MS } from '../src/main/speech.mjs';
@@ -1103,4 +1104,30 @@ test('an element that throws on play is swallowed', () => {
     throw new Error('no output device');
   };
   assert.equal(createVoicePlayer({ el }).play({ mime: AUDIO_MIME, base64: 'QUJD' }), false);
+});
+
+// ---------------------------------------------------------------- call mode keys
+
+test('loadCallConfig: no file means no call device, never a throw', () => {
+  assert.deepEqual(loadCallConfig({}), { device: '', mixMic: false, mic: '' });
+  assert.deepEqual(
+    loadCallConfig({ envPath: 'x', fs: { readFileSync: () => { throw new Error('ENOENT'); } } }),
+    { device: '', mixMic: false, mic: '' },
+  );
+});
+
+test('loadCallConfig reads the three keys with the same parse rules as the voice', () => {
+  const read = (text) => loadCallConfig({ envPath: 'x', fs: { readFileSync: () => text } });
+  assert.deepEqual(read('GANYU_CALL_DEVICE= Voicemeeter AUX Input \n'), { device: 'Voicemeeter AUX Input', mixMic: false, mic: '' });
+  assert.deepEqual(
+    read('GANYU_CALL_DEVICE=CABLE Input\nGANYU_CALL_MIX_MIC=1\nGANYU_CALL_MIC=USB Mic\n'),
+    { device: 'CABLE Input', mixMic: true, mic: 'USB Mic' },
+  );
+  for (const off of ['0', 'false', 'no', 'off', 'never', '']) {
+    assert.equal(read(`GANYU_CALL_MIX_MIC=${off}\n`).mixMic, false, `"${off}" is off`);
+  }
+  assert.equal(read('# GANYU_CALL_MIX_MIC=1\n').mixMic, false, 'a commented key is not set');
+  // Call keys never change the voice config's shape.
+  const voice = loadVoiceConfig({ envPath: 'x', fs: { readFileSync: () => 'GANYU_CALL_DEVICE=CABLE Input\n' } });
+  assert.equal('call' in voice, false);
 });

@@ -250,8 +250,74 @@ export const DRAG_PHASES = Object.freeze(['press', 'release']);
  * It exists because a pet stranded off-screen — by a resolution change, an
  * undocked monitor, or a drag — was unrecoverable, and the right-click menu is
  * the only user control there is.
+ *
+ * `toggle-call` turns call mode on and off — her voice also played into a
+ * call through a virtual audio device (src/renderer/callaudio.mjs).
  */
-export const MENU_ACTIONS = Object.freeze(['toggle-mute', 'toggle-pin', 'home', 'quit']);
+export const MENU_ACTIONS = Object.freeze(['toggle-mute', 'toggle-pin', 'toggle-call', 'home', 'quit']);
+
+/**
+ * The one permission this app grants: audio-only `media`, to its own page.
+ *
+ * Electron grants every permission by default. Call mode needs exactly one —
+ * `media` for audio, so the renderer can read output-device labels (to match
+ * GANYU_CALL_DEVICE) and, in mix mode only, open the mic. Everything else is
+ * refused: video, other permissions, any page that is not the renderer itself.
+ *
+ * `appUrl` is the renderer's file:// URL. Returns `{check, request}` in the
+ * shapes of `session.setPermissionCheckHandler` and
+ * `session.setPermissionRequestHandler`.
+ */
+export function mediaPermissionHandlers({ appUrl }) {
+  // Compared case-insensitively and decoded: Chromium may normalise the drive
+  // letter and the percent-encoding of a Windows file URL. The origin alone is
+  // useless here — every file:// page has the same one, `file:///`.
+  const norm = (url) => {
+    try {
+      return decodeURI(String(url).split('#')[0].split('?')[0]).toLowerCase();
+    } catch {
+      return '';
+    }
+  };
+  const page = norm(appUrl ?? '');
+  const isAppPage = (url) => typeof url === 'string' && page !== '' && url.startsWith('file:') && norm(url) === page;
+  const pageOf = (webContents) => {
+    try {
+      return webContents && typeof webContents.getURL === 'function' ? webContents.getURL() : '';
+    } catch {
+      return '';
+    }
+  };
+  return {
+    // Device labels (to match GANYU_CALL_DEVICE) and setSinkId to a non-default
+    // output both ride on this check, as `media` with mediaType `audio`.
+    check(webContents, permission, _requestingOrigin, details = {}) {
+      if (permission !== 'media' || details?.mediaType !== 'audio') return false;
+      if (details?.isMainFrame === false) return false;
+      return isAppPage(details?.requestingUrl || pageOf(webContents));
+    },
+    // getUserMedia, mix mode only. Exactly `['audio']`: a legacy screen-capture
+    // request also arrives as `media`, with an empty mediaTypes list.
+    request(webContents, permission, callback, details = {}) {
+      const types = Array.isArray(details?.mediaTypes) ? details.mediaTypes : [];
+      const ok = permission === 'media'
+        && types.length === 1
+        && types[0] === 'audio'
+        && details?.isMainFrame !== false
+        && isAppPage(details?.requestingUrl || pageOf(webContents));
+      callback(ok);
+    },
+  };
+}
+
+/** Installs the handlers above on `session`. A session without the API is left alone. */
+export function installMediaPermissions(session, { appUrl }) {
+  if (!session) return false;
+  const { check, request } = mediaPermissionHandlers({ appUrl });
+  if (typeof session.setPermissionCheckHandler === 'function') session.setPermissionCheckHandler(check);
+  if (typeof session.setPermissionRequestHandler === 'function') session.setPermissionRequestHandler(request);
+  return true;
+}
 
 /**
  * Bottom-right of the primary display work area. Y sits flush on the bottom
