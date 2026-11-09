@@ -36,6 +36,7 @@ This file is the single source of truth for parallel builders. **Own only your f
 | A electron-main | builder-A | `src/main/index.mjs`, `src/main/window.mjs`, `src/main/preload.cjs` |
 | B server+state | builder-B | `src/main/server.mjs`, `src/main/state.mjs`, `test/state.test.mjs`, `test/server.test.mjs` |
 | C renderer | builder-C | `src/renderer/index.html`, `src/renderer/pet.mjs`, `src/renderer/bubbles.mjs`, `src/renderer/styles.css` |
+| P pet packs | pet-packs | `src/main/petpack.mjs`, `scripts/add-pet.mjs`, `test/petpack.test.mjs`, `pets/starter-hat.png` |
 | D speech | builder-D | `src/main/speech.mjs`, `src/main/persona.mjs`, `src/main/brain.mjs`, `src/main/context.mjs`, `src/main/ledger.mjs`, `src/main/vault.mjs`, `src/main/sessions.mjs`, `test/speech.test.mjs`, `test/brain.test.mjs`, `test/context.test.mjs`, `test/ledger.test.mjs`, `test/vault.test.mjs`, `test/sessions.test.mjs` |
 | E wander | builder-E | `src/main/wander.mjs`, `test/wander.test.mjs` |
 | G chat | builder-G | `src/main/chat.mjs`, `test/chat.test.mjs` |
@@ -141,6 +142,40 @@ Three details are load-bearing. It is still **text in the same bubble**, so §Ch
 **Every `MENU_ACTIONS` entry needs a `menuLabels()` entry.** `paintMenu` writes only labels it finds, so a missing one is a silently blank button rather than a crash — which is exactly how `home` stayed unreachable for two modules' worth of work while main filtered it through faithfully. `test/renderer.test.mjs` walks the action list against the label table for that reason.
 
 **Interactivity latches.** `createInteractivity` ORs five: `overPet`, `overMenu`, `menuOpen`, `chatOpen`, `dragging`. The last exists because the window chases the cursor during a drag, so on a fast throw it trails behind and the pointer spends most of the gesture off the sprite — without the latch the overlay would go click-through mid-throw and the `mouseup` that ends the drag would land on the desktop. `releaseAll()` drops all five, and in the renderer it is only ever reached through a wrapper that closes the menu and the input strip first — see the invariant below.
+
+### Pet packs and accessories
+
+**The `accessories` field** (optional, top level of a pet config, validated by `validatePetConfig`):
+
+```json
+"accessories": [
+  { "id": "hat", "sheet": "starter-hat.png", "enabled": true }
+]
+```
+
+- `id` — required, unique within the list, a safe name (`^[a-z0-9][a-z0-9_-]*$`, at most 64 chars).
+- `sheet` — required non-empty string; absolute, or relative to the directory holding the config (same rule as `spritesheet`, resolved by `resolveAccessoryPaths` beside `resolveSheetPath`).
+- `enabled` — optional boolean, default `true`.
+- Absent, or `[]`, means no layers. The built-in pet has none.
+
+**Selection.** `GANYU_ACCESSORIES` (one machine) overrides `enabled`: unset or empty → the config's `enabled`; `none` → nothing; `id,id` → exactly those, in **config order**, and an id the config does not list is one log line and is ignored. Computed main-side by `selectAccessories(config, envValue)`; a layer whose file does not exist is dropped with one log line.
+
+**Payload.** `getFlags().sprite.accessories = [{ id, url }]` — the selected layers, in config order, `url` a `file://` URL from `spriteFileUrl`. Absent or not an array → the renderer draws no layers, so an older main works unchanged. The renderer mirrors this as `export let ACCESSORIES` (built-in `[]`), rebound by `useSpriteConfig`; `test/petbinding.test.mjs` asserts it against `DEFAULT_PET_CONFIG`.
+
+**Drawing.** `createSpriteRenderer` takes `accessories` and `ImageCtor`, loads each layer itself, and after the base `drawImage` draws every *loaded* layer in list order with the identical source rect (same row, same frame) and destination rect. The renderer has no horizontal flip — walk-left is its own row — so "same flip" is "same rect". A layer whose natural size differs from the base sheet's is skipped with **one** `console.warn` and never drawn; a layer that fails to load likewise. Neither ever stops the base pet drawing. A layer arriving after the first frame invalidates the dedup so it appears on the next tick.
+
+**Pet selection.** `--pet <id>` beats `GANYU_PET`, which beats the built-in. A named pet is looked up by `findPetConfig` in order: the **user pets dir** `<petsDir>/<id>/ganyu-pet.json`, then the repo `pets/<id>.json`, then the built-in (only when `<id>` is the built-in's own id). The **first location that has the file decides** — an invalid user copy is a hard exit, not a fall-through to the repo copy. A name that is found nowhere, or not a safe name, is a hard exit, unchanged.
+
+**User pets dir** (`defaultUserPetsDir` in `petpack.mjs`, used by both `add-pet` and main): `GANYU_PETS_DIR` if set, else `%APPDATA%\ganyu-pet\pets` on Windows, `~/Library/Application Support/ganyu-pet/pets` on macOS, `$XDG_CONFIG_HOME/ganyu-pet/pets` (default `~/.config`) elsewhere — i.e. Electron's `userData` for this app plus `pets`. `add-pet --pets-dir <dir>` overrides it for one run.
+
+**A pet pack** is a folder or `.zip` whose root (or single top-level folder) holds either:
+
+1. `ganyu-pet.json` — a config `validatePetConfig` accepts — plus the files its `spritesheet` and every `accessories[].sheet` name, all relative and inside the pack; or
+2. a bare Codex pet: `pet.json` + `spritesheet.webp|png` and no `ganyu-pet.json`. The config is drafted by `scripts/analyze-pet.mjs`'s measurement (run under Electron); geometry and frame counts are measured, every row label, `modes`, `walk`, `airborne` and `celebrate` are placeholders, and the installer prints that.
+
+**Install** (`installPack` in `petpack.mjs`, CLI `npm run add-pet -- <zip | folder | codex-pet-id> [--pets-dir D] [--force] [--codex-home D]`): stage into a `.staging-*` dir inside the pets dir (same volume, so the final rename cannot cross devices; the leading dot keeps it from ever being a valid pet name), validate, then rename to `<petsDir>/<id>/`. Installed layout: `ganyu-pet.json` plus the referenced sheets, paths rewritten relative. An existing `<id>` is refused unless `--force`, which first renames the old copy to `<id>.bak-<timestamp>`. Any failure leaves the pets dir as it was.
+
+**Zip reading** is zero-dependency (`node:zlib` `inflateRawSync` over the central directory). Stored (0) and deflate (8) only. Refused: `..` segments, absolute paths, drive letters, backslash-rooted paths, symlink entries, encrypted entries, more than 512 entries, more than 64 MB uncompressed in total (checked against declared sizes before inflating and against actual sizes after), and a CRC mismatch.
 
 ### Dismissing the menu
 
