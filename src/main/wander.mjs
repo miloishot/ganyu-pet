@@ -286,14 +286,26 @@ export function createWander({
     if (!Array.isArray(list)) return [];
     const surfaces = [];
     for (const l of list) {
+      // Per entry, so a hostile one (a throwing getter, a revoked Proxy) costs
+      // that entry rather than taking containNow() down with it.
+      let left;
+      let right;
+      let top;
+      let hwnd;
+      try {
+        if (!l) continue;
+        ({ left, right, top, hwnd } = l);
+      } catch {
+        continue;
+      }
       if (
-        !l || !Number.isFinite(l.left) || !Number.isFinite(l.right) ||
-        !Number.isFinite(l.top) || !Number.isFinite(l.hwnd)
+        !Number.isFinite(left) || !Number.isFinite(right) ||
+        !Number.isFinite(top) || !Number.isFinite(hwnd)
       ) continue;
-      const sy = l.top - size.height;
+      const sy = top - size.height;
       if (!(sy >= minY && sy < bottomY - FLOOR_EPS)) continue;
-      const lo = Math.max(l.left, minX);
-      const hi = Math.min(l.right - size.width, maxX);
+      const lo = Math.max(left, minX);
+      const hi = Math.min(right - size.width, maxX);
       if (lo > hi) continue;
       surfaces.push({ y: sy, lo, hi });
     }
@@ -482,7 +494,14 @@ export function createWander({
     // a tick that began on a surface (the floor or a ledge), so a skid decays and
     // a flight does not. The start y also bounds which surfaces she can land on.
     const fromY = y;
-    const onSurface = surfaceUnder(b) !== null;
+    // A ledge counts as contact only when she is not moving up: a throw that
+    // carries her up *through* a ledge passes its standing y in mid-air, and a
+    // tick that happens to start within EPS of it must not skid her. The floor
+    // keeps its old rule exactly (contact whatever vy is), so floor-only
+    // behaviour is unchanged; the one asymmetry is that the tick leaving a
+    // ledge on a bounce gets no friction where the floor's would.
+    const under = surfaceUnder(b);
+    const onSurface = under !== null && (under.y === b.bottomY || vy >= 0);
 
     vy = Math.min(vy + D.gravityPxPerSec2 * dt, D.maxFallPxPerSec);
     y += vy * dt;
@@ -515,6 +534,11 @@ export function createWander({
 
     const rebound = vy * D.restitution;
     y = land.y; // exactly on the surface, whether she bounces or settles
+    // And inside its standing range: `supports` allows EPS of slack, so a skid can
+    // stop up to half a pixel past a ledge's end, the window rounds a further
+    // half pixel out, and the 1s containNow poll then reads her back as standing
+    // on air. At most a 0.5px nudge; on the floor x is already in range (no-op).
+    x = clamp(x, land.lo, land.hi);
     moveWindow(Math.round(x), Math.round(y));
 
     if (rebound >= D.minBounceVelocity) {
@@ -596,6 +620,15 @@ export function createWander({
     const under = surfaceUnder(b);
     if (under && vy0 >= 0 && Math.abs(vx0) < D.minSlideVelocity) {
       y = under.y;
+      // Same reason as the landing clamp in fallTick: set down within EPS past a
+      // ledge's end, she would read back as standing on air on the next poll.
+      // Ledges only: on the floor an out-of-range x (the work area changed while
+      // she was held) is containNow's to fix, exactly as it was before ledges.
+      const cx = under.y === b.bottomY ? x : clamp(x, under.lo, under.hi);
+      if (cx !== x) {
+        x = cx;
+        moveWindow(Math.round(x), Math.round(y));
+      }
       vx = 0;
       vy = 0;
       setAirborne(false);
