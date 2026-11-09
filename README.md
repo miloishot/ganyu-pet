@@ -85,6 +85,18 @@ node hooks/install-hooks.mjs            # dry run, prints a diff
 node hooks/install-hooks.mjs --apply
 ```
 
+**OpenCode** has no hook commands, so it gets a plugin instead, `hooks/opencode/ganyu.js`. Install it
+with `--opencode`. It is opt-in, and it goes to `$XDG_CONFIG_HOME/opencode/plugins/ganyu.js`, else
+`~/.config/opencode/plugins/ganyu.js`. That is the path OpenCode reads on Windows too, and
+`--opencode-dir <dir>` overrides it. The plugin sends only the event name, session id, tool name,
+working directory and, for a session error, the error's type. It never sends your prompts, tool
+arguments or tool output. Other plugins are left alone, and an older `ganyu.js` is backed up first:
+
+```bash
+node hooks/install-hooks.mjs --opencode --no-codex --no-claude           # dry run
+node hooks/install-hooks.mjs --opencode --no-codex --no-claude --apply
+```
+
 ### Privacy
 
 Everything is local except calls to the endpoint you configure. There is no telemetry and no
