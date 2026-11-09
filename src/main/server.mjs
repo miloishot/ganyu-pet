@@ -15,7 +15,7 @@ const SWEEP_MS = 1000;
 const MAX_BODY_BYTES = 1024 * 1024;
 const RING_SIZE = 50;
 const RAW_CAPTURE_LIMIT = 4096;
-const SOURCES = new Set(['codex', 'claude']);
+const SOURCES = new Set(['codex', 'claude', 'opencode']);
 const BARE_EVENT_RE = /^[A-Za-z][A-Za-z0-9 _.:-]{0,63}$/;
 
 /** `--port N` / `--port=N` > GANYU_PORT > 47821. */
